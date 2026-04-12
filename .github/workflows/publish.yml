@@ -1,0 +1,126 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features -- --test-threads=1
+
+      - name: Check documentation
+        run: cargo doc --no-deps --all-features
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify package can be built
+        run: cargo build --release
+
+      - name: Verify package can be packaged
+        run: cargo package --allow-dirty
+
+      - name: Check for Cargo.lock changes
+        run: |
+          if git diff --name-only | grep -q "Cargo.lock"; then
+            echo "Cargo.lock was updated during dependency resolution (normal in CI)"
+            echo "Will use --allow-dirty flag for publishing"
+          else
+            echo "Cargo.lock unchanged"
+          fi
+
+      - name: Check if CARGO_REGISTRY_TOKEN is available
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "CARGO_REGISTRY_TOKEN secret is not set in repository settings"
+            echo "To enable automatic publishing:"
+            echo "1. Go to https://crates.io/ and create an API token"
+            echo "2. Add the token as CARGO_REGISTRY_TOKEN secret in repository settings"
+            echo "3. Re-run this workflow or create a new release"
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        run: cargo publish --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: "chia-query v${{ steps.extract_version.outputs.VERSION }}"
+          body: |
+            ## chia-query v${{ steps.extract_version.outputs.VERSION }}
+
+            Query the Chia blockchain via decentralized peers with coinset.org fallback.
+
+            ### Installation
+            ```toml
+            [dependencies]
+            chia-query = "${{ steps.extract_version.outputs.VERSION }}"
+            ```
+
+            See the [README](https://github.com/DIG-Network/chia-query/blob/main/README.md) for usage instructions.
+          draft: false
+          prerelease: false
