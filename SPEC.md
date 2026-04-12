@@ -1,6 +1,6 @@
 # chia-query -- Project Specification
 
-A Rust crate for querying the Chia blockchain with automatic load balancing between decentralized peer connections and the coinset.org HTTP API.
+A Rust crate for querying the Chia blockchain with automatic load balancing between decentralized peer connections and the coinset.org HTTP API
 
 ## Overview
 
