@@ -58,14 +58,16 @@ fn assert_coin_records_eq(label: &str, coinset: &[CoinRecord], peer: &[CoinRecor
         missing.is_empty() && extra.is_empty(),
         "{label}: set mismatch\n  coinset_count={} peer_count={}\n  \
          missing_from_peer({})={missing:?}\n  extra_in_peer({})={extra:?}",
-        cs_set.len(), pr_set.len(), missing.len(), extra.len(),
+        cs_set.len(),
+        pr_set.len(),
+        missing.len(),
+        extra.len(),
     );
 
     // Build lookup for per-record field comparison.
     let cs_map: HashMap<CoinId3, &CoinRecord> =
         coinset.iter().map(|r| (record_id3(r), r)).collect();
-    let pr_map: HashMap<CoinId3, &CoinRecord> =
-        peer.iter().map(|r| (record_id3(r), r)).collect();
+    let pr_map: HashMap<CoinId3, &CoinRecord> = peer.iter().map(|r| (record_id3(r), r)).collect();
 
     for key in &cs_set {
         let c = cs_map[key];
@@ -78,10 +80,7 @@ fn assert_coin_records_eq(label: &str, coinset: &[CoinRecord], peer: &[CoinRecor
             c.spent_block_index, p.spent_block_index,
             "{label}: spent_block_index mismatch for {key:?}"
         );
-        assert_eq!(
-            c.spent, p.spent,
-            "{label}: spent mismatch for {key:?}"
-        );
+        assert_eq!(c.spent, p.spent, "{label}: spent mismatch for {key:?}");
     }
 }
 
@@ -91,9 +90,11 @@ fn assert_coin_records_eq(label: &str, coinset: &[CoinRecord], peer: &[CoinRecor
 
 fn assert_spends_eq(label: &str, coinset: &[CoinSpend], peer: &[CoinSpend]) {
     assert_eq!(
-        coinset.len(), peer.len(),
+        coinset.len(),
+        peer.len(),
         "{label}: spend count -- coinset={} peer={}",
-        coinset.len(), peer.len(),
+        coinset.len(),
+        peer.len(),
     );
 
     let cs_map: HashMap<CoinId3, &CoinSpend> =
@@ -109,18 +110,21 @@ fn assert_spends_eq(label: &str, coinset: &[CoinSpend], peer: &[CoinSpend]) {
     assert!(
         missing.is_empty() && extra.is_empty(),
         "{label}: spend set mismatch\n  missing({})={missing:?}\n  extra({})={extra:?}",
-        missing.len(), extra.len(),
+        missing.len(),
+        extra.len(),
     );
 
     // Field-level comparison for each spend.
     for (key, cs) in &cs_map {
         let pr = pr_map.get(key).unwrap();
         assert_eq!(
-            norm(&cs.puzzle_reveal), norm(&pr.puzzle_reveal),
+            norm(&cs.puzzle_reveal),
+            norm(&pr.puzzle_reveal),
             "{label}: puzzle_reveal mismatch for {key:?}"
         );
         assert_eq!(
-            norm(&cs.solution), norm(&pr.solution),
+            norm(&cs.solution),
+            norm(&pr.solution),
             "{label}: solution mismatch for {key:?}"
         );
     }
@@ -170,7 +174,7 @@ fn coin_id_hex(c: &Coin) -> String {
     hasher.update(&ph);
     if start == usize::MAX {
         hasher.update([0u8]);
-        hasher.update(&amount_bytes);
+        hasher.update(amount_bytes);
     } else {
         hasher.update(&amount_bytes[start..]);
     }
@@ -188,15 +192,19 @@ async fn parity_all() {
     eprintln!("=== Setting up ===");
     let cert_dir = std::env::temp_dir().join("chia-query-parity-tests");
     std::fs::create_dir_all(&cert_dir).unwrap();
-    let tls = create_tls(&cert_dir.join("test.crt"), &cert_dir.join("test.key"))
-        .expect("TLS");
+    let tls = create_tls(&cert_dir.join("test.crt"), &cert_dir.join("test.key")).expect("TLS");
 
-    let coinset = CoinsetClient::new("https://api.coinset.org", Duration::from_secs(30))
-        .expect("coinset");
+    let coinset =
+        CoinsetClient::new("https://api.coinset.org", Duration::from_secs(30)).expect("coinset");
     let peer = PeerBackend::new(
-        NetworkType::Mainnet, tls, 5,
-        Duration::from_secs(15), Duration::from_secs(60),
-    ).await.expect("peer");
+        NetworkType::Mainnet,
+        tls,
+        5,
+        Duration::from_secs(15),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("peer");
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -213,7 +221,10 @@ async fn parity_all() {
     let search_start = peak.saturating_sub(500);
     for h in (search_start.saturating_sub(50)..search_start).rev() {
         let rec = coinset.get_block_record_by_height(h).await.unwrap();
-        let ar = coinset.get_additions_and_removals(&rec.header_hash).await.unwrap();
+        let ar = coinset
+            .get_additions_and_removals(&rec.header_hash)
+            .await
+            .unwrap();
         if !ar.removals.is_empty() && ar.additions.len() > ar.removals.len() {
             tx_height = h;
             tx_header_hash = rec.header_hash;
@@ -224,7 +235,10 @@ async fn parity_all() {
     }
     assert!(tx_height > 0, "no tx block found");
 
-    let first_non_cb = cs_additions.iter().find(|c| !c.coinbase).unwrap_or(&cs_additions[0]);
+    let first_non_cb = cs_additions
+        .iter()
+        .find(|c| !c.coinbase)
+        .unwrap_or(&cs_additions[0]);
     let added_coin_id = coin_id_hex(&first_non_cb.coin);
     let parent_coin_id = first_non_cb.coin.parent_coin_info.clone();
     let removal = &cs_removals[0];
@@ -249,17 +263,27 @@ async fn parity_all() {
         let pr = retry(
             peer.try_get_block_record_by_height(tx_height),
             peer.try_get_block_record_by_height(tx_height),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cs.height, pr.height, "height");
         assert_eq!(cs.weight, pr.weight, "weight");
         assert_eq!(cs.total_iters, pr.total_iters, "total_iters");
-        assert_eq!(cs.signage_point_index, pr.signage_point_index, "signage_point_index");
-        assert_eq!(norm(&cs.farmer_puzzle_hash), norm(&pr.farmer_puzzle_hash), "farmer_puzzle_hash");
+        assert_eq!(
+            cs.signage_point_index, pr.signage_point_index,
+            "signage_point_index"
+        );
+        assert_eq!(
+            norm(&cs.farmer_puzzle_hash),
+            norm(&pr.farmer_puzzle_hash),
+            "farmer_puzzle_hash"
+        );
         assert_eq!(norm(&cs.prev_hash), norm(&pr.prev_hash), "prev_hash");
         // timestamp: peer extracts from foliage_transaction_block
         assert_eq!(cs.timestamp, pr.timestamp, "timestamp");
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -267,20 +291,30 @@ async fn parity_all() {
     // =======================================================================
     eprintln!("--- get_block_records (range) ---");
     {
-        let cs = coinset.get_block_records(tx_height, tx_height + 3).await.unwrap();
+        let cs = coinset
+            .get_block_records(tx_height, tx_height + 3)
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_block_records(tx_height, tx_height + 3),
             peer.try_get_block_records(tx_height, tx_height + 3),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cs.len(), pr.len(), "count");
         for (c, p) in cs.iter().zip(pr.iter()) {
             assert_eq!(c.height, p.height, "height at {}", c.height);
             assert_eq!(c.weight, p.weight, "weight at {}", c.height);
             assert_eq!(c.total_iters, p.total_iters, "total_iters at {}", c.height);
-            assert_eq!(c.signage_point_index, p.signage_point_index, "spi at {}", c.height);
+            assert_eq!(
+                c.signage_point_index, p.signage_point_index,
+                "spi at {}",
+                c.height
+            );
         }
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -297,7 +331,9 @@ async fn parity_all() {
         match retry(
             peer.try_get_additions_and_removals(tx_height, &tx_header_hash),
             peer.try_get_additions_and_removals(tx_height, &tx_header_hash),
-        ).await {
+        )
+        .await
+        {
             Ok(pr) => {
                 // Additions: same coin set, same confirmed_block_index.
                 let cs_add_set: HashSet<CoinId3> = cs_additions.iter().map(record_id3).collect();
@@ -307,7 +343,8 @@ async fn parity_all() {
                 assert!(
                     add_missing.is_empty() && add_extra.is_empty(),
                     "additions set mismatch: missing({})={add_missing:?} extra({})={add_extra:?}",
-                    add_missing.len(), add_extra.len(),
+                    add_missing.len(),
+                    add_extra.len(),
                 );
                 // Removals: same coin set, same spent_block_index.
                 let cs_rem_set: HashSet<CoinId3> = cs_removals.iter().map(record_id3).collect();
@@ -317,12 +354,20 @@ async fn parity_all() {
                 assert!(
                     rem_missing.is_empty() && rem_extra.is_empty(),
                     "removals set mismatch: missing({})={rem_missing:?} extra({})={rem_extra:?}",
-                    rem_missing.len(), rem_extra.len(),
+                    rem_missing.len(),
+                    rem_extra.len(),
                 );
-                eprintln!("  PASS (adds={} rems={})", cs_additions.len(), cs_removals.len());
+                eprintln!(
+                    "  PASS (adds={} rems={})",
+                    cs_additions.len(),
+                    cs_removals.len()
+                );
                 passed += 1;
             }
-            Err(e) => { eprintln!("  SKIP ({e})"); skipped += 1; }
+            Err(e) => {
+                eprintln!("  SKIP ({e})");
+                skipped += 1;
+            }
         }
     }
 
@@ -331,17 +376,29 @@ async fn parity_all() {
     // =======================================================================
     eprintln!("\n--- get_coin_record_by_name ---");
     {
-        let cs = coinset.get_coin_record_by_name(&added_coin_id).await.unwrap();
+        let cs = coinset
+            .get_coin_record_by_name(&added_coin_id)
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_coin_record_by_name(&added_coin_id),
             peer.try_get_coin_record_by_name(&added_coin_id),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(coin_id3(&cs.coin), coin_id3(&pr.coin), "coin identity");
-        assert_eq!(cs.confirmed_block_index, pr.confirmed_block_index, "confirmed_block_index");
-        assert_eq!(cs.spent_block_index, pr.spent_block_index, "spent_block_index");
+        assert_eq!(
+            cs.confirmed_block_index, pr.confirmed_block_index,
+            "confirmed_block_index"
+        );
+        assert_eq!(
+            cs.spent_block_index, pr.spent_block_index,
+            "spent_block_index"
+        );
         assert_eq!(cs.spent, pr.spent, "spent");
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -353,14 +410,18 @@ async fn parity_all() {
         let end = Some(tx_height + 10);
         let cs = coinset
             .get_coin_records_by_puzzle_hash(&removal_ph, start, end, true)
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_coin_records_by_puzzle_hash(&removal_ph, start, end, true),
             peer.try_get_coin_records_by_puzzle_hash(&removal_ph, start, end, true),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_coin_records_eq("puzzle_hash", &cs, &pr);
-        eprintln!("  PASS (count={})", cs.len()); passed += 1;
+        eprintln!("  PASS (count={})", cs.len());
+        passed += 1;
     }
 
     // =======================================================================
@@ -373,14 +434,18 @@ async fn parity_all() {
         let end = Some(tx_height + 10);
         let cs = coinset
             .get_coin_records_by_puzzle_hashes(&hashes, start, end, true)
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_coin_records_by_puzzle_hashes(&hashes, start, end, true),
             peer.try_get_coin_records_by_puzzle_hashes(&hashes, start, end, true),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_coin_records_eq("puzzle_hashes", &cs, &pr);
-        eprintln!("  PASS (count={})", cs.len()); passed += 1;
+        eprintln!("  PASS (count={})", cs.len());
+        passed += 1;
     }
 
     // =======================================================================
@@ -391,14 +456,18 @@ async fn parity_all() {
         let names = vec![added_coin_id.clone(), spent_coin_id.clone()];
         let cs = coinset
             .get_coin_records_by_names(&names, None, None, true)
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_coin_records_by_names(&names),
             peer.try_get_coin_records_by_names(&names),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_coin_records_eq("names", &cs, &pr);
-        eprintln!("  PASS (count={})", cs.len()); passed += 1;
+        eprintln!("  PASS (count={})", cs.len());
+        passed += 1;
     }
 
     // =======================================================================
@@ -409,14 +478,18 @@ async fn parity_all() {
         let parents = vec![parent_coin_id.clone()];
         let cs = coinset
             .get_coin_records_by_parent_ids(&parents, None, None, true)
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_children(&parent_coin_id),
             peer.try_get_children(&parent_coin_id),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_coin_records_eq("parent_ids", &cs, &pr);
-        eprintln!("  PASS (count={})", cs.len()); passed += 1;
+        eprintln!("  PASS (count={})", cs.len());
+        passed += 1;
     }
 
     // =======================================================================
@@ -426,17 +499,29 @@ async fn parity_all() {
     {
         let cs = coinset
             .get_puzzle_and_solution(&spent_coin_id, Some(tx_height))
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_puzzle_and_solution(&spent_coin_id, tx_height),
             peer.try_get_puzzle_and_solution(&spent_coin_id, tx_height),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(norm(&cs.puzzle_reveal), norm(&pr.puzzle_reveal), "puzzle_reveal");
+        assert_eq!(
+            norm(&cs.puzzle_reveal),
+            norm(&pr.puzzle_reveal),
+            "puzzle_reveal"
+        );
         assert_eq!(norm(&cs.solution), norm(&pr.solution), "solution");
         // Also verify the coin in the coinset response matches the removal.
-        assert_eq!(coin_id3(&cs.coin), coin_id3(&removal.coin), "coinset coin matches removal");
-        eprintln!("  PASS"); passed += 1;
+        assert_eq!(
+            coin_id3(&cs.coin),
+            coin_id3(&removal.coin),
+            "coinset coin matches removal"
+        );
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -446,15 +531,23 @@ async fn parity_all() {
     {
         let cs = coinset
             .get_puzzle_and_solution(&spent_coin_id, Some(tx_height))
-            .await.unwrap();
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_puzzle_and_solution_auto(&spent_coin_id),
             peer.try_get_puzzle_and_solution_auto(&spent_coin_id),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(norm(&cs.puzzle_reveal), norm(&pr.puzzle_reveal), "puzzle_reveal");
+        assert_eq!(
+            norm(&cs.puzzle_reveal),
+            norm(&pr.puzzle_reveal),
+            "puzzle_reveal"
+        );
         assert_eq!(norm(&cs.solution), norm(&pr.solution), "solution");
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -463,14 +556,23 @@ async fn parity_all() {
     eprintln!("\n--- get_fee_estimate ---");
     {
         let times = [60u64, 120, 300];
-        let cs = coinset.get_fee_estimate(None, Some(&times), None).await.unwrap();
+        let cs = coinset
+            .get_fee_estimate(None, Some(&times), None)
+            .await
+            .unwrap();
         let pr = retry(
             peer.try_get_fee_estimate(&times),
             peer.try_get_fee_estimate(&times),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cs.estimates.len(), pr.estimates.len(), "estimate count");
-        assert_eq!(cs.target_times.len(), pr.target_times.len(), "target_times count");
+        assert_eq!(
+            cs.target_times.len(),
+            pr.target_times.len(),
+            "target_times count"
+        );
         // Values may differ (different nodes) but both must be non-negative.
         for (i, est) in pr.estimates.iter().enumerate() {
             assert!(*est >= 0.0, "peer estimate[{i}] negative: {est}");
@@ -478,7 +580,10 @@ async fn parity_all() {
         for (i, est) in cs.estimates.iter().enumerate() {
             assert!(*est >= 0.0, "coinset estimate[{i}] negative: {est}");
         }
-        eprintln!("  PASS (coinset={:?} peer={:?})", cs.estimates, pr.estimates);
+        eprintln!(
+            "  PASS (coinset={:?} peer={:?})",
+            cs.estimates, pr.estimates
+        );
         passed += 1;
     }
 
@@ -492,9 +597,14 @@ async fn parity_all() {
         assert_eq!(cs.network_name, pr.network_name, "network_name");
         assert_eq!(cs.network_prefix, pr.network_prefix, "network_prefix");
         if !cs.genesis_challenge.is_empty() {
-            assert_eq!(norm(&cs.genesis_challenge), norm(&pr.genesis_challenge), "genesis_challenge");
+            assert_eq!(
+                norm(&cs.genesis_challenge),
+                norm(&pr.genesis_challenge),
+                "genesis_challenge"
+            );
         }
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -505,7 +615,8 @@ async fn parity_all() {
         let cs = coinset.get_aggsig_additional_data().await.unwrap();
         let pr = peer.aggsig_additional_data();
         assert_eq!(norm(&cs), norm(&pr), "aggsig_additional_data");
-        eprintln!("  PASS"); passed += 1;
+        eprintln!("  PASS");
+        passed += 1;
     }
 
     // =======================================================================
@@ -515,8 +626,12 @@ async fn parity_all() {
     {
         let peer_peak = peer.peak_height();
         let diff = (peak as i64 - peer_peak as i64).unsigned_abs();
-        assert!(diff < 50, "peak divergence: coinset={peak} peer={peer_peak} diff={diff}");
-        eprintln!("  PASS (coinset={peak} peer={peer_peak})"); passed += 1;
+        assert!(
+            diff < 50,
+            "peak divergence: coinset={peak} peer={peer_peak} diff={diff}"
+        );
+        eprintln!("  PASS (coinset={peak} peer={peer_peak})");
+        passed += 1;
     }
 
     // =======================================================================
@@ -538,9 +653,13 @@ async fn parity_all() {
                     pr["reward_chain_block"]["weight"].as_u64(),
                     "reward_chain_block.weight"
                 );
-                eprintln!("  PASS"); passed += 1;
+                eprintln!("  PASS");
+                passed += 1;
             }
-            Err(e) => { eprintln!("  SKIP ({e})"); skipped += 1; }
+            Err(e) => {
+                eprintln!("  SKIP ({e})");
+                skipped += 1;
+            }
         }
     }
 
@@ -550,9 +669,13 @@ async fn parity_all() {
             Ok(pr) => {
                 let cs = coinset.get_block_spends(&tx_header_hash).await.unwrap();
                 assert_spends_eq("block_spends", &cs, &pr);
-                eprintln!("  PASS (count={})", cs.len()); passed += 1;
+                eprintln!("  PASS (count={})", cs.len());
+                passed += 1;
             }
-            Err(e) => { eprintln!("  SKIP ({e})"); skipped += 1; }
+            Err(e) => {
+                eprintln!("  SKIP ({e})");
+                skipped += 1;
+            }
         }
     }
 
@@ -560,20 +683,30 @@ async fn parity_all() {
     {
         match peer.try_get_block_spends_with_conditions(tx_height).await {
             Ok(pr) => {
-                let cs = coinset.get_block_spends_with_conditions(&tx_header_hash).await.unwrap();
+                let cs = coinset
+                    .get_block_spends_with_conditions(&tx_header_hash)
+                    .await
+                    .unwrap();
                 assert_eq!(cs.len(), pr.len(), "count");
                 let cs_spends: Vec<CoinSpend> = cs.iter().map(|s| s.coin_spend.clone()).collect();
                 let pr_spends: Vec<CoinSpend> = pr.iter().map(|s| s.coin_spend.clone()).collect();
                 assert_spends_eq("spends_with_conditions", &cs_spends, &pr_spends);
                 let any_conds = pr.iter().any(|s| !s.conditions.is_empty());
                 assert!(any_conds, "peer should extract at least some conditions");
-                eprintln!("  PASS"); passed += 1;
+                eprintln!("  PASS");
+                passed += 1;
             }
-            Err(e) => { eprintln!("  SKIP ({e})"); skipped += 1; }
+            Err(e) => {
+                eprintln!("  SKIP ({e})");
+                skipped += 1;
+            }
         }
     }
 
     // =======================================================================
     eprintln!("\n=== RESULTS: {passed} passed, {skipped} skipped ===");
-    assert!(passed >= 14, "expected >= 14 wallet-protocol tests to pass, got {passed}");
+    assert!(
+        passed >= 14,
+        "expected >= 14 wallet-protocol tests to pass, got {passed}"
+    );
 }

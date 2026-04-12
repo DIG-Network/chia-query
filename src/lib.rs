@@ -175,10 +175,7 @@ impl ChiaQuery {
         self.router.get_block_count_metrics().await
     }
 
-    pub async fn get_block_record(
-        &self,
-        header_hash: &str,
-    ) -> Result<BlockRecord, ChiaQueryError> {
+    pub async fn get_block_record(&self, header_hash: &str) -> Result<BlockRecord, ChiaQueryError> {
         self.router.get_block_record(header_hash).await
     }
 
@@ -235,10 +232,7 @@ impl ChiaQuery {
     // Coins
     // =======================================================================
 
-    pub async fn get_coin_record_by_name(
-        &self,
-        name: &str,
-    ) -> Result<CoinRecord, ChiaQueryError> {
+    pub async fn get_coin_record_by_name(&self, name: &str) -> Result<CoinRecord, ChiaQueryError> {
         self.router.get_coin_record_by_name(name).await
     }
 
@@ -469,8 +463,7 @@ impl ChiaQuery {
                     // Coin exists but confirmed_block_index is 0 -- not
                     // confirmed yet, keep polling.
                 }
-                Err(ChiaQueryError::PeerRejection(_))
-                | Err(ChiaQueryError::CoinsetApiError(_)) => {
+                Err(ChiaQueryError::PeerRejection(_)) | Err(ChiaQueryError::CoinsetApiError(_)) => {
                     // Coin not found yet -- keep polling.
                 }
                 Err(e) => {

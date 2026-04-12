@@ -78,16 +78,18 @@ impl QueryRouter {
 
         // Retry on a different peer
         match peer_retry.await {
-            Ok(v) => return Ok(v),
+            Ok(v) => Ok(v),
             Err(peer_err) => {
                 if !self.coinset_fallback_enabled {
                     return Err(peer_err);
                 }
                 // Fall back to coinset
-                coinset_fn.await.map_err(|ce| ChiaQueryError::AllSourcesFailed {
-                    peer_error: Box::new(peer_err),
-                    coinset_error: Some(Box::new(ce)),
-                })
+                coinset_fn
+                    .await
+                    .map_err(|ce| ChiaQueryError::AllSourcesFailed {
+                        peer_error: Box::new(peer_err),
+                        coinset_error: Some(Box::new(ce)),
+                    })
             }
         }
     }
@@ -147,7 +149,9 @@ impl QueryRouter {
         if self.coinset_fallback_enabled {
             self.coinset.get_block(header_hash).await
         } else {
-            Err(ChiaQueryError::UnsupportedWithoutCoinset("get_block".into()))
+            Err(ChiaQueryError::UnsupportedWithoutCoinset(
+                "get_block".into(),
+            ))
         }
     }
 
@@ -171,10 +175,7 @@ impl QueryRouter {
         self.coinset.get_block_count_metrics().await
     }
 
-    pub async fn get_block_record(
-        &self,
-        header_hash: &str,
-    ) -> Result<BlockRecord, ChiaQueryError> {
+    pub async fn get_block_record(&self, header_hash: &str) -> Result<BlockRecord, ChiaQueryError> {
         self.require_coinset("get_block_record")?;
         self.coinset.get_block_record(header_hash).await
     }
@@ -288,10 +289,7 @@ impl QueryRouter {
 // ---------------------------------------------------------------------------
 
 impl QueryRouter {
-    pub async fn get_coin_record_by_name(
-        &self,
-        name: &str,
-    ) -> Result<CoinRecord, ChiaQueryError> {
+    pub async fn get_coin_record_by_name(&self, name: &str) -> Result<CoinRecord, ChiaQueryError> {
         self.peer_then_coinset(
             self.peer.try_get_coin_record_by_name(name),
             self.peer.try_get_coin_record_by_name(name),
@@ -308,12 +306,24 @@ impl QueryRouter {
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
         self.peer_then_coinset(
-            self.peer
-                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
-            self.peer
-                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
-            self.coinset
-                .get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
+            self.peer.try_get_coin_records_by_hint(
+                hint,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_hint(
+                hint,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset.get_coin_records_by_hint(
+                hint,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
         )
         .await
     }
@@ -326,12 +336,24 @@ impl QueryRouter {
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
         self.peer_then_coinset(
-            self.peer
-                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
-            self.peer
-                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
-            self.coinset
-                .get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
+            self.peer.try_get_coin_records_by_hints(
+                hints,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_hints(
+                hints,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset.get_coin_records_by_hints(
+                hints,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
         )
         .await
     }
@@ -346,8 +368,12 @@ impl QueryRouter {
         self.peer_then_coinset(
             self.peer.try_get_coin_records_by_names(names),
             self.peer.try_get_coin_records_by_names(names),
-            self.coinset
-                .get_coin_records_by_names(names, start_height, end_height, include_spent_coins),
+            self.coinset.get_coin_records_by_names(
+                names,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
         )
         .await
     }
@@ -372,7 +398,9 @@ impl QueryRouter {
             // Apply client-side height and spent filters.
             all_records.retain(|r| {
                 let height_ok = match (start_height, end_height) {
-                    (Some(s), Some(e)) => r.confirmed_block_index >= s && r.confirmed_block_index <= e,
+                    (Some(s), Some(e)) => {
+                        r.confirmed_block_index >= s && r.confirmed_block_index <= e
+                    }
                     (Some(s), None) => r.confirmed_block_index >= s,
                     (None, Some(e)) => r.confirmed_block_index <= e,
                     (None, None) => true,
@@ -467,10 +495,7 @@ impl QueryRouter {
     }
 
     /// No peer equivalent -- always coinset.
-    pub async fn get_memos_by_coin_name(
-        &self,
-        name: &str,
-    ) -> Result<Value, ChiaQueryError> {
+    pub async fn get_memos_by_coin_name(&self, name: &str) -> Result<Value, ChiaQueryError> {
         self.require_coinset("get_memos_by_coin_name")?;
         self.coinset.get_memos_by_coin_name(name).await
     }
