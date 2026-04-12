@@ -1,0 +1,30 @@
+[package]
+name = "chia-query"
+version = "0.1.0"
+edition = "2021"
+description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
+license = "MIT"
+repository = "https://github.com/DIG-Network/chia-query"
+readme = "README.md"
+keywords = ["chia", "blockchain", "coinset", "peer", "query"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+
+[dependencies]
+chia = "0.26"
+clvmr = "0.14"
+chia-wallet-sdk = { version = "0.30", features = ["native-tls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+futures-util = "0.3"
+log = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
