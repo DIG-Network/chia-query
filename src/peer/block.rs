@@ -112,11 +112,9 @@ pub fn block_spends(
         node_from_bytes_backrefs_record(&mut allocator, generator.as_ref())
             .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
 
-    let args = chia::consensus::run_block_generator::setup_generator_args(
-        &mut allocator,
-        &block_refs,
-    )
-    .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
+    let args =
+        chia::consensus::run_block_generator::setup_generator_args(&mut allocator, &block_refs)
+            .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
 
     let dialect = clvmr::chia_dialect::ChiaDialect::new(flags);
     let reduction = clvmr::run_program::run_program(
@@ -140,12 +138,9 @@ pub fn block_spends(
             amount: sc.coin_amount,
         };
 
-        if let Ok((puzzle_node, solution_node)) = get_puzzle_and_solution_for_coin(
-            &allocator,
-            generator_output,
-            &backrefs,
-            &removal,
-        ) {
+        if let Ok((puzzle_node, solution_node)) =
+            get_puzzle_and_solution_for_coin(&allocator, generator_output, &backrefs, &removal)
+        {
             let puzzle_bytes = node_to_bytes(&allocator, puzzle_node).unwrap_or_default();
             let solution_bytes = node_to_bytes(&allocator, solution_node).unwrap_or_default();
 
@@ -195,11 +190,9 @@ pub fn block_spends_with_conditions(
         node_from_bytes_backrefs_record(&mut allocator, generator.as_ref())
             .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
 
-    let args = chia::consensus::run_block_generator::setup_generator_args(
-        &mut allocator,
-        &block_refs,
-    )
-    .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
+    let args =
+        chia::consensus::run_block_generator::setup_generator_args(&mut allocator, &block_refs)
+            .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
 
     let dialect = clvmr::chia_dialect::ChiaDialect::new(flags);
     let reduction = clvmr::run_program::run_program(
@@ -223,12 +216,9 @@ pub fn block_spends_with_conditions(
             amount: sc.coin_amount,
         };
 
-        if let Ok((puzzle_node, solution_node)) = get_puzzle_and_solution_for_coin(
-            &allocator,
-            generator_output,
-            &backrefs,
-            &removal,
-        ) {
+        if let Ok((puzzle_node, solution_node)) =
+            get_puzzle_and_solution_for_coin(&allocator, generator_output, &backrefs, &removal)
+        {
             let puzzle_bytes = node_to_bytes(&allocator, puzzle_node).unwrap_or_default();
             let solution_bytes = node_to_bytes(&allocator, solution_node).unwrap_or_default();
 
@@ -240,9 +230,7 @@ pub fn block_spends_with_conditions(
                 solution_node,
                 constants.max_block_cost_clvm,
             ) {
-                Ok(clvmr::reduction::Reduction(_, output)) => {
-                    parse_conditions(&allocator, output)
-                }
+                Ok(clvmr::reduction::Reduction(_, output)) => parse_conditions(&allocator, output),
                 Err(_) => Vec::new(),
             };
 
@@ -271,56 +259,48 @@ fn parse_conditions(allocator: &clvmr::Allocator, output: clvmr::NodePtr) -> Vec
 }
 
 /// Public version of condition parsing for use from `router.rs`.
-pub fn parse_conditions_public(allocator: &clvmr::Allocator, mut output: clvmr::NodePtr) -> Vec<Condition> {
+pub fn parse_conditions_public(
+    allocator: &clvmr::Allocator,
+    mut output: clvmr::NodePtr,
+) -> Vec<Condition> {
     let mut conditions = Vec::new();
 
-    loop {
-        let (cond, rest) = match validation_error::next(allocator, output) {
-            Ok(Some(pair)) => pair,
-            _ => break,
-        };
+    while let Ok(Some((cond, rest))) = validation_error::next(allocator, output) {
         output = rest;
 
         // cond = (opcode . args_list)
-        let opcode_node = match validation_error::first(allocator, cond) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(opcode_node) = validation_error::first(allocator, cond) else {
+            continue;
         };
 
         let opcode_bytes = match allocator.sexp(opcode_node) {
             clvmr::allocator::SExp::Atom => allocator.atom(opcode_node).as_ref().to_vec(),
-            clvmr::allocator::SExp::Pair(_, _) => continue, // skip malformed conditions
+            clvmr::allocator::SExp::Pair(_, _) => continue,
         };
         let opcode = serde_json::Value::String(format!("0x{}", hex::encode(&opcode_bytes)));
 
         // Collect args
         let mut vars = Vec::new();
-        let mut args_iter = match validation_error::rest(allocator, cond) {
-            Ok(n) => n,
-            Err(_) => continue,
+        let Ok(mut args_iter) = validation_error::rest(allocator, cond) else {
+            continue;
         };
 
-        loop {
-            match validation_error::next(allocator, args_iter) {
-                Ok(Some((arg, rest))) => {
-                    args_iter = rest;
-                    // Args can be atoms or pairs (e.g., hint lists).
-                    // Serialize pairs as CLVM bytes for fidelity.
-                    let arg_hex = match allocator.sexp(arg) {
-                        clvmr::allocator::SExp::Atom => {
-                            format!("0x{}", hex::encode(allocator.atom(arg).as_ref()))
-                        }
-                        clvmr::allocator::SExp::Pair(_, _) => {
-                            match clvmr::serde::node_to_bytes(allocator, arg) {
-                                Ok(bytes) => format!("0x{}", hex::encode(&bytes)),
-                                Err(_) => continue,
-                            }
-                        }
-                    };
-                    vars.push(arg_hex);
+        while let Ok(Some((arg, rest))) = validation_error::next(allocator, args_iter) {
+            args_iter = rest;
+            // Args can be atoms or pairs (e.g., hint lists).
+            // Serialize pairs as CLVM bytes for fidelity.
+            let arg_hex = match allocator.sexp(arg) {
+                clvmr::allocator::SExp::Atom => {
+                    format!("0x{}", hex::encode(allocator.atom(arg).as_ref()))
                 }
-                _ => break,
-            }
+                clvmr::allocator::SExp::Pair(_, _) => {
+                    match clvmr::serde::node_to_bytes(allocator, arg) {
+                        Ok(bytes) => format!("0x{}", hex::encode(&bytes)),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            vars.push(arg_hex);
         }
 
         conditions.push(Condition { opcode, vars });

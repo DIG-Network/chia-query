@@ -79,7 +79,10 @@ impl CoinsetClient {
         header_hash: &str,
     ) -> Result<AdditionsAndRemovals, ChiaQueryError> {
         let json = self
-            .post("get_additions_and_removals", &json!({ "header_hash": header_hash }))
+            .post(
+                "get_additions_and_removals",
+                &json!({ "header_hash": header_hash }),
+            )
             .await?;
         let additions = serde_json::from_value(json["additions"].clone())
             .map_err(|e| ChiaQueryError::CoinsetApiError(e.to_string()))?;
@@ -101,10 +104,7 @@ impl CoinsetClient {
             .await
     }
 
-    pub async fn get_block_record(
-        &self,
-        header_hash: &str,
-    ) -> Result<BlockRecord, ChiaQueryError> {
+    pub async fn get_block_record(&self, header_hash: &str) -> Result<BlockRecord, ChiaQueryError> {
         self.post_extract(
             "get_block_record",
             &json!({ "header_hash": header_hash }),
@@ -193,10 +193,7 @@ impl CoinsetClient {
     // Coins
     // =======================================================================
 
-    pub async fn get_coin_record_by_name(
-        &self,
-        name: &str,
-    ) -> Result<CoinRecord, ChiaQueryError> {
+    pub async fn get_coin_record_by_name(&self, name: &str) -> Result<CoinRecord, ChiaQueryError> {
         self.post_extract(
             "get_coin_record_by_name",
             &json!({ "name": name }),
@@ -325,16 +322,9 @@ impl CoinsetClient {
         .await
     }
 
-    pub async fn get_memos_by_coin_name(
-        &self,
-        name: &str,
-    ) -> Result<Value, ChiaQueryError> {
-        self.post_extract(
-            "get_memos_by_coin_name",
-            &json!({ "name": name }),
-            "memos",
-        )
-        .await
+    pub async fn get_memos_by_coin_name(&self, name: &str) -> Result<Value, ChiaQueryError> {
+        self.post_extract("get_memos_by_coin_name", &json!({ "name": name }), "memos")
+            .await
     }
 
     pub async fn get_puzzle_and_solution(
@@ -363,8 +353,8 @@ impl CoinsetClient {
             .await?;
         let coin_spend: CoinSpend = serde_json::from_value(json["coin_solution"].clone())
             .map_err(|e| ChiaQueryError::CoinsetApiError(e.to_string()))?;
-        let conditions: Vec<Condition> = serde_json::from_value(json["conditions"].clone())
-            .unwrap_or_default();
+        let conditions: Vec<Condition> =
+            serde_json::from_value(json["conditions"].clone()).unwrap_or_default();
         Ok(CoinSpendWithConditions {
             coin_spend,
             conditions,
@@ -374,10 +364,7 @@ impl CoinsetClient {
     pub async fn push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
         let body = json!({ "spend_bundle": bundle });
         let json = self.post("push_tx", &body).await?;
-        let status = json["status"]
-            .as_str()
-            .unwrap_or("UNKNOWN")
-            .to_string();
+        let status = json["status"].as_str().unwrap_or("UNKNOWN").to_string();
         Ok(TxStatus {
             status,
             success: true,

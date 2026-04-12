@@ -8,11 +8,10 @@ use std::time::Duration;
 
 use chia::consensus::consensus_constants::ConsensusConstants;
 use chia::protocol::{
-    Bytes32, CoinStateFilters, FullBlock as ProtoFullBlock, RejectAdditionsRequest,
-    RejectBlock, RejectHeaderRequest, RejectRemovalsRequest, RequestAdditions, RequestBlock,
-    RequestBlockHeader, RequestFeeEstimates, RequestRemovals, RespondAdditions,
-    RespondBlock, RespondBlockHeader, RespondFeeEstimates, RespondRemovals,
-    SpendBundle as ProtoBundle,
+    Bytes32, CoinStateFilters, FullBlock as ProtoFullBlock, RejectAdditionsRequest, RejectBlock,
+    RejectHeaderRequest, RejectRemovalsRequest, RequestAdditions, RequestBlock, RequestBlockHeader,
+    RequestFeeEstimates, RequestRemovals, RespondAdditions, RespondBlock, RespondBlockHeader,
+    RespondFeeEstimates, RespondRemovals, SpendBundle as ProtoBundle,
 };
 use chia_wallet_sdk::client::Peer;
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
@@ -132,7 +131,14 @@ impl PeerBackend {
         let hashes: Vec<&str> = puzzle_hashes.iter().map(String::as_str).collect();
         let (peer, addr) = self.pick().await?;
         let res = self
-            .do_puzzle_hash_query(&peer, &hashes, start_height, end_height, include_spent, false)
+            .do_puzzle_hash_query(
+                &peer,
+                &hashes,
+                start_height,
+                end_height,
+                include_spent,
+                false,
+            )
             .await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
@@ -149,7 +155,14 @@ impl PeerBackend {
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
         let res = self
-            .do_puzzle_hash_query(&peer, &[hint], start_height, end_height, include_spent, true)
+            .do_puzzle_hash_query(
+                &peer,
+                &[hint],
+                start_height,
+                end_height,
+                include_spent,
+                true,
+            )
             .await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
@@ -193,7 +206,9 @@ impl PeerBackend {
         height: u32,
     ) -> Result<CoinSpend, ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
-        let res = self.do_get_puzzle_and_solution(&peer, coin_id, height).await;
+        let res = self
+            .do_get_puzzle_and_solution(&peer, coin_id, height)
+            .await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
         }
@@ -212,10 +227,7 @@ impl PeerBackend {
         res
     }
 
-    pub async fn try_push_tx(
-        &self,
-        bundle: &SpendBundle,
-    ) -> Result<TxStatus, ChiaQueryError> {
+    pub async fn try_push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
         let res = self.do_push_tx(&peer, bundle).await;
         if res.is_err() {
@@ -294,7 +306,9 @@ impl PeerBackend {
         height: u32,
     ) -> Result<AdditionsAndRemovals, ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
-        let res = self.do_get_additions_and_removals_from_block(&peer, height).await;
+        let res = self
+            .do_get_additions_and_removals_from_block(&peer, height)
+            .await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
         }
@@ -348,14 +362,17 @@ impl PeerBackend {
         .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
         .map_err(|_| ChiaQueryError::PeerRejection("coin state rejected".into()))?;
 
-        let cs = state_resp.coin_states.first().ok_or_else(|| {
-            ChiaQueryError::PeerRejection("coin not found".into())
-        })?;
-        let spent_height = cs.spent_height.ok_or_else(|| {
-            ChiaQueryError::PeerRejection("coin is not spent".into())
-        })?;
+        let cs = state_resp
+            .coin_states
+            .first()
+            .ok_or_else(|| ChiaQueryError::PeerRejection("coin not found".into()))?;
+        let spent_height = cs
+            .spent_height
+            .ok_or_else(|| ChiaQueryError::PeerRejection("coin is not spent".into()))?;
 
-        let res = self.do_get_puzzle_and_solution(&peer, coin_id, spent_height).await;
+        let res = self
+            .do_get_puzzle_and_solution(&peer, coin_id, spent_height)
+            .await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
         }
@@ -488,9 +505,7 @@ impl PeerBackend {
             .await
             .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
             .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
-            .map_err(|_| {
-                ChiaQueryError::PeerRejection("puzzle state request rejected".into())
-            })?;
+            .map_err(|_| ChiaQueryError::PeerRejection("puzzle state request rejected".into()))?;
 
             all_states.extend(response.coin_states.iter().cloned());
 
@@ -506,8 +521,8 @@ impl PeerBackend {
             .iter()
             .filter(|cs| {
                 let h = cs.created_height.unwrap_or(0);
-                let above_start = start_height.map_or(true, |s| h >= s);
-                let below_end = end_height.map_or(true, |e| h <= e);
+                let above_start = start_height.is_none_or(|s| h >= s);
+                let below_end = end_height.is_none_or(|e| h <= e);
                 above_start && below_end
             })
             .map(translate::coin_state_to_record)
@@ -578,12 +593,11 @@ impl PeerBackend {
             time_targets: target_times.to_vec(),
         };
 
-        let response: RespondFeeEstimates = tokio::time::timeout(self.request_timeout, {
-            peer.request_infallible(request)
-        })
-        .await
-        .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
-        .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
+        let response: RespondFeeEstimates =
+            tokio::time::timeout(self.request_timeout, peer.request_infallible(request))
+                .await
+                .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
+                .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
 
         let estimates: Vec<f64> = response
             .estimates
@@ -605,12 +619,10 @@ impl PeerBackend {
     ) -> Result<TxStatus, ChiaQueryError> {
         let proto = to_protocol_spend_bundle(bundle)?;
 
-        let ack = tokio::time::timeout(self.request_timeout, {
-            peer.send_transaction(proto)
-        })
-        .await
-        .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
-        .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
+        let ack = tokio::time::timeout(self.request_timeout, peer.send_transaction(proto))
+            .await
+            .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
+            .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
 
         Ok(translate::ack_to_tx_status(ack.status))
     }
@@ -687,7 +699,9 @@ impl PeerBackend {
         .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
         .map_err(|_| ChiaQueryError::PeerRejection("header request rejected".into()))?;
 
-        Ok(translate::header_block_to_block_record(&response.header_block))
+        Ok(translate::header_block_to_block_record(
+            &response.header_block,
+        ))
     }
 
     // -- additions and removals (from chia-block-listener pattern) -----------
@@ -732,7 +746,9 @@ impl PeerBackend {
             .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
             .map_err(|_| ChiaQueryError::PeerRejection("removals rejected".into()))?;
 
-        Ok(translate::additions_removals_to_response(&adds, &rems, height))
+        Ok(translate::additions_removals_to_response(
+            &adds, &rems, height,
+        ))
     }
 
     // -- children (RequestChildren is already on Peer) ----------------------
@@ -744,12 +760,10 @@ impl PeerBackend {
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
         let coin_name = translate::parse_bytes32(parent_id)?;
 
-        let response = tokio::time::timeout(self.request_timeout, {
-            peer.request_children(coin_name)
-        })
-        .await
-        .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
-        .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
+        let response = tokio::time::timeout(self.request_timeout, peer.request_children(coin_name))
+            .await
+            .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
+            .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
 
         Ok(translate::coin_states_to_records(&response.coin_states))
     }
@@ -770,12 +784,12 @@ fn to_protocol_spend_bundle(bundle: &SpendBundle) -> Result<ProtoBundle, ChiaQue
                     puzzle_hash: translate::parse_bytes32(&cs.coin.puzzle_hash)?,
                     amount: cs.coin.amount,
                 },
-                puzzle_reveal: chia::protocol::Program::from(
-                    chia::protocol::Bytes::from(translate::parse_hex(&cs.puzzle_reveal)?),
-                ),
-                solution: chia::protocol::Program::from(
-                    chia::protocol::Bytes::from(translate::parse_hex(&cs.solution)?),
-                ),
+                puzzle_reveal: chia::protocol::Program::from(chia::protocol::Bytes::from(
+                    translate::parse_hex(&cs.puzzle_reveal)?,
+                )),
+                solution: chia::protocol::Program::from(chia::protocol::Bytes::from(
+                    translate::parse_hex(&cs.solution)?,
+                )),
             })
         })
         .collect::<Result<_, ChiaQueryError>>()?;

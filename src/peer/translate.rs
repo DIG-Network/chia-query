@@ -119,10 +119,7 @@ pub fn header_block_to_block_record(hb: &HeaderBlock) -> BlockRecord {
     let rcb = &hb.reward_chain_block;
     let foliage = &hb.foliage;
 
-    let timestamp = hb
-        .foliage_transaction_block
-        .as_ref()
-        .map(|ft| ft.timestamp);
+    let timestamp = hb.foliage_transaction_block.as_ref().map(|ft| ft.timestamp);
 
     BlockRecord {
         header_hash: hex32(&foliage.reward_block_hash),

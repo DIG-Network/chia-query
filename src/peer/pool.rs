@@ -67,7 +67,10 @@ impl PeerPool {
         while let Some(result) = futures.next().await {
             match result {
                 Ok((peer, addr, receiver)) => {
-                    initial.push(PeerEntry { peer, address: addr });
+                    initial.push(PeerEntry {
+                        peer,
+                        address: addr,
+                    });
                     receivers.push(receiver);
                 }
                 Err(e) => log::debug!("initial peer connect failed: {e}"),
