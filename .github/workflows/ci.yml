@@ -43,13 +43,27 @@ jobs:
       - name: Check clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Coverage MUST be collected via the combined `cargo llvm-cov nextest` form so llvm-cov
+      # drives nextest directly -- never run `cargo nextest run` and `cargo llvm-cov` as two
+      # separate steps, that collects zero coverage (the exact bug this fixes, #489).
+      #
+      # `--no-tests=warn`: today this crate's only test file (tests/parity.rs) is a live-network
+      # `#[ignore]`d comparison suite (run manually with `--ignored` against mainnet), so a normal
+      # nextest run matches ZERO tests. Nextest's default `--no-tests` behavior is a HARD ERROR
+      # ("no tests to run", exit 4) in that case, which fails the job before coverage is even
+      # measured. `warn` makes "no tests matched" a warning instead of a failure so the (currently
+      # empty) coverage report still generates and uploads.
+      #
       # Coverage is measure-only for now: the active unit-test suite is still being built out
-      # (tracked in #157). It is NOT yet gated at >= 80% lines to avoid blocking this PR on a
-      # large new test suite; once the suite lands the gate becomes --fail-under-lines 80.
+      # (tracked in #157). It is NOT yet gated at >= 80% lines -- with zero non-ignored tests today,
+      # a `--fail-under-lines 80` gate would fail every PR unconditionally. Once the real unit-test
+      # suite lands (#157), flip this to the gated form: `cargo llvm-cov nextest --fail-under-lines 80
+      # --all-features --workspace --lcov --output-path lcov.info --retries 2`.
+      #
       # Runs via nextest with retries so a test that fails-then-passes is reported as FLAKY
       # (not a hard failure) instead of silently passing or blocking the build (#489).
       - name: Run tests with coverage (measure-only)
-        run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info --retries 2
+        run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info --retries 2 --no-tests=warn
 
       - name: Coverage summary
         if: always()
