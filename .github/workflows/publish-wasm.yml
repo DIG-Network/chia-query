@@ -6,7 +6,10 @@ name: Publish chia-query-wasm
 # consumes it in both environments.
 #
 # Triggered on a published GitHub Release (so it rides the release-on-tag flow)
-# and via manual dispatch. Needs the org npm token in `secrets.NPM_TOKEN`.
+# and via manual dispatch. Publishes via npm OIDC trusted publishing — no token,
+# no OTP: the trusted-publisher config on npmjs (repo DIG-Network/chia-query +
+# workflow publish-wasm.yml) lets a modern npm mint a short-lived credential from
+# the job's OIDC id-token. Provenance is auto-enabled under trusted publishing.
 
 on:
   release:
@@ -20,6 +23,11 @@ jobs:
   publish:
     name: Build (bundler + node) and publish to npm
     runs-on: ubuntu-latest
+    # id-token: write is REQUIRED so the job can request the OIDC token npm
+    # exchanges for a short-lived publish credential (trusted publishing).
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,6 +48,11 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        # GitHub runners ship an older npm that predates OIDC trusted publishing;
+        # a modern npm is what auto-detects the OIDC environment on publish.
+        run: npm install -g npm@latest
 
       - name: Build the npm package (bundler + node targets)
         # wasm-pack emits one target per invocation; merge the node build's
@@ -72,9 +85,9 @@ jobs:
           fs.writeFileSync('pkg/package.json', JSON.stringify(p, null, 2));
           NODE
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC trusted publishing)
         working-directory: pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        # `|| true` on the version-exists case keeps a re-run idempotent.
+        # No NODE_AUTH_TOKEN / .npmrc auth: with id-token: write + a modern npm +
+        # the trusted publisher configured on npm, `npm publish` auto-detects the
+        # OIDC environment and mints a short-lived token — no token, no OTP.
         run: npm publish --access public
