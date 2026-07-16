@@ -1,1 +1,6 @@
 /target
+
+# wasm-pack output (generated; published from CI)
+/pkg
+/pkg-bundler
+/pkg-node

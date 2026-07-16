@@ -1,0 +1,108 @@
+name: coinset API drift monitor
+
+# Watches api.coinset.org for shape drift. coinset.org publishes no OpenAPI
+# schema, so this scheduled sentinel probes representative endpoints, reduces
+# each response to its type-shape, and diffs against the committed snapshot
+# tests/fixtures/coinset-api-snapshot.json. On drift it files/updates a single
+# `coinset-drift` issue AND fails loud.
+#
+# This is NOT a required merge gate: it watches an EXTERNAL API, so a coinset
+# outage must never block PRs. It runs only on a schedule + manual dispatch.
+#
+# KEEPALIVE CAVEAT: GitHub auto-disables `schedule` workflows in a public repo
+# after 60 days with NO repository activity. This repo is actively developed,
+# but if the cron ever goes silent, re-enable it from the Actions tab (or push
+# any commit) — the schedule resumes once the repo sees activity.
+
+on:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: coinset-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Detect coinset.org API drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Probe coinset.org and diff against the snapshot
+        id: check
+        run: |
+          set +e
+          OUTPUT=$(cargo run --quiet --bin coinset_drift -- check 2>&1)
+          CODE=$?
+          echo "$OUTPUT"
+          {
+            echo 'report<<DRIFT_EOF'
+            echo "$OUTPUT"
+            echo 'DRIFT_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: File or update the drift issue
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPORT: ${{ steps.check.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="coinset.org API drift detected"
+          BODY=$(cat <<EOF
+          The scheduled drift monitor found that api.coinset.org no longer matches
+          the committed snapshot \`tests/fixtures/coinset-api-snapshot.json\`.
+
+          Follow the \`chia-query\` freshness preflight: confirm the change, update
+          the client + response types, refresh the snapshot
+          (\`cargo run --bin coinset_drift -- update\`), release chia-query, then bump
+          consumers.
+
+          \`\`\`
+          $REPORT
+          \`\`\`
+
+          Run: $RUN_URL
+          (Last updated: $(date -u +%Y-%m-%dT%H:%M:%SZ))
+          EOF
+          )
+
+          # Dedupe by the fixed title: update the one open issue, else create it.
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label coinset-drift --search "in:title \"$TITLE\"" \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "updated existing drift issue #$EXISTING"
+          else
+            # Ensure the label exists (fail-soft), then create.
+            gh label create coinset-drift --repo "$GITHUB_REPOSITORY" \
+              --color B60205 --description "api.coinset.org shape drift" 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --label coinset-drift --body "$BODY"
+            echo "created a new drift issue"
+          fi
+
+      - name: Fail loud on drift
+        if: steps.check.outputs.exit_code != '0'
+        run: |
+          echo "::error::coinset.org API drift detected — see the coinset-drift issue."
+          exit 1

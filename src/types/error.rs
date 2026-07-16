@@ -18,7 +18,7 @@ pub enum ChiaQueryError {
     CoinsetApiError(String),
 
     #[error("coinset HTTP error: {0}")]
-    CoinsetHttp(#[from] reqwest::Error),
+    CoinsetHttp(String),
 
     #[error("not supported without coinset: {0}")]
     UnsupportedWithoutCoinset(String),

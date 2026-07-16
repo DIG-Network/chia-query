@@ -1,0 +1,115 @@
+{
+  "get_block_record_by_height": {
+    "block_record": {
+      "challenge_block_info_hash": "string",
+      "challenge_vdf_output": {
+        "data": "string"
+      },
+      "deficit": "integer",
+      "farmer_puzzle_hash": "string",
+      "fees": "integer",
+      "finished_challenge_slot_hashes": "null",
+      "finished_infused_challenge_slot_hashes": "null",
+      "finished_reward_slot_hashes": "null",
+      "header_hash": "string",
+      "height": "integer",
+      "infused_challenge_vdf_output": {
+        "data": "string"
+      },
+      "overflow": "boolean",
+      "pool_puzzle_hash": "string",
+      "prev_hash": "string",
+      "prev_transaction_block_hash": "string",
+      "prev_transaction_block_height": "integer",
+      "required_iters": "integer",
+      "reward_claims_incorporated": [
+        {
+          "amount": "integer",
+          "parent_coin_info": "string",
+          "puzzle_hash": "string"
+        }
+      ],
+      "reward_infusion_new_challenge": "string",
+      "signage_point_index": "integer",
+      "sub_epoch_summary_included": "null",
+      "sub_slot_iters": "integer",
+      "timestamp": "integer",
+      "total_iters": "integer",
+      "weight": "integer"
+    },
+    "success": "boolean"
+  },
+  "get_blockchain_state": {
+    "blockchain_state": {
+      "average_block_time": "integer",
+      "block_max_cost": "integer",
+      "difficulty": "integer",
+      "genesis_challenge_initialized": "boolean",
+      "mempool_cost": "integer",
+      "mempool_fees": "integer",
+      "mempool_max_total_cost": "integer",
+      "mempool_min_fees": {
+        "cost_5000000": "integer"
+      },
+      "mempool_size": "integer",
+      "node_id": "string",
+      "peak": {
+        "challenge_block_info_hash": "string",
+        "challenge_vdf_output": {
+          "data": "string"
+        },
+        "deficit": "integer",
+        "farmer_puzzle_hash": "string",
+        "fees": "null",
+        "finished_challenge_slot_hashes": "null",
+        "finished_infused_challenge_slot_hashes": "null",
+        "finished_reward_slot_hashes": "null",
+        "header_hash": "string",
+        "height": "integer",
+        "infused_challenge_vdf_output": {
+          "data": "string"
+        },
+        "overflow": "boolean",
+        "pool_puzzle_hash": "string",
+        "prev_hash": "string",
+        "prev_transaction_block_hash": "null",
+        "prev_transaction_block_height": "integer",
+        "required_iters": "integer",
+        "reward_claims_incorporated": "null",
+        "reward_infusion_new_challenge": "string",
+        "signage_point_index": "integer",
+        "sub_epoch_summary_included": "null",
+        "sub_slot_iters": "integer",
+        "timestamp": "null",
+        "total_iters": "integer",
+        "weight": "integer"
+      },
+      "space": "integer",
+      "sub_slot_iters": "integer",
+      "sync": {
+        "sync_mode": "boolean",
+        "sync_progress_height": "integer",
+        "sync_tip_height": "integer",
+        "synced": "boolean"
+      }
+    },
+    "success": "boolean"
+  },
+  "get_coin_record_by_name__error": {
+    "error": "string",
+    "structuredError": {
+      "code": "string",
+      "data": {
+        "name": "string"
+      },
+      "message": "string"
+    },
+    "success": "boolean",
+    "traceback": "null"
+  },
+  "get_network_info": {
+    "network_name": "string",
+    "network_prefix": "string",
+    "success": "boolean"
+  }
+}

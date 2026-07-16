@@ -206,6 +206,9 @@ pub type MempoolItem = serde_json::Value;
 // Convenience conversions between our types and chia protocol types
 // ---------------------------------------------------------------------------
 
+// The peer tier is native-only, so the `chia` protocol conversion compiles
+// only on native builds; the wasm coinset core never touches `chia`.
+#[cfg(feature = "native")]
 impl Coin {
     /// Build from a `chia::protocol::Coin`, encoding hashes as 0x-prefixed hex.
     pub fn from_protocol(c: &chia::protocol::Coin) -> Self {

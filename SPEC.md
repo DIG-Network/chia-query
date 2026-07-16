@@ -151,14 +151,40 @@ Some endpoints have no direct peer protocol equivalent (e.g., `get_all_mempool_i
 
 ### CoinsetBackend
 
-A thin HTTP client wrapper around `api.coinset.org`. Each method:
+A thin, transport-generic client (`CoinsetClient<T: HttpTransport>`) over
+`api.coinset.org`. Each method:
 
 1. Serializes the request to JSON
-2. POSTs to `https://api.coinset.org/{endpoint}`
+2. POSTs to `{base_url}/{endpoint}` via the injected [transport](#http-transport)
 3. Deserializes the JSON response
-4. Maps `{ "success": false, "error": "..." }` to `ChiaQueryError::CoinsetError`
+4. Maps a `success: false` envelope to `ChiaQueryError::CoinsetApiError` (see
+   [Error envelopes](#error-envelopes))
 
-Uses `reqwest` with connection pooling enabled.
+#### HTTP transport
+
+The HTTP layer is abstracted behind the `HttpTransport` trait
+(`post_json(url, body) -> Value`) so the coinset tier compiles for both native
+and wasm:
+
+- **Native** (`native` feature, default): `ReqwestTransport` — a shared
+  `reqwest` client with a configurable timeout and connection pooling.
+- **wasm** (`coinset` feature, no `native`): `FetchTransport` — an **injected**
+  JavaScript `fetch` function (the host passes `window.fetch` / Node's global
+  `fetch`). No native HTTP stack reaches the wasm build.
+
+#### Error envelopes
+
+A failing coinset response carries
+`{ error, structuredError, traceback, success: false }`. The client resolves a
+human-readable message with this precedence:
+
+1. `structuredError` — the newer, stable summary. An object `{ code, data,
+   message }` (its `message` is used) or, on some endpoints, a bare string.
+2. `error` — the legacy message string.
+3. `"unknown error"` — when neither is present.
+
+`traceback` is **opaque** and MUST NOT surface into user-facing output — it is
+server-internal detail (stack frames) and is deliberately ignored.
 
 ### PeerPool
 
@@ -239,8 +265,9 @@ enum ChiaQueryError {
     /// coinset.org returned { "success": false, "error": "..." }
     CoinsetApiError(String),
 
-    /// HTTP transport error talking to coinset.org
-    CoinsetHttp(reqwest::Error),
+    /// HTTP transport error talking to coinset.org (message-only, so the
+    /// variant is transport-agnostic and compiles on wasm without reqwest)
+    CoinsetHttp(String),
 
     /// Request cannot be served by peers (no protocol equivalent),
     /// and coinset.org fallback is disabled
@@ -259,22 +286,23 @@ enum ChiaQueryError {
 
 ## Crate Dependencies
 
-```toml
-[dependencies]
-chia = "0.26"                        # Chia protocol types (Bytes32, Coin, CoinSpend, etc.)
-chia-wallet-sdk = { version = "0.30", features = ["native-tls"] }  # Peer connections, TLS
-tokio = { version = "1", features = ["full"] }  # Async runtime
-reqwest = { version = "0.12", features = ["json"] }  # HTTP client for coinset.org
-serde = { version = "1", features = ["derive"] }  # Serialization
-serde_json = "1"                     # JSON parsing
-thiserror = "2"                      # Error derive
-rand = "0.8"                         # Shuffling peer addresses
-futures-util = "0.3"                 # FuturesUnordered for concurrent connections
+The wasm-safe core (`serde`, `serde_json`, `thiserror`, `hex`, `sha2`, `log`)
+is always compiled. Everything else is optional and grouped by feature:
 
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-openssl-sys = { version = "0.9", features = ["vendored"] }
+```toml
+[features]
+default = ["native"]
+native  = ["dep:chia", "dep:clvmr", "dep:chia-wallet-sdk", "dep:tokio",
+           "dep:tokio-tungstenite", "dep:reqwest", "dep:rand", "dep:futures-util"]
+coinset = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys",
+           "dep:serde-wasm-bindgen", "dep:getrandom"]
 ```
+
+- **native** pulls the peer + routing stack: `chia`, `clvmr`,
+  `chia-wallet-sdk` (native-tls), `tokio`, `tokio-tungstenite`, `reqwest`,
+  `rand`, `futures-util`, and (linux-only) vendored `openssl`.
+- **coinset** pulls the wasm bindings: `wasm-bindgen`, `wasm-bindgen-futures`,
+  `js-sys`, `serde-wasm-bindgen`, and `getrandom` (js backend).
 
 ## Module Structure
 
@@ -282,21 +310,24 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 chia-query/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs                  # Public API: ChiaQuery, ChiaQueryConfig, re-exports
+│   ├── lib.rs                  # Public API: ChiaQuery (native), re-exports
+│   ├── drift.rs                # coinset API drift detection (shape + diff) — wasm-safe
+│   ├── wasm_api.rs             # @dignetwork/chia-query-wasm bindings (wasm coinset build)
+│   ├── bin/
+│   │   └── coinset_drift.rs    # Drift-monitor binary (native): probe + check/update
 │   ├── types/
 │   │   ├── mod.rs              # Type re-exports
-│   │   ├── request.rs          # Request parameter structs (mirror coinset.org JSON)
 │   │   ├── response.rs         # Response structs (CoinRecord, BlockRecord, etc.)
 │   │   └── error.rs            # ChiaQueryError enum
-│   ├── router.rs               # QueryRouter: peer-first dispatch with coinset fallback
-│   ├── peer/
-│   │   ├── mod.rs              # PeerBackend: translates API calls to peer protocol
-│   │   ├── pool.rs             # PeerPool: maintains 5 connections, ejection, replacement
-│   │   ├── connect.rs          # DNS discovery, TLS setup, connect_random logic
-│   │   └── translate.rs        # Peer protocol response -> coinset.org response format
+│   ├── router.rs               # (native) QueryRouter: peer-first dispatch + coinset fallback
+│   ├── peer/                   # (native) PeerBackend, pool, connect, translate
 │   └── coinset/
-│       ├── mod.rs              # CoinsetBackend: HTTP wrapper
-│       └── client.rs           # reqwest client, request/response serialization
+│       ├── mod.rs              # CoinsetClient<T>: transport-generic REST wrapper
+│       └── transport.rs        # HttpTransport trait: ReqwestTransport / FetchTransport
+├── tests/
+│   ├── parity.rs               # (native, #[ignore]) live peer-vs-coinset comparison
+│   └── fixtures/
+│       └── coinset-api-snapshot.json   # committed drift baseline
 ```
 
 ## Configuration
@@ -371,3 +402,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Build Targets & Feature Flags
+
+chia-query builds for two targets from one source tree, selected by feature:
+
+| Feature | Target | Surface |
+|---------|--------|---------|
+| `native` (default) | native | Full client: peer WebSockets + CLVM routing + `reqwest`, racing peers against the coinset fallback (`ChiaQuery`). |
+| `coinset` | `wasm32-unknown-unknown` | The coinset.org REST tier only (`coinset::CoinsetClient`), HTTP over an injected `fetch`. |
+
+Build the wasm coinset-only tier with:
+
+```
+cargo build --target wasm32-unknown-unknown --no-default-features --features coinset
+```
+
+All non-coinset code (the peer backend, `router.rs` CLVM execution,
+`chia-wallet-sdk` + `native-tls`, `tokio` networking, `reqwest`, the linux
+vendored OpenSSL, `Coin::from_protocol`) is gated behind the `native` feature,
+so the wasm build pulls in none of it — no `blst`, no native HTTP, no
+`getrandom` leak. A CI job (`wasm-coinset`) asserts this stays clean on every PR.
+
+### `@dignetwork/chia-query-wasm`
+
+`wasm-pack` builds the coinset tier into the npm package
+`@dignetwork/chia-query-wasm`, published for BOTH the browser (bundler target)
+and Node (nodejs target) so a consumer — notably dig-urn-resolver's chain-verify
+— runs in either environment. The bindings (`wasm_api::CoinsetClient`) take an
+injected `fetch`:
+
+```js
+import { CoinsetClient } from '@dignetwork/chia-query-wasm';
+const client = new CoinsetClient('https://api.coinset.org', fetch);
+const state = await client.request('get_blockchain_state', {});
+```
+
+**Trade-off (single-endpoint trust).** The wasm coinset-only build drops the
+peer tier, so a wasm consumer reads from ONE coinset endpoint with no
+peer cross-check. This is acceptable because on-chain verification stays
+client-side (singleton-lineage / anti-rollback checks layered on top of the raw
+reads), the coinset URL is configurable (a consumer may point at its own trusted
+node), and the transport abstraction leaves room for a future multi-endpoint
+cross-check without an API change.
+
+## coinset.org API Drift Monitor
+
+coinset.org publishes no OpenAPI schema, so a scheduled sentinel watches it for
+breaking changes (the automated backstop to the chia-query freshness preflight).
+
+- **Mechanism.** `src/drift.rs` reduces a JSON response to its *type-shape* —
+  every key preserved, every scalar replaced by a type tag (`string`,
+  `integer`, `number`, `boolean`, `null`), arrays collapsed to a single-element
+  shape — discarding all concrete values (which change every block). `diff_shapes`
+  reports each added/removed key and each type/structure change between two shapes.
+- **Snapshot.** `tests/fixtures/coinset-api-snapshot.json` is the committed
+  baseline shape of a representative probe set: `get_blockchain_state`,
+  `get_network_info`, `get_block_record_by_height`, and an error-envelope probe
+  (`get_coin_record_by_name` on an absent coin — guards the
+  `error`/`structuredError`/`traceback` shape).
+- **Binary.** `coinset_drift check` (native, `required-features = ["native"]`)
+  probes live coinset, diffs against the snapshot, and exits non-zero on drift;
+  `coinset_drift update` regenerates the snapshot.
+- **Workflow.** `.github/workflows/coinset-drift.yml` runs `check` on a daily
+  cron + manual dispatch. On drift it files/updates a single deduped
+  `coinset-drift` issue (one open issue, updated not duplicated) AND fails loud.
+  It is NOT a required merge gate — it watches an external API, so a coinset
+  outage never blocks PRs.

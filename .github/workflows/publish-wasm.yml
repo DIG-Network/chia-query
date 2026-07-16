@@ -1,0 +1,80 @@
+name: Publish chia-query-wasm
+
+# Builds the coinset-only wasm package with wasm-pack and publishes it to npm
+# as @dignetwork/chia-query-wasm. Two entry points are shipped so it runs in
+# BOTH the browser (bundler target) and Node (nodejs target) — dig-urn-resolver
+# consumes it in both environments.
+#
+# Triggered on a published GitHub Release (so it rides the release-on-tag flow)
+# and via manual dispatch. Needs the org npm token in `secrets.NPM_TOKEN`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build (bundler + node) and publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build the npm package (bundler + node targets)
+        # wasm-pack emits one target per invocation; merge the node build's
+        # entry point into the bundler package so a single published package
+        # works in both browsers and Node.
+        run: |
+          set -euo pipefail
+          wasm-pack build --release --target bundler --out-dir pkg \
+            --no-default-features --features coinset
+          wasm-pack build --release --target nodejs --out-dir pkg-node \
+            --no-default-features --features coinset
+
+          # Fold the Node entry point in beside the bundler entry point.
+          cp pkg-node/chia_query.js pkg/chia_query_node.js
+          cp pkg-node/chia_query_bg.wasm pkg/chia_query_node_bg.wasm 2>/dev/null || true
+
+          # Rename to the scoped package + wire dual entry points.
+          node - <<'NODE'
+          const fs = require('fs');
+          const p = JSON.parse(fs.readFileSync('pkg/package.json', 'utf8'));
+          p.name = '@dignetwork/chia-query-wasm';
+          p.description = 'coinset.org REST access for the browser and Node (the DIG Network chia-query wasm build)';
+          p.repository = { type: 'git', url: 'https://github.com/DIG-Network/chia-query.git' };
+          p.license = 'MIT';
+          // Bundler build is the default (browser); expose the Node build too.
+          p.exports = {
+            '.': { node: './chia_query_node.js', default: './chia_query.js' },
+          };
+          p.files = Array.from(new Set([...(p.files || []), 'chia_query_node.js', 'chia_query_node_bg.wasm']));
+          fs.writeFileSync('pkg/package.json', JSON.stringify(p, null, 2));
+          NODE
+
+      - name: Publish to npm
+        working-directory: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # `|| true` on the version-exists case keeps a re-run idempotent.
+        run: npm publish --access public

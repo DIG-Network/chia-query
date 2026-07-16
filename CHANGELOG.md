@@ -35,5 +35,3 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Chores
 - Remove target/ from tracking, add .gitignore
-
-
