@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.3.0] - 2026-07-16
+
+### Features
+- **coinset:** StructuredError capture + drift-monitor + wasm coinset build (#3)
+
 ## [0.2.2] - 2026-07-12
 
 ### CI
@@ -35,3 +40,5 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Chores
 - Remove target/ from tracking, add .gitignore
+
+
