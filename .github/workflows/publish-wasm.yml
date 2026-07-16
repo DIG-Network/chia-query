@@ -51,8 +51,10 @@ jobs:
 
       - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
         # GitHub runners ship an older npm that predates OIDC trusted publishing;
-        # a modern npm is what auto-detects the OIDC environment on publish.
-        run: npm install -g npm@latest
+        # a modern npm is what auto-detects the OIDC environment on publish. Pin
+        # to the 11.x line: npm@latest (12.x) requires Node >= 22, but this job
+        # runs on Node 20, and 11.5.1 already clears the OIDC floor.
+        run: npm install -g npm@^11.5.1
 
       - name: Build the npm package (bundler + node targets)
         # wasm-pack emits one target per invocation; merge the node build's
