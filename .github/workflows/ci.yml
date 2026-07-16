@@ -79,3 +79,28 @@ jobs:
 
       - name: Check documentation
         run: cargo doc --no-deps --all-features
+
+  wasm-coinset:
+    name: Build & lint (wasm32 coinset-only)
+    runs-on: ubuntu-latest
+    # Proves the coinset REST tier stays wasm-clean: no native HTTP, no blst,
+    # no getrandom leak, none of the peer/CLVM stack reaches the wasm build.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build coinset-only for wasm32
+        run: cargo build --target wasm32-unknown-unknown --no-default-features --features coinset
+
+      - name: Clippy coinset-only for wasm32
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features coinset -- -D warnings

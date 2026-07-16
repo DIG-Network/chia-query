@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -9,22 +9,69 @@ readme = "README.md"
 keywords = ["chia", "blockchain", "coinset", "peer", "query"]
 categories = ["api-bindings", "cryptography::cryptocurrencies"]
 
+[lib]
+# `cdylib` for the wasm-pack build; `rlib` so native consumers + the drift bin
+# + tests still link the crate normally.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `native` (default) is the full client: peer WebSockets + CLVM routing +
+# reqwest, racing decentralized peers against the coinset.org fallback.
+default = ["native"]
+native = [
+    "dep:chia",
+    "dep:clvmr",
+    "dep:chia-wallet-sdk",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:reqwest",
+    "dep:rand",
+    "dep:futures-util",
+]
+# `coinset` is the wasm-safe core: the coinset.org REST tier only, with its
+# HTTP riding an injected `fetch` transport. Build it wasm-clean with
+# `cargo build --target wasm32-unknown-unknown --no-default-features --features coinset`.
+coinset = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:serde-wasm-bindgen",
+    "dep:getrandom",
+]
+
 [dependencies]
-chia = "0.26"
-clvmr = "0.14"
-chia-wallet-sdk = { version = "0.30", features = ["native-tls"] }
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
-reqwest = { version = "0.12", features = ["json"] }
+# --- wasm-safe core (always compiled) ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
-futures-util = "0.3"
 log = "0.4"
 
+# --- native-only (the peer + routing tiers) ---
+chia = { version = "0.26", optional = true }
+clvmr = { version = "0.14", optional = true }
+chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+rand = { version = "0.8", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# --- wasm-only (the injected-fetch coinset transport + bindings) ---
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+# `getrandom` with the `js` backend keeps any transitive RNG wasm-clean.
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[[bin]]
+name = "coinset_drift"
+required-features = ["native"]
+
+# Linux-only vendored OpenSSL for the native TLS stack. Inert on wasm
+# (target_os != "linux"), so it never reaches the coinset-only build.
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 openssl-sys = { version = "0.9", features = ["vendored"] }
