@@ -556,7 +556,10 @@ the current unspent tip, collecting every member coin id. It is NEVER an echo of
 coin, so `SingletonLineage::contains` MEMBERSHIP is meaningful. Each hop is authenticated by
 `singleton_child_from_spend`: the spent coin's puzzle reveal MUST hash to its committed puzzle hash
 (`clvm_utils::tree_hash`), and the child is the odd-amount `CREATE_COIN` output of the parent spend
-(computed with `chia_protocol::Coin::coin_id`). A revisited coin (cycle) fails closed as `Malformed`.
+(computed with `chia_protocol::Coin::coin_id`). Additionally, each hop binds the fetched spend to the
+requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to `launcher_id`),
+making the walk cryptographically self-authenticating from the launcher; a mismatch fails closed as
+`Malformed`. A revisited coin (cycle) fails closed as `Malformed`.
 `Ok(None)` = the launcher never existed or the singleton was fully melted. **Per-hop CLVM
 verification is NECESSARY but NOT SUFFICIENT** -- it does not defeat total fabrication; the registry
 trust model layered above provides custody soundness.

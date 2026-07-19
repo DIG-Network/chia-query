@@ -55,6 +55,14 @@ where
     let Some(launch_spend) = fetch_spend(launcher_id).await? else {
         return Ok(None); // launcher never spent => never launched
     };
+    // Bind the fetched spend to the coin we asked for: a source must not answer the launcher query
+    // with the spend of a DIFFERENT coin. Without this, a compromised source could seed the walk
+    // from a coin of its choosing. `coin_id` is a SHA-256 commitment, so this cannot be forged.
+    if launch_spend.coin.coin_id() != launcher_id {
+        return Err(ChainSourceError::Malformed(
+            "fetched launcher spend does not match the requested launcher id".to_string(),
+        ));
+    }
     let Some(mut current) = extract_child(&launch_spend)? else {
         return Ok(None); // the launcher spend created no singleton child => not a singleton launch
     };
@@ -71,12 +79,25 @@ where
         match fetch_spend(current).await? {
             // `current` is unspent — it is the live tip.
             None => return Ok(Some(SingletonLineage::new(current, members))),
-            Some(spend) => match extract_child(&spend)? {
-                Some(child) => current = child,
-                // Spent with no singleton recreation output — the singleton was melted; there is
-                // no live tip, so the lineage is genuinely gone.
-                None => return Ok(None),
-            },
+            Some(spend) => {
+                // Bind the fetched spend to `current`: the source must return the spend OF the coin
+                // being walked, not an internally-consistent spend of some other coin. The per-hop
+                // reveal check (`singleton_child_from_spend`) only proves the reveal matches the
+                // spend's OWN coin — it does NOT prove that coin is `current`. This coin-id binding
+                // closes that gap, making the walk cryptographically self-authenticating from the
+                // launcher: a mismatch fails closed (Malformed) BEFORE deriving the child.
+                if spend.coin.coin_id() != current {
+                    return Err(ChainSourceError::Malformed(
+                        "fetched spend does not match the requested coin id".to_string(),
+                    ));
+                }
+                match extract_child(&spend)? {
+                    Some(child) => current = child,
+                    // Spent with no singleton recreation output — the singleton was melted; there
+                    // is no live tip, so the lineage is genuinely gone.
+                    None => return Ok(None),
+                }
+            }
         }
     }
 }
@@ -413,5 +434,59 @@ mod tests {
         let result =
             walk_singleton_lineage(launcher_id, fetcher(spends), table_extractor(children)).await;
         assert!(matches!(result, Err(ChainSourceError::Malformed(_))));
+    }
+
+    /// Core regression proof (both gates): a source returns an internally-consistent spend whose
+    /// `coin.coin_id()` is NOT the coin being walked. The per-hop reveal check passes (the reveal
+    /// hashes to the spend's OWN coin), so only the coin-id binding catches it. The walk MUST fail
+    /// closed rather than emit a bogus lineage.
+    #[tokio::test]
+    async fn spend_of_wrong_coin_fails_closed() {
+        let launcher = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1);
+        let launcher_id = launcher.coin_id();
+        let eve = coin(launcher_id, 0x10);
+
+        // The eve query is answered with the spend of a DIFFERENT coin (a "wrong coin"): its own
+        // reveal/coin are internally consistent, but its coin id is not `eve`.
+        let wrong = coin(Bytes32::new([0xDD; 32]), 0x20);
+        assert_ne!(wrong.coin_id(), eve.coin_id());
+
+        let mut spends = HashMap::new();
+        spends.insert(launcher_id, spend_of(launcher));
+        spends.insert(eve.coin_id(), spend_of(wrong)); // spend of the wrong coin
+
+        let mut children = HashMap::new();
+        children.insert(launcher_id, eve.coin_id());
+        // The wrong spend would extract to some child, but the binding rejects it first.
+        children.insert(wrong.coin_id(), coin(wrong.coin_id(), 0x21).coin_id());
+
+        let result =
+            walk_singleton_lineage(launcher_id, fetcher(spends), table_extractor(children)).await;
+        assert!(
+            matches!(result, Err(ChainSourceError::Malformed(_))),
+            "a spend of the wrong coin must fail closed, got {result:?}"
+        );
+    }
+
+    /// The launcher query is answered with the spend of a coin whose id is not `launcher_id`.
+    #[tokio::test]
+    async fn launcher_spend_mismatch_fails_closed() {
+        let real_launcher = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1);
+        let launcher_id = real_launcher.coin_id();
+        let other = Coin::new(Bytes32::new([0xCC; 32]), Bytes32::new([0x03; 32]), 1);
+        assert_ne!(other.coin_id(), launcher_id);
+
+        let mut spends = HashMap::new();
+        spends.insert(launcher_id, spend_of(other)); // spend of the wrong coin under launcher_id
+
+        let mut children = HashMap::new();
+        children.insert(other.coin_id(), coin(other.coin_id(), 0x10).coin_id());
+
+        let result =
+            walk_singleton_lineage(launcher_id, fetcher(spends), table_extractor(children)).await;
+        assert!(
+            matches!(result, Err(ChainSourceError::Malformed(_))),
+            "a launcher spend of the wrong coin must fail closed, got {result:?}"
+        );
     }
 }
