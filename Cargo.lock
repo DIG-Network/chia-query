@@ -363,11 +363,13 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chia",
+ "chia-protocol",
  "chia-wallet-sdk",
  "clvmr",
+ "dig-chainsource-interface",
  "futures-util",
  "getrandom 0.2.17",
  "hex",
@@ -888,6 +890,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
+]
+
+[[package]]
+name = "dig-chainsource-interface"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01084c5fb2b4a14db1569da4fef039de14e3db8c5588ded3504945d7333a133c"
+dependencies = [
+ "chia-protocol",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

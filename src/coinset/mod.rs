@@ -95,6 +95,24 @@ impl<T: HttpTransport> CoinsetClient<T> {
             .map_err(|e| ChiaQueryError::CoinsetApiError(format!("parse `{key}`: {e}")))
     }
 
+    /// Absence-aware sibling of [`post_extract`](Self::post_extract): distinguishes a PROVABLE
+    /// absence from a failure.
+    ///
+    /// coinset.org answers a "not found" single-record query with a `success: true` envelope whose
+    /// data field is `null`. That is provable absence -> `Ok(None)`. A `success: false` envelope
+    /// (handled by [`post`](Self::post)) is a failure -> `Err`, as is a present-but-unparseable
+    /// field. Absence is NEVER collapsed into an error, and a transport/API error is NEVER collapsed
+    /// into `Ok(None)` (SPEC §3, the money-critical mapping).
+    async fn post_extract_opt<D: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        key: &str,
+    ) -> Result<Option<D>, ChiaQueryError> {
+        let json = self.post(endpoint, body).await?;
+        optional_field(&json, key)
+    }
+
     // =======================================================================
     // Blocks
     // =======================================================================
@@ -143,6 +161,20 @@ impl<T: HttpTransport> CoinsetClient<T> {
         height: u32,
     ) -> Result<BlockRecord, ChiaQueryError> {
         self.post_extract(
+            "get_block_record_by_height",
+            &json!({ "height": height }),
+            "block_record",
+        )
+        .await
+    }
+
+    /// Absence-aware [`get_block_record_by_height`](Self::get_block_record_by_height): `Ok(None)`
+    /// when no block exists at `height` (coinset returns `block_record: null`), `Err` on failure.
+    pub async fn get_block_record_by_height_opt(
+        &self,
+        height: u32,
+    ) -> Result<Option<BlockRecord>, ChiaQueryError> {
+        self.post_extract_opt(
             "get_block_record_by_height",
             &json!({ "height": height }),
             "block_record",
@@ -220,6 +252,20 @@ impl<T: HttpTransport> CoinsetClient<T> {
 
     pub async fn get_coin_record_by_name(&self, name: &str) -> Result<CoinRecord, ChiaQueryError> {
         self.post_extract(
+            "get_coin_record_by_name",
+            &json!({ "name": name }),
+            "coin_record",
+        )
+        .await
+    }
+
+    /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name): `Ok(None)` when the
+    /// coin provably does not exist, `Err` when the read could not be completed.
+    pub async fn get_coin_record_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+        self.post_extract_opt(
             "get_coin_record_by_name",
             &json!({ "name": name }),
             "coin_record",
@@ -358,6 +404,21 @@ impl<T: HttpTransport> CoinsetClient<T> {
         height: Option<u32>,
     ) -> Result<CoinSpend, ChiaQueryError> {
         self.post_extract(
+            "get_puzzle_and_solution",
+            &json!({ "coin_id": coin_id, "height": height }),
+            "coin_solution",
+        )
+        .await
+    }
+
+    /// Absence-aware [`get_puzzle_and_solution`](Self::get_puzzle_and_solution): `Ok(None)` when the
+    /// coin is provably unspent/unknown (coinset returns `coin_solution: null`), `Err` on failure.
+    pub async fn get_puzzle_and_solution_opt(
+        &self,
+        coin_id: &str,
+        height: Option<u32>,
+    ) -> Result<Option<CoinSpend>, ChiaQueryError> {
+        self.post_extract_opt(
             "get_puzzle_and_solution",
             &json!({ "coin_id": coin_id, "height": height }),
             "coin_solution",
@@ -532,6 +593,23 @@ fn structured_error_message(value: Option<&Value>) -> Option<String> {
     }
 }
 
+/// Interprets the `key` field of a `success: true` coinset envelope as a PROVABLE-absence signal.
+///
+/// A `null` (or absent) field means the queried record genuinely does not exist -> `Ok(None)`. A
+/// present field that fails to deserialize is a malformed/unusable answer -> `Err` (never
+/// `Ok(None)`), so an unparseable payload can never be mistaken for absence (SPEC §3).
+fn optional_field<D: serde::de::DeserializeOwned>(
+    json: &Value,
+    key: &str,
+) -> Result<Option<D>, ChiaQueryError> {
+    match json.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(present) => serde_json::from_value(present.clone())
+            .map(Some)
+            .map_err(|e| ChiaQueryError::CoinsetApiError(format!("parse `{key}`: {e}"))),
+    }
+}
+
 /// A trimmed, owned copy of a JSON string value, or `None` when absent/blank.
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
     value
@@ -602,5 +680,47 @@ mod tests {
     fn generic_message_when_nothing_usable() {
         let envelope = json!({ "success": false });
         assert_eq!(coinset_error_message(&envelope), "unknown error");
+    }
+
+    // ---- optional_field: PROVABLE absence vs a malformed payload (SPEC §3) ----
+
+    #[test]
+    fn optional_field_null_is_provable_absence() {
+        // A `success: true` envelope with a null record = the coin genuinely does not exist.
+        let envelope = json!({ "success": true, "coin_record": null });
+        let record: Option<CoinRecord> = optional_field(&envelope, "coin_record").unwrap();
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn optional_field_missing_key_is_absence() {
+        let envelope = json!({ "success": true });
+        let record: Option<CoinRecord> = optional_field(&envelope, "coin_record").unwrap();
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn optional_field_present_record_is_some() {
+        let envelope = json!({
+            "success": true,
+            "coin_record": {
+                "coin": { "parent_coin_info": "0x00", "puzzle_hash": "0x11", "amount": 1 },
+                "confirmed_block_index": 5,
+                "spent_block_index": 0,
+                "spent": false,
+                "coinbase": false,
+                "timestamp": 123
+            }
+        });
+        let record: Option<CoinRecord> = optional_field(&envelope, "coin_record").unwrap();
+        assert_eq!(record.unwrap().confirmed_block_index, 5);
+    }
+
+    #[test]
+    fn optional_field_unparseable_present_payload_is_error_not_absence() {
+        // Present but malformed -> Err, NEVER Ok(None): an unusable answer must not read as absence.
+        let envelope = json!({ "success": true, "coin_record": "not-an-object" });
+        let result: Result<Option<CoinRecord>, _> = optional_field(&envelope, "coin_record");
+        assert!(result.is_err());
     }
 }

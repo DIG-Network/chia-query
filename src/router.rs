@@ -94,6 +94,38 @@ impl QueryRouter {
         }
     }
 
+    /// Absence-aware variant of [`peer_then_coinset`](Self::peer_then_coinset).
+    ///
+    /// A successful peer response — whether `Some` (found) or `None` (provable absence) — is
+    /// authoritative and returned immediately. Only a peer FAILURE falls through to the retry and
+    /// then the coinset fallback, so a genuine absence is never masked by a fallback and a failure
+    /// is never collapsed into `Ok(None)` (SPEC §3).
+    async fn peer_then_coinset_opt<T>(
+        &self,
+        peer_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+        peer_retry: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+        coinset_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+    ) -> Result<Option<T>, ChiaQueryError> {
+        match peer_fn.await {
+            Ok(v) => return Ok(v),
+            Err(e) => log::debug!("peer opt attempt 1 failed: {e}"),
+        }
+        match peer_retry.await {
+            Ok(v) => Ok(v),
+            Err(peer_err) => {
+                if !self.coinset_fallback_enabled {
+                    return Err(peer_err);
+                }
+                coinset_fn
+                    .await
+                    .map_err(|ce| ChiaQueryError::AllSourcesFailed {
+                        peer_error: Box::new(peer_err),
+                        coinset_error: Some(Box::new(ce)),
+                    })
+            }
+        }
+    }
+
     /// For endpoints that have no peer protocol equivalent.
     fn require_coinset(&self, endpoint: &str) -> Result<(), ChiaQueryError> {
         if !self.coinset_fallback_enabled {
@@ -296,6 +328,77 @@ impl QueryRouter {
             self.coinset.get_coin_record_by_name(name),
         )
         .await
+    }
+
+    /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name): a PROVABLE absence
+    /// is `Ok(None)`, every transport/rejection/parse failure is `Err`. A successful peer or coinset
+    /// response that reports no such coin is the authoritative absence; only when the peer read
+    /// itself fails does the router fall back to coinset (SPEC §3).
+    pub async fn get_coin_record_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+        self.peer_then_coinset_opt(
+            self.peer.try_get_coin_record_by_name_opt(name),
+            self.peer.try_get_coin_record_by_name_opt(name),
+            self.coinset.get_coin_record_by_name_opt(name),
+        )
+        .await
+    }
+
+    /// Absence-aware read of the spend that spent `coin_id`: `Ok(None)` when the coin is provably
+    /// unspent/unknown, `Err` when the read could not be completed.
+    pub async fn get_coin_spend_opt(
+        &self,
+        coin_id: &str,
+    ) -> Result<Option<CoinSpend>, ChiaQueryError> {
+        self.peer_then_coinset_opt(
+            self.peer.try_get_coin_spend_opt(coin_id),
+            self.peer.try_get_coin_spend_opt(coin_id),
+            self.coinset.get_puzzle_and_solution_opt(coin_id, None),
+        )
+        .await
+    }
+
+    /// The current peak height, or `Ok(None)` when no source exposes a peak; `Err` on failure.
+    pub async fn peak_height_opt(&self) -> Result<Option<u32>, ChiaQueryError> {
+        let state = self.get_blockchain_state().await?;
+        Ok(state.peak.map(|p| p.height))
+    }
+
+    /// The Unix timestamp of the block at `height`: `Ok(None)` when no such block exists or the
+    /// block carries no timestamp; `Err` on failure.
+    pub async fn block_timestamp_opt(&self, height: u32) -> Result<Option<u64>, ChiaQueryError> {
+        let record = self.get_block_record_by_height_opt(height).await?;
+        Ok(record.and_then(|r| r.timestamp))
+    }
+
+    /// Absence-aware block-record read used by [`block_timestamp_opt`](Self::block_timestamp_opt).
+    async fn get_block_record_by_height_opt(
+        &self,
+        height: u32,
+    ) -> Result<Option<BlockRecord>, ChiaQueryError> {
+        // A successful peer read is authoritative; only a peer FAILURE falls through to coinset,
+        // whose null block_record is provable absence.
+        if let Ok(record) = self.peer.try_get_block_record_by_height(height).await {
+            return Ok(Some(record));
+        }
+        match self.peer.try_get_block_record_by_height(height).await {
+            Ok(record) => Ok(Some(record)),
+            Err(peer_err) => {
+                if self.coinset_fallback_enabled {
+                    self.coinset
+                        .get_block_record_by_height_opt(height)
+                        .await
+                        .map_err(|ce| ChiaQueryError::AllSourcesFailed {
+                            peer_error: Box::new(peer_err),
+                            coinset_error: Some(Box::new(ce)),
+                        })
+                } else {
+                    Err(peer_err)
+                }
+            }
+        }
     }
 
     pub async fn get_coin_records_by_hint(

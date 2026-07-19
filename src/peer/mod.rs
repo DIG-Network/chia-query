@@ -97,6 +97,40 @@ impl PeerBackend {
         res
     }
 
+    /// Absence-aware sibling of [`try_get_coin_record_by_name`](Self::try_get_coin_record_by_name).
+    ///
+    /// A successful `RespondCoinState` with an EMPTY coin-state list is PROVABLE absence -> `Ok(None)`;
+    /// a rejected/timed-out request is a failure -> `Err`. This split is what lets the aggregating
+    /// provider report a genuinely-absent coin as `Ok(None)` rather than a spurious error (SPEC §3).
+    pub async fn try_get_coin_record_by_name_opt(
+        &self,
+        name: &str,
+    ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+        let (peer, addr) = self.pick().await?;
+        let res = self.do_get_coin_record_by_name_opt(&peer, name).await;
+        if res.is_err() {
+            self.pool.eject_peer(addr).await;
+        }
+        res
+    }
+
+    /// Absence-aware read of the spend that spent `coin_id`.
+    ///
+    /// Returns `Ok(None)` when the coin is provably unknown (no coin-state) or unspent (no spent
+    /// height) — both genuine "there is no such spend" answers — and `Err` only when the peer read
+    /// itself fails.
+    pub async fn try_get_coin_spend_opt(
+        &self,
+        coin_id: &str,
+    ) -> Result<Option<CoinSpend>, ChiaQueryError> {
+        let (peer, addr) = self.pick().await?;
+        let res = self.do_get_coin_spend_opt(&peer, coin_id).await;
+        if res.is_err() {
+            self.pool.eject_peer(addr).await;
+        }
+        res
+    }
+
     pub async fn try_get_coin_records_by_puzzle_hash(
         &self,
         puzzle_hash: &str,
@@ -460,6 +494,61 @@ impl PeerBackend {
             .first()
             .map(translate::coin_state_to_record)
             .ok_or_else(|| ChiaQueryError::PeerRejection("coin not found".into()))
+    }
+
+    /// Absence-aware coin-record read: a successful response with no coin-state is `Ok(None)`; a
+    /// rejected/timed-out request is `Err`.
+    async fn do_get_coin_record_by_name_opt(
+        &self,
+        peer: &Peer,
+        name: &str,
+    ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+        let coin_id = translate::parse_bytes32(name)?;
+
+        let response = tokio::time::timeout(self.request_timeout, {
+            peer.request_coin_state(vec![coin_id], None, self.genesis_challenge(), false)
+        })
+        .await
+        .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
+        .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
+        .map_err(|_| ChiaQueryError::PeerRejection("coin state request rejected".into()))?;
+
+        // An empty coin-state list from a SUCCESSFUL response is provable absence.
+        Ok(response
+            .coin_states
+            .first()
+            .map(translate::coin_state_to_record))
+    }
+
+    /// Absence-aware read of the spend that spent `coin_id`: `Ok(None)` when the coin is unknown or
+    /// unspent, `Err` when the peer read fails.
+    async fn do_get_coin_spend_opt(
+        &self,
+        peer: &Peer,
+        coin_id: &str,
+    ) -> Result<Option<CoinSpend>, ChiaQueryError> {
+        let id = translate::parse_bytes32(coin_id)?;
+
+        let state_resp = tokio::time::timeout(self.request_timeout, {
+            peer.request_coin_state(vec![id], None, self.genesis_challenge(), false)
+        })
+        .await
+        .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
+        .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
+        .map_err(|_| ChiaQueryError::PeerRejection("coin state rejected".into()))?;
+
+        // Unknown coin or unspent coin => there is genuinely no spend => Ok(None).
+        let Some(cs) = state_resp.coin_states.first() else {
+            return Ok(None);
+        };
+        let Some(spent_height) = cs.spent_height else {
+            return Ok(None);
+        };
+
+        let spend = self
+            .do_get_puzzle_and_solution(peer, coin_id, spent_height)
+            .await?;
+        Ok(Some(spend))
     }
 
     async fn do_puzzle_hash_query(

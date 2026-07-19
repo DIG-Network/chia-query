@@ -29,6 +29,8 @@ pub mod wasm_api;
 #[cfg(feature = "native")]
 pub mod peer;
 #[cfg(feature = "native")]
+pub mod provider_registry;
+#[cfg(feature = "native")]
 pub mod router;
 
 pub use types::*;
@@ -259,6 +261,39 @@ mod native_client {
             name: &str,
         ) -> Result<CoinRecord, ChiaQueryError> {
             self.router.get_coin_record_by_name(name).await
+        }
+
+        /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name): `Ok(None)` when
+        /// the coin provably does not exist, `Err` when the read could not be completed. Used by the
+        /// [`ChainSource`](dig_chainsource_interface::ChainSource) facade to honour the fail-closed
+        /// `Ok(None)`-vs-`Err` contract.
+        pub async fn get_coin_record_by_name_opt(
+            &self,
+            name: &str,
+        ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+            self.router.get_coin_record_by_name_opt(name).await
+        }
+
+        /// Absence-aware read of the spend that spent `coin_id`: `Ok(None)` when the coin is
+        /// provably unspent/unknown, `Err` on failure.
+        pub async fn get_coin_spend_opt(
+            &self,
+            coin_id: &str,
+        ) -> Result<Option<CoinSpend>, ChiaQueryError> {
+            self.router.get_coin_spend_opt(coin_id).await
+        }
+
+        /// The current peak height (`Ok(None)` when unavailable), `Err` on failure.
+        pub async fn peak_height_opt(&self) -> Result<Option<u32>, ChiaQueryError> {
+            self.router.peak_height_opt().await
+        }
+
+        /// The Unix timestamp of the block at `height` (`Ok(None)` when absent), `Err` on failure.
+        pub async fn block_timestamp_opt(
+            &self,
+            height: u32,
+        ) -> Result<Option<u64>, ChiaQueryError> {
+            self.router.block_timestamp_opt(height).await
         }
 
         pub async fn get_coin_records_by_hint(
