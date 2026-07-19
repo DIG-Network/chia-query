@@ -10,7 +10,7 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
 use dig_chainsource_interface::{ChainSourceError, CoinRecord as IfaceCoinRecord};
 
 use crate::types::{
-    ChiaQueryError, CoinRecord as ChqCoinRecord, CoinSpend as ChqCoinSpend, Coin as ChqCoin,
+    ChiaQueryError, Coin as ChqCoin, CoinRecord as ChqCoinRecord, CoinSpend as ChqCoinSpend,
 };
 
 /// Parses a `0x`-prefixed (or bare) hex string into a [`Bytes32`], failing closed with
@@ -217,8 +217,7 @@ mod tests {
 
     #[test]
     fn unsupported_maps_to_unsupported() {
-        let mapped =
-            map_query_error(ChiaQueryError::UnsupportedWithoutCoinset("get_x".into()));
+        let mapped = map_query_error(ChiaQueryError::UnsupportedWithoutCoinset("get_x".into()));
         assert!(matches!(mapped, ChainSourceError::Unsupported(_)));
     }
 

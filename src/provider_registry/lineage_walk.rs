@@ -93,11 +93,12 @@ pub(crate) fn singleton_child_from_spend(
 ) -> Result<Option<Bytes32>, ChainSourceError> {
     let mut allocator = Allocator::new();
 
-    let puzzle = clvmr::serde::node_from_bytes_backrefs(&mut allocator, spend.puzzle_reveal.as_ref())
-        .map_err(|e| ChainSourceError::Malformed(format!("undecodable puzzle reveal: {e}")))?;
+    let puzzle =
+        clvmr::serde::node_from_bytes_backrefs(&mut allocator, spend.puzzle_reveal.as_ref())
+            .map_err(|e| ChainSourceError::Malformed(format!("undecodable puzzle reveal: {e}")))?;
 
     // Authenticate the reveal against the coin it claims to spend.
-    let reveal_hash: [u8; 32] = clvm_utils::tree_hash(&allocator, puzzle).into();
+    let reveal_hash: [u8; 32] = chia::clvm_utils::tree_hash(&allocator, puzzle).into();
     if Bytes32::new(reveal_hash) != spend.coin.puzzle_hash {
         return Err(ChainSourceError::Malformed(
             "puzzle reveal does not hash to the spent coin's puzzle hash".to_string(),
@@ -136,7 +137,7 @@ fn create_coin_child(a: &Allocator, condition: NodePtr, parent_id: Bytes32) -> O
     let amount = atom_to_u64(&atom_bytes(a, amount_node)?);
 
     // Only the odd-amount output continues the singleton.
-    if amount % 2 == 0 {
+    if amount.is_multiple_of(2) {
         return None;
     }
     Some(Coin::new(parent_id, Bytes32::new(puzzle_hash), amount).coin_id())
@@ -242,7 +243,10 @@ mod tests {
 
         assert_eq!(lineage.tip(), *members.last().unwrap());
         for member in &members {
-            assert!(lineage.contains(*member), "genuine member must be in lineage");
+            assert!(
+                lineage.contains(*member),
+                "genuine member must be in lineage"
+            );
         }
         assert_eq!(lineage.len(), members.len());
     }
@@ -268,8 +272,7 @@ mod tests {
         // A structurally-consistent FORK: the tip's puzzle hash but a different parent -> a
         // different coin id -> still not a member (shape equality is not membership).
         let real_tip = *members.last().unwrap();
-        let forked_tip =
-            Coin::new(Bytes32::new([0x99; 32]), Bytes32::new([0x12; 32]), 1).coin_id();
+        let forked_tip = Coin::new(Bytes32::new([0x99; 32]), Bytes32::new([0x12; 32]), 1).coin_id();
         assert_ne!(forked_tip, real_tip);
         assert!(!lineage.contains(forked_tip));
     }
@@ -318,6 +321,78 @@ mod tests {
         )
         .await;
         assert_eq!(result, Err(ChainSourceError::Timeout));
+    }
+
+    /// Builds a spend whose puzzle is `(q . ((51 puzzle_hash amount)))` — a quoted single
+    /// `CREATE_COIN` — with the spent coin's puzzle hash set to the reveal's tree hash so the
+    /// authentication check passes. Returns the spend and the parent coin id.
+    fn create_coin_spend(child_ph: [u8; 32], amount: u8) -> (CoinSpend, Bytes32) {
+        let mut a = Allocator::new();
+        let op = a.new_atom(&[CREATE_COIN]).unwrap();
+        let ph_atom = a.new_atom(&child_ph).unwrap();
+        let amt_atom = a.new_atom(&[amount]).unwrap();
+        let nil = a.nil();
+        let arg2 = a.new_pair(amt_atom, nil).unwrap();
+        let arg1 = a.new_pair(ph_atom, arg2).unwrap();
+        let condition = a.new_pair(op, arg1).unwrap();
+        let conditions = a.new_pair(condition, nil).unwrap();
+        let quote = a.new_atom(&[1]).unwrap();
+        let puzzle = a.new_pair(quote, conditions).unwrap();
+
+        let puzzle_bytes = clvmr::serde::node_to_bytes(&a, puzzle).unwrap();
+        let solution_bytes = clvmr::serde::node_to_bytes(&a, nil).unwrap();
+        let puzzle_hash: [u8; 32] = chia::clvm_utils::tree_hash(&a, puzzle).into();
+
+        let coin = Coin::new(Bytes32::new([0xAB; 32]), Bytes32::new(puzzle_hash), 1);
+        let parent_id = coin.coin_id();
+        let spend = CoinSpend::new(
+            coin,
+            Program::from(puzzle_bytes),
+            Program::from(solution_bytes),
+        );
+        (spend, parent_id)
+    }
+
+    #[test]
+    fn extractor_returns_odd_create_coin_child() {
+        let child_ph = [0x55u8; 32];
+        let (spend, parent_id) = create_coin_spend(child_ph, 3); // odd
+        let child = singleton_child_from_spend(&spend).unwrap();
+        let expected = Coin::new(parent_id, Bytes32::new(child_ph), 3).coin_id();
+        assert_eq!(child, Some(expected));
+    }
+
+    #[test]
+    fn extractor_ignores_even_amount_create_coin() {
+        // An even-amount CREATE_COIN is not a singleton recreation -> no child (a melt).
+        let (spend, _) = create_coin_spend([0x55u8; 32], 2); // even
+        assert_eq!(singleton_child_from_spend(&spend).unwrap(), None);
+    }
+
+    #[test]
+    fn extractor_rejects_unauthenticated_reveal() {
+        // Tamper with the committed puzzle hash so the reveal no longer authenticates -> Malformed.
+        let (mut spend, _) = create_coin_spend([0x55u8; 32], 3);
+        spend.coin = Coin::new(
+            spend.coin.parent_coin_info,
+            Bytes32::new([0x00; 32]), // wrong puzzle hash
+            spend.coin.amount,
+        );
+        assert!(matches!(
+            singleton_child_from_spend(&spend),
+            Err(ChainSourceError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn extractor_rejects_undecodable_reveal() {
+        let coin = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1);
+        // 0xff is not a valid serialized CLVM program.
+        let spend = CoinSpend::new(coin, Program::from(vec![0xff]), Program::from(vec![0x80]));
+        assert!(matches!(
+            singleton_child_from_spend(&spend),
+            Err(ChainSourceError::Malformed(_))
+        ));
     }
 
     #[tokio::test]

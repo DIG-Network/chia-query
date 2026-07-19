@@ -132,7 +132,70 @@ kinded_provider!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_chainsource_interface::MockChainSource;
+    use chia_protocol::Coin;
+    use dig_chainsource_interface::{
+        ChainSourceError, CoinRecord as IfaceCoinRecord, MockChainSource, SingletonLineage,
+    };
+
+    #[test]
+    fn wrapper_delegates_every_read_to_the_inner_source() {
+        let id = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x22; 32]), 1).coin_id();
+        let record = IfaceCoinRecord {
+            coin: Coin::new(id, Bytes32::new([0x22; 32]), 1),
+            confirmed_height: Some(5),
+            spent_height: None,
+            timestamp: Some(9),
+            coinbase: false,
+        };
+        let launcher = Bytes32::new([0x33; 32]);
+        let mock = MockChainSource::new()
+            .with_coin(id, record.clone())
+            .with_lineage(launcher, SingletonLineage::single(launcher))
+            .with_timestamp(5, 1_000)
+            .with_peak(42);
+
+        let provider = LocalNodeProvider::new("local", 0, mock);
+
+        assert_eq!(provider.coin_record(id).unwrap(), Some(record.clone()));
+        assert_eq!(
+            provider
+                .coin_records_by_puzzle_hash(Bytes32::new([0x22; 32]), true)
+                .unwrap(),
+            vec![record.clone()]
+        );
+        // `record`'s coin has parent == id, so by-parent finds it.
+        assert_eq!(
+            provider.coin_records_by_parent(id).unwrap(),
+            vec![record.clone()]
+        );
+        assert_eq!(
+            provider
+                .coin_records_by_parent(Bytes32::new([0xEE; 32]))
+                .unwrap(),
+            vec![]
+        );
+        assert_eq!(provider.coin_spend(id).unwrap(), None);
+        assert_eq!(provider.parent_spend(id).unwrap(), None);
+        assert_eq!(
+            provider.resolve_singleton_lineage(launcher).unwrap(),
+            Some(SingletonLineage::single(launcher))
+        );
+        assert_eq!(provider.peak_height().unwrap(), Some(42));
+        assert_eq!(provider.block_timestamp(5).unwrap(), Some(1_000));
+    }
+
+    #[test]
+    fn wrapper_propagates_inner_errors() {
+        let provider = CoinsetProvider::new(
+            "coinset",
+            0,
+            MockChainSource::new().fail_with(ChainSourceError::Timeout),
+        );
+        assert_eq!(
+            provider.coin_record(Bytes32::new([0x01; 32])),
+            Err(ChainSourceError::Timeout)
+        );
+    }
 
     #[test]
     fn wrappers_report_their_kind_and_identity() {

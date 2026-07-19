@@ -91,8 +91,8 @@ impl ProviderRegistry {
         trust_override: Option<TrustLevel>,
         independence_group: impl Into<String>,
     ) -> Self {
-        let trust =
-            trust_override.unwrap_or_else(|| TrustLevel::default_for(provider.provider_info().kind));
+        let trust = trust_override
+            .unwrap_or_else(|| TrustLevel::default_for(provider.provider_info().kind));
         self.providers.push(Registration {
             provider,
             trust,
@@ -322,9 +322,7 @@ mod tests {
     use chia_protocol::Coin;
     use dig_chainsource_interface::MockChainSource;
 
-    use crate::provider_registry::providers::{
-        CoinsetProvider, CustomProvider, LocalNodeProvider,
-    };
+    use crate::provider_registry::providers::{CoinsetProvider, CustomProvider, LocalNodeProvider};
 
     fn coin_id(byte: u8) -> Bytes32 {
         Coin::new(Bytes32::new([byte; 32]), Bytes32::new([byte; 32]), 1).coin_id()
@@ -555,6 +553,101 @@ mod tests {
         assert_eq!(
             registry.trusted().coin_record(id),
             Err(ChainSourceError::NoProvider)
+        );
+    }
+
+    #[test]
+    fn every_read_method_flows_through_both_views() {
+        let ph = Bytes32::new([0x22; 32]);
+        let parent = Coin::new(Bytes32::new([0x01; 32]), ph, 1);
+        let parent_id = parent.coin_id();
+        let child = Coin::new(parent_id, ph, 1);
+        let launcher = Bytes32::new([0x77; 32]);
+
+        let source = MockChainSource::new()
+            .with_coin(parent_id, record_for(parent_id))
+            .with_coin(child.coin_id(), {
+                let mut r = record_for(child.coin_id());
+                r.coin = child;
+                r
+            })
+            .with_spend(
+                parent_id,
+                chia_protocol::CoinSpend::new(
+                    parent,
+                    chia_protocol::Program::from(vec![1]),
+                    chia_protocol::Program::from(vec![0x80]),
+                ),
+            )
+            .with_lineage(launcher, SingletonLineage::single(launcher))
+            .with_timestamp(100, 1_700_000_000)
+            .with_peak(555);
+
+        let registry = ProviderRegistry::new().register(
+            Box::new(LocalNodeProvider::new("local", 0, source)),
+            None, // Trusted
+            "local-node",
+        );
+
+        // Custody view — every method answers via the trusted source.
+        let custody = registry.trusted();
+        assert!(!custody
+            .coin_records_by_puzzle_hash(ph, true)
+            .unwrap()
+            .is_empty());
+        assert!(!custody
+            .coin_records_by_parent(parent_id)
+            .unwrap()
+            .is_empty());
+        assert!(custody.coin_spend(parent_id).unwrap().is_some());
+        assert_eq!(custody.peak_height().unwrap(), Some(555));
+        assert_eq!(custody.block_timestamp(100).unwrap(), Some(1_700_000_000));
+        assert_eq!(
+            custody.resolve_singleton_lineage(launcher).unwrap(),
+            Some(SingletonLineage::single(launcher))
+        );
+
+        // Discovery view — same reads, single-provider, no trust guarantee.
+        let discovery = registry.any();
+        assert!(discovery.coin_record(parent_id).unwrap().is_some());
+        assert!(!discovery
+            .coin_records_by_puzzle_hash(ph, false)
+            .unwrap()
+            .is_empty());
+        assert!(!discovery
+            .coin_records_by_parent(parent_id)
+            .unwrap()
+            .is_empty());
+        assert!(discovery.coin_spend(parent_id).unwrap().is_some());
+        assert_eq!(discovery.peak_height().unwrap(), Some(555));
+        assert_eq!(discovery.block_timestamp(100).unwrap(), Some(1_700_000_000));
+        assert!(discovery
+            .resolve_singleton_lineage(launcher)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn discovery_falls_through_failing_providers_to_a_responder() {
+        let id = coin_id(0x0B);
+        let registry = ProviderRegistry::new()
+            .register(
+                Box::new(CoinsetProvider::new(
+                    "down",
+                    0,
+                    MockChainSource::new().fail_with(ChainSourceError::Timeout),
+                )),
+                None,
+                "down",
+            )
+            .register(
+                Box::new(CoinsetProvider::new("up", 10, mock_with(id))),
+                None,
+                "up",
+            );
+        assert_eq!(
+            registry.any().coin_record(id).unwrap(),
+            Some(record_for(id))
         );
     }
 

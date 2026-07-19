@@ -22,9 +22,7 @@ use dig_chainsource_interface::{
 use tokio::runtime::Handle;
 
 use super::bridge::run_blocking;
-use super::convert::{
-    bytes32_to_hex, coin_record_from_chq, coin_spend_from_chq, map_query_error,
-};
+use super::convert::{bytes32_to_hex, coin_record_from_chq, coin_spend_from_chq, map_query_error};
 use super::lineage_walk::{singleton_child_from_spend, walk_singleton_lineage};
 use crate::ChiaQuery;
 
@@ -92,8 +90,8 @@ impl ChainSource for ChiaQueryProvider {
 
     fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
         let id = bytes32_to_hex(coin_id);
-        let spend =
-            run_blocking(&self.handle, self.inner.get_coin_spend_opt(&id))?.map_err(map_query_error)?;
+        let spend = run_blocking(&self.handle, self.inner.get_coin_spend_opt(&id))?
+            .map_err(map_query_error)?;
         spend.as_ref().map(coin_spend_from_chq).transpose()
     }
 
