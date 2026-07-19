@@ -20,8 +20,10 @@ crate-type = ["cdylib", "rlib"]
 default = ["native"]
 native = [
     "dep:chia",
+    "dep:chia-protocol",
     "dep:clvmr",
     "dep:chia-wallet-sdk",
+    "dep:dig-chainsource-interface",
     "dep:tokio",
     "dep:tokio-tungstenite",
     "dep:reqwest",
@@ -50,6 +52,12 @@ log = "0.4"
 
 # --- native-only (the peer + routing tiers) ---
 chia = { version = "0.26", optional = true }
+# The canonical `ChainSource` provider interface chia-query implements + aggregates.
+# `chia-protocol` is pulled in directly so the provider module speaks the exact
+# `chia_protocol` types the interface exposes (cargo unifies it with `chia`'s
+# re-export at the same 0.26.x).
+chia-protocol = { version = "0.26", optional = true }
+dig-chainsource-interface = { version = "0.1", optional = true }
 clvmr = { version = "0.14", optional = true }
 chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -65,6 +73,11 @@ js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 # `getrandom` with the `js` backend keeps any transitive RNG wasm-clean.
 getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[dev-dependencies]
+# Enables the in-memory `MockChainSource` for the provider-registry trust-model
+# tests. This merges the `testing` feature onto the native dependency above.
+dig-chainsource-interface = { version = "0.1", features = ["testing"] }
 
 [[bin]]
 name = "coinset_drift"
