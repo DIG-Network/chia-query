@@ -4,3 +4,8 @@
 /pkg
 /pkg-bundler
 /pkg-node
+
+# Local agent tooling (not part of the crate)
+.claude/
+AGENTS.md
+CLAUDE.md
