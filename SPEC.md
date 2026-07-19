@@ -469,3 +469,119 @@ breaking changes (the automated backstop to the chia-query freshness preflight).
   `coinset-drift` issue (one open issue, updated not duplicated) AND fails loud.
   It is NOT a required merge gate — it watches an external API, so a coinset
   outage never blocks PRs.
+
+## ChainSource Provider Registry (native)
+
+chia-query is the canonical `dig-chainsource-interface` registry: it implements the ONE
+`ChainSource` trait over its async router and composes providers under an operator trust model whose
+custody view FAILS CLOSED. This surface is native-only (`feature = "native"`, module
+`provider_registry`); it never reaches the wasm coinset-only build. It depends on
+`dig-chainsource-interface = "0.1"` (crates.io), whose `chia-protocol 0.26` unifies with chia-query's
+`chia 0.26` umbrella at a single `chia-protocol 0.26.x`.
+
+### The blocking facade (`ChiaQueryProvider`) -- SPEC 7 runtime requirement
+
+`ChiaQueryProvider` presents the synchronous, object-safe `ChainSource` trait over the asynchronous
+`QueryRouter`. Each sync method bridges to async via `run_blocking`, which resolves the ambient tokio
+context:
+
+- **inside a multi-thread runtime** -- `task::block_in_place(|| handle.block_on(fut))` (does not
+  starve the async worker);
+- **inside a current-thread runtime** -- blocking would panic, so it returns
+  `ChainSourceError::Transport` carrying a message that names the multi-thread requirement (NEVER an
+  opaque tokio panic);
+- **outside any runtime** -- `handle.block_on(fut)` directly.
+
+A `catch_unwind` backstop converts any residual panic into `ChainSourceError::Transport`, so misuse
+never unwinds across the trait boundary. **The facade MUST run on a multi-thread tokio runtime.** A
+consumer that is itself async MUST wrap each call in `tokio::task::spawn_blocking` so the blocking
+read never runs on an async worker thread.
+
+### Fail-closed method mapping (SPEC 3, the money-critical crux)
+
+Every read distinguishes `Ok(None)`/empty-`Vec` (a source that reliably answered "no such thing" --
+safe to act on) from `Err` (could not answer -- the consumer MUST fail closed). A
+transport/timeout/parse error is NEVER reported as absence; absence is NEVER reported as an error.
+
+| Interface method | Router method | Absence handling |
+|---|---|---|
+| `coin_record(id)` | `get_coin_record_by_name_opt` | provable absence -> `Ok(None)`; failure -> `Err` |
+| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` (start=end=None) | successful empty query -> `Ok(vec![])`; failure -> `Err` |
+| `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], None, None, true)` | successful empty query -> `Ok(vec![])`; failure -> `Err` |
+| `coin_spend(id)` | `get_coin_spend_opt` | unspent/unknown -> `Ok(None)`; failure -> `Err` |
+| `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | gap mid-walk -> `Ok(None)`; failure -> `Err` |
+| `resolve_singleton_lineage(launcher)` | forward walk over `get_coin_spend_opt` | never launched / fully melted -> `Ok(None)`; failure -> `Err` |
+| `peak_height()` | `peak_height_opt` (from `get_blockchain_state`) | no peak -> `Ok(None)`; failure -> `Err` |
+| `block_timestamp(h)` | `block_timestamp_opt` (from `get_block_record_by_height_opt`) | no block / no timestamp -> `Ok(None)`; failure -> `Err` |
+
+**Absence-aware read paths (the PREFERRED design).** The pre-existing single-record router methods
+collapse provable absence into `Err` (coinset returns `success:true` + a null field, which then fails
+to deserialize). New `_opt` read paths were added at every layer to preserve correct custody
+semantics -- a legitimately-unspent coin's `coin_spend` is `Ok(None)`, not `Err`, which the singleton
+walk requires to find the tip:
+
+- **coinset** -- `post_extract_opt` / `optional_field`: a `success:true` envelope with a `null` (or
+  absent) data field is provable absence -> `Ok(None)`; a present-but-unparseable field is `Err`
+  (never `Ok(None)`); `success:false` (via `post`) is `Err`.
+- **peer** -- `try_get_coin_record_by_name_opt` / `try_get_coin_spend_opt`: a successful
+  `RespondCoinState` with an EMPTY coin-state list (or an unspent coin, for spends) is provable
+  absence -> `Ok(None)`; a rejected/timed-out request is `Err`. The `wait_for_confirmation`
+  "not-found-yet" polling heuristic (which treats `PeerRejection`/`CoinsetApiError` as not-found) is
+  NEVER reused for these reads.
+- **router** -- `peer_then_coinset_opt`: a SUCCESSFUL peer response (`Some` or `None`) is
+  authoritative and returned immediately; only a peer FAILURE falls through to the retry then the
+  coinset `_opt` fallback, so absence is never masked by a fallback and a failure is never collapsed
+  into `Ok(None)`.
+
+### `ChiaQueryError` -> `ChainSourceError` mapping
+
+| `ChiaQueryError` | `ChainSourceError` |
+|---|---|
+| `PeerConnection(msg)` naming a timeout | `Timeout` |
+| `PeerConnection` / `PeerRejection` / `PeerDiscoveryFailed` / `TlsError` / `CoinsetHttp` / `CoinsetApiError` / `AllSourcesFailed` | `Transport` |
+| `InvalidRequest` (bad input, e.g. malformed hex) | `Malformed` |
+| `UnsupportedWithoutCoinset` | `Unsupported` |
+
+**Type conversion is fail-closed.** chia-query's String-hex fields parse to `chia_protocol` types
+(`Bytes32`, `Coin`, `Program`, `CoinSpend`); a decode/length failure is `Malformed`, NEVER a silent
+zero/default. A `0` height/timestamp maps to `None` (matching "not known by this source"); `spent`
+gates `spent_height`.
+
+### Singleton lineage -- a genuine forward walk
+
+`resolve_singleton_lineage` performs a REAL forward walk launcher -> tip using the shared
+`dig_chainsource_interface::SingletonLineage` type (no dig-did dependency -- that crate is same-level).
+From the launcher spend it derives the eve coin, then follows each singleton recreation hop-by-hop to
+the current unspent tip, collecting every member coin id. It is NEVER an echo of a caller-supplied
+coin, so `SingletonLineage::contains` MEMBERSHIP is meaningful. Each hop is authenticated by
+`singleton_child_from_spend`: the spent coin's puzzle reveal MUST hash to its committed puzzle hash
+(`clvm_utils::tree_hash`), and the child is the odd-amount `CREATE_COIN` output of the parent spend
+(computed with `chia_protocol::Coin::coin_id`). A revisited coin (cycle) fails closed as `Malformed`.
+`Ok(None)` = the launcher never existed or the singleton was fully melted. **Per-hop CLVM
+verification is NECESSARY but NOT SUFFICIENT** -- it does not defeat total fabrication; the registry
+trust model layered above provides custody soundness.
+
+### Trust model -- the two views (SPEC 5)
+
+Providers are the four kind wrappers `CoinsetProvider` (PublicOracle), `LocalNodeProvider`
+(LocalNode; compose over the SPEC 5.3 `dig.local` -> `localhost` ladder), `DigPeersProvider`
+(DigPeers), `CustomProvider` (operator override) -- each wraps any `ChainSource` and labels it with a
+`ProviderKind`. The operator assigns each a `TrustLevel` at registration (default per kind:
+`LocalNode` -> `Trusted`; every other kind -> `Untrusted`). A provider's self-declared
+`ProviderInfo.trustless` flag is ADVISORY ONLY -- it never grants custody trust.
+
+- **`registry.trusted()` -- the CUSTODY view.** A read is satisfied ONLY by (a) an operator-`Trusted`
+  source (the gold standard, always preferred when present; when every trusted source errors it fails
+  closed and NEVER degrades to a public source), OR (b) a qualifying quorum. **Fail-closed default:**
+  a pure-public quorum (no operator-trusted member) does NOT satisfy custody unless the operator sets
+  `allow_public_quorum_custody(true)`, which enables a quorum requiring **2 independent groups** to
+  agree (logged loudly as reduced assurance). Otherwise custody fails closed with `NoProvider`.
+- **`registry.any()` -- the DISCOVERY view.** A single-provider, low-trust read for NON-custody use
+  (returns the first provider that responds). Its result MUST NOT be used to route funds.
+
+**Independence groups.** Each provider registers with an `independence_group` id; a quorum counts
+DISTINCT groups, so two providers in the same group (e.g. the same coinset.org listed twice) count as
+one and cannot alone satisfy a 2-group threshold. Quorum agreement compares converted answers for
+equality (for `resolve_singleton_lineage`, cross-source agreement compares the full lineage;
+consumers still apply the `SingletonLineage::contains` MEMBERSHIP authority test to the result, never
+tip/puzzle-hash equality). Disagreement, too few groups, or all-errors fails closed.
