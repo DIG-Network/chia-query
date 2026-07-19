@@ -29,6 +29,8 @@ pub mod wasm_api;
 #[cfg(feature = "native")]
 pub mod peer;
 #[cfg(feature = "native")]
+pub mod provider_registry;
+#[cfg(feature = "native")]
 pub mod router;
 
 pub use types::*;
