@@ -559,7 +559,21 @@ coin, so `SingletonLineage::contains` MEMBERSHIP is meaningful. Each hop is auth
 (computed with `chia_protocol::Coin::coin_id`). Additionally, each hop binds the fetched spend to the
 requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to `launcher_id`),
 making the walk cryptographically self-authenticating from the launcher; a mismatch fails closed as
-`Malformed`. A revisited coin (cycle) fails closed as `Malformed`.
+`Malformed`. A revisited coin (cycle) fails closed as `Malformed`. The walk is bounded against
+resource-exhaustion DoS by TWO layers, because each generation is a strictly-sequential network
+round-trip (one fetch per hop on the coinset path, two on the peer path) with only per-request
+timeouts. (1) **Primary — an overall wall-clock deadline** (`WALK_DEADLINE`, 45s) wraps the entire
+walk future, so a hostile source serving an ever-advancing chain of DISTINCT (non-repeating)
+recreations — which passes the reveal + coin-id binding every hop and never trips the cycle guard —
+cannot keep the walk alive indefinitely; exceeding the deadline fails closed as `Timeout` (distinct
+from `Malformed`), bounding total network time, CPU, and memory-growth-rate together. (2)
+**Belt-and-suspenders — a hop cap** (`MAX_LINEAGE_GENERATIONS`, 100,000, checked before each fetch)
+fails closed as `Malformed`; a real singleton (a few thousand hops at most over its lifetime) stays
+far below it, and over any real network the deadline stops an adversarial walk long before the cap is
+reached. The coin-id binding is load-bearing over EVERY source: the peer transport returns
+the genuine spent coin (fetched from its coin state alongside the puzzle/solution) so a peer-sourced
+lineage authenticates and resolves — it is never built from a name-only placeholder coin, which would
+hash to the wrong id and fail the binding closed.
 `Ok(None)` = the launcher never existed or the singleton was fully melted. **Per-hop CLVM
 verification is NECESSARY but NOT SUFFICIENT** -- it does not defeat total fabrication; the registry
 trust model layered above provides custody soundness.

@@ -180,3 +180,44 @@ pub fn additions_removals_to_response(
         removals,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia::protocol::{Coin as ProtoCoin, Program};
+
+    /// #1258 regression: the peer path must build a `CoinSpend` from the GENUINE spent coin, not a
+    /// name-only placeholder. This proves `make_coin_spend` carries every genuine coin field through
+    /// verbatim (so the downstream lineage coin-id binding can authenticate the hop), and that the
+    /// pre-fix placeholder coin (default puzzle hash, zero amount) does NOT match — which is exactly
+    /// why peer-sourced lineage failed closed before the fix.
+    #[test]
+    fn make_coin_spend_preserves_the_genuine_coin() {
+        let genuine = ProtoCoin {
+            parent_coin_info: Bytes32::new([0x11; 32]),
+            puzzle_hash: Bytes32::new([0x22; 32]),
+            amount: 7,
+        };
+        let puzzle = Program::from(vec![0x80]);
+        let solution = Program::from(vec![0x80]);
+
+        let spend = make_coin_spend(&genuine, &puzzle, &solution);
+        assert_eq!(
+            spend.coin.parent_coin_info,
+            hex32(&genuine.parent_coin_info)
+        );
+        assert_eq!(spend.coin.puzzle_hash, hex32(&genuine.puzzle_hash));
+        assert_eq!(spend.coin.amount, genuine.amount);
+
+        // The old placeholder shared only the coin name (as parent); its puzzle hash and amount
+        // differ, so it hashes to a different coin id and would fail the lineage binding closed.
+        let placeholder = ProtoCoin {
+            parent_coin_info: genuine.parent_coin_info,
+            puzzle_hash: Bytes32::default(),
+            amount: 0,
+        };
+        let placeholder_spend = make_coin_spend(&placeholder, &puzzle, &solution);
+        assert_ne!(placeholder_spend.coin.puzzle_hash, spend.coin.puzzle_hash);
+        assert_ne!(placeholder_spend.coin.amount, spend.coin.amount);
+    }
+}
