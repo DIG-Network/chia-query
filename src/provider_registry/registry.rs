@@ -698,11 +698,7 @@ mod tests {
                 "coinset.org",
             )
             .register(
-                Box::new(CustomProvider::new(
-                    "mirror",
-                    20,
-                    list_source(vec![c, a]),
-                )),
+                Box::new(CustomProvider::new("mirror", 20, list_source(vec![c, a]))),
                 None,
                 "mirror.example",
             );

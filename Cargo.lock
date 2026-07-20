@@ -367,6 +367,7 @@ version = "0.4.1"
 dependencies = [
  "chia",
  "chia-protocol",
+ "chia-puzzles",
  "chia-wallet-sdk",
  "clvmr",
  "dig-chainsource-interface",
