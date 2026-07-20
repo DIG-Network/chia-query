@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.1] - 2026-07-20
+
+### Bug Fixes
+- **lineage:** Max-generation depth cap + peer-coin liveness (#8)
+
 ## [0.4.0] - 2026-07-19
 
 ### Features
