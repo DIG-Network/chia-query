@@ -548,6 +548,17 @@ impl PeerBackend {
         let spend = self
             .do_get_puzzle_and_solution(peer, coin_id, spent_height)
             .await?;
+
+        // Substitute the GENUINE spent coin from the coin-state lookup for the name-only placeholder
+        // that `do_get_puzzle_and_solution` builds (the peer `PuzzleSolutionResponse` omits the full
+        // coin). The singleton-lineage walk binds each fetched spend to the requested coin id
+        // (`spend.coin.coin_id() == current`, chia-query#7); a placeholder coin hashes to the wrong
+        // id and fails that binding closed, making peer-sourced lineage resolution impossible. The
+        // real coin is already in hand here, so return it and let the binding authenticate the hop.
+        let spend = CoinSpend {
+            coin: Coin::from_protocol(&cs.coin),
+            ..spend
+        };
         Ok(Some(spend))
     }
 

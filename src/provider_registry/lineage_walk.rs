@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::time::Duration;
 
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use clvmr::{Allocator, NodePtr, SExp};
@@ -30,6 +31,31 @@ const CREATE_COIN: u8 = 51;
 /// A generous CLVM evaluation budget for running a single puzzle+solution — the standard maximum
 /// block cost, comfortably above any one singleton spend.
 const MAX_CLVM_COST: u64 = 11_000_000_000;
+
+/// The overall wall-clock deadline for a full lineage walk.
+///
+/// Each generation is a strictly-sequential NETWORK round-trip (one fetch per hop on the coinset
+/// path, two on the peer path), so a hostile source that answers each hop just under the per-request
+/// timeout — with an ever-advancing chain of DISTINCT recreations — would keep the walk alive for as
+/// long as it keeps serving valid hops. A hop-count cap alone cannot bound this: it bounds neither
+/// total elapsed time nor the per-hop CLVM cost. This deadline wraps the ENTIRE walk future, bounding
+/// network time, CPU, and memory-growth-rate simultaneously, and fails closed as
+/// [`ChainSourceError::Timeout`]. It is the primary DoS defense; the hop cap below is a
+/// belt-and-suspenders sanity bound. Sized to comfortably resolve any legitimate lineage over a
+/// healthy source while denying an attacker an unbounded hang.
+const WALK_DEADLINE: Duration = Duration::from_secs(45);
+
+/// The maximum number of generations (recreation hops) the walk will follow before failing closed.
+///
+/// A belt-and-suspenders sanity bound layered under [`WALK_DEADLINE`] (the primary defense). The
+/// cycle guard alone catches only REPEATED coins; a hostile [`ChainSource`] can instead serve an
+/// unbounded, ever-advancing chain of DISTINCT recreations (each hop a new coin), which the cycle
+/// guard never trips. A real singleton is recreated once per on-chain update — a few thousand hops at
+/// the very most over its lifetime — so 100,000 is a generous margin above any legitimate lineage
+/// while still a hard fail-closed ceiling. Checked before each fetch; a walk that reaches it fails
+/// closed as [`ChainSourceError::Malformed`]. (In practice the wall-clock deadline stops an
+/// adversarial walk long before this count is reached over any real network.)
+const MAX_LINEAGE_GENERATIONS: usize = 100_000;
 
 /// Walks the singleton launched at `launcher_id` forward to its current unspent tip.
 ///
@@ -43,6 +69,57 @@ const MAX_CLVM_COST: u64 = 11_000_000_000;
 /// must fail closed and never treat the error as absence).
 pub(crate) async fn walk_singleton_lineage<F, Fut, X>(
     launcher_id: Bytes32,
+    fetch_spend: F,
+    extract_child: X,
+) -> Result<Option<SingletonLineage>, ChainSourceError>
+where
+    F: Fn(Bytes32) -> Fut,
+    Fut: Future<Output = Result<Option<CoinSpend>, ChainSourceError>>,
+    X: Fn(&CoinSpend) -> Result<Option<Bytes32>, ChainSourceError>,
+{
+    walk_singleton_lineage_bounded(
+        launcher_id,
+        WALK_DEADLINE,
+        MAX_LINEAGE_GENERATIONS,
+        fetch_spend,
+        extract_child,
+    )
+    .await
+}
+
+/// Wraps the depth-capped walk in an overall wall-clock `deadline`, failing closed as
+/// [`ChainSourceError::Timeout`] when the whole walk (network hops + CLVM + allocation) outlasts it.
+///
+/// Factored out with explicit bounds so both the deadline and the hop cap are testable with small
+/// values; production callers use [`walk_singleton_lineage`], which pins them to [`WALK_DEADLINE`] and
+/// [`MAX_LINEAGE_GENERATIONS`]. `Timeout` is used deliberately (not `Malformed`): a walk that runs out
+/// of time is a resource-exhaustion condition, semantically distinct from a malformed chain.
+async fn walk_singleton_lineage_bounded<F, Fut, X>(
+    launcher_id: Bytes32,
+    deadline: Duration,
+    max_generations: usize,
+    fetch_spend: F,
+    extract_child: X,
+) -> Result<Option<SingletonLineage>, ChainSourceError>
+where
+    F: Fn(Bytes32) -> Fut,
+    Fut: Future<Output = Result<Option<CoinSpend>, ChainSourceError>>,
+    X: Fn(&CoinSpend) -> Result<Option<Bytes32>, ChainSourceError>,
+{
+    let walk =
+        walk_singleton_lineage_capped(launcher_id, max_generations, fetch_spend, extract_child);
+    match tokio::time::timeout(deadline, walk).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ChainSourceError::Timeout),
+    }
+}
+
+/// The depth-bounded core of [`walk_singleton_lineage`], factored out so the cap is testable with a
+/// small value without allocating a million-hop chain. Production callers use the public wrapper,
+/// which pins `max_generations` to [`MAX_LINEAGE_GENERATIONS`].
+async fn walk_singleton_lineage_capped<F, Fut, X>(
+    launcher_id: Bytes32,
+    max_generations: usize,
     fetch_spend: F,
     extract_child: X,
 ) -> Result<Option<SingletonLineage>, ChainSourceError>
@@ -69,6 +146,14 @@ where
 
     let mut members: BTreeSet<Bytes32> = BTreeSet::new();
     loop {
+        // Bound the walk depth: the cycle guard below catches only REPEATED coins, so a hostile
+        // source serving an unbounded chain of DISTINCT recreations would otherwise loop forever.
+        if members.len() >= max_generations {
+            return Err(ChainSourceError::Malformed(format!(
+                "singleton lineage exceeded the maximum of {max_generations} generations"
+            )));
+        }
+
         // A coin appearing twice would mean a malformed/cyclic lineage — fail closed.
         if !members.insert(current) {
             return Err(ChainSourceError::Malformed(
@@ -466,6 +551,80 @@ mod tests {
             matches!(result, Err(ChainSourceError::Malformed(_))),
             "a spend of the wrong coin must fail closed, got {result:?}"
         );
+    }
+
+    /// #1323 regression: a hostile source serves an unbounded, ever-advancing recreation chain —
+    /// every hop a DISTINCT coin, so the cycle guard never trips. Without a depth cap the walk would
+    /// loop and allocate forever (a CPU/memory DoS); the cap must stop it with `Malformed`.
+    #[tokio::test]
+    async fn unbounded_non_repeating_lineage_fails_closed_via_depth_cap() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let launcher = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1);
+        let launcher_id = launcher.coin_id();
+        let eve = coin(launcher_id, 0x10);
+
+        // A coin table the extractor grows on the fly, so the fetcher can always answer the query
+        // for the next (never-before-seen) coin with a spend whose coin id matches — passing the
+        // per-hop binding while never repeating a coin.
+        let known: Rc<RefCell<HashMap<Bytes32, Coin>>> = Rc::new(RefCell::new(HashMap::new()));
+        known.borrow_mut().insert(launcher_id, launcher);
+        known.borrow_mut().insert(eve.coin_id(), eve);
+
+        let fetch_known = known.clone();
+        let fetch = move |id: Bytes32| {
+            let spend = fetch_known.borrow().get(&id).cloned().map(spend_of);
+            std::future::ready(Ok(spend))
+        };
+
+        let extract_known = known.clone();
+        let eve_id = eve.coin_id();
+        let extract = move |spend: &CoinSpend| {
+            let parent = spend.coin.coin_id();
+            // The launcher spend recreates the (already-known) eve coin.
+            if parent == launcher_id {
+                return Ok(Some(eve_id));
+            }
+            // Every other hop recreates a fresh coin parented by the spent one — always distinct,
+            // so the cycle guard never fires and only the depth cap can stop the walk.
+            let child = Coin::new(parent, Bytes32::new([0x33; 32]), 1);
+            extract_known.borrow_mut().insert(child.coin_id(), child);
+            Ok(Some(child.coin_id()))
+        };
+
+        let cap = 32;
+        let result = walk_singleton_lineage_capped(launcher_id, cap, fetch, extract).await;
+        assert!(
+            matches!(result, Err(ChainSourceError::Malformed(_))),
+            "an unbounded non-repeating lineage must fail closed at the depth cap, got {result:?}"
+        );
+    }
+
+    /// #1323 regression (primary defense): a source that answers each hop only after a delay must
+    /// not hang the walk. The overall wall-clock deadline bounds the whole future and fails closed
+    /// as `Timeout` — semantically distinct from `Malformed` — independent of the hop cap.
+    #[tokio::test]
+    async fn walk_exceeding_wall_clock_deadline_returns_timeout() {
+        let launcher = Coin::new(Bytes32::new([0x01; 32]), Bytes32::new([0x02; 32]), 1);
+        let launcher_id = launcher.coin_id();
+
+        // Every fetch stalls longer than the deadline, so the deadline fires during the first hop.
+        let fetch = |id: Bytes32| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<_, ChainSourceError>(Some(spend_of(coin(id, 0x02))))
+        };
+
+        let deadline = Duration::from_millis(20);
+        let result = walk_singleton_lineage_bounded(
+            launcher_id,
+            deadline,
+            100,
+            fetch,
+            table_extractor(HashMap::new()),
+        )
+        .await;
+        assert_eq!(result, Err(ChainSourceError::Timeout));
     }
 
     /// The launcher query is answered with the spend of a coin whose id is not `launcher_id`.
