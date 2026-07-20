@@ -296,8 +296,14 @@ where
             continue; // this group already contributed a representative answer
         }
         if let Ok(answer) = query(&*reg.provider) {
-            // Reject an implausibly large untrusted answer before it is canonicalized or compared.
-            answer.validate_bound()?;
+            // Drop an implausibly large untrusted answer BEFORE any canonicalization/comparison, so
+            // it costs no O(n log n) work and never enters the tally. Skipping (not propagating) is
+            // deliberate: a single hostile member returning an oversized list simply loses its vote,
+            // exactly as a non-responding member would — it must NOT abort the whole quorum and deny
+            // an otherwise-valid honest agreement (that would be a self-defeating DoS lever).
+            if answer.validate_bound().is_err() {
+                continue;
+            }
             per_group.push((group, answer));
         }
     }
@@ -746,12 +752,8 @@ mod tests {
         );
     }
 
-    /// #1341: an untrusted quorum source returning MORE than [`MAX_QUORUM_RECORDS`] records must
-    /// fail closed with the typed `Malformed` error before the oversized list is canonicalized —
-    /// bounding CPU/memory against a hostile flood.
-    #[test]
-    fn quorum_fails_closed_when_untrusted_source_exceeds_the_record_cap() {
-        let ph = Bytes32::new([0x22; 32]);
+    /// Builds an over-cap flood of records (all under puzzle hash `ph`) to exercise the record bound.
+    fn oversized_flood(ph: Bytes32) -> Vec<CoinRecord> {
         let flood: Vec<CoinRecord> = (0..=MAX_QUORUM_RECORDS as u32)
             .map(|i| {
                 let coin = Coin::new(Bytes32::new([0x01; 32]), ph, u64::from(i) + 1);
@@ -761,6 +763,16 @@ mod tests {
             })
             .collect();
         assert!(flood.len() > MAX_QUORUM_RECORDS);
+        flood
+    }
+
+    /// #1341: an over-cap untrusted answer is DROPPED (loses its vote), never propagated. When every
+    /// available source floods, no honest quorum can form -> fail closed (as a set of non-responders
+    /// would), but the bound work is still avoided (the flood is never canonicalized).
+    #[test]
+    fn quorum_fails_closed_when_all_sources_exceed_the_record_cap() {
+        let ph = Bytes32::new([0x22; 32]);
+        let flood = oversized_flood(ph);
 
         let registry = ProviderRegistry::new()
             .allow_public_quorum_custody(true)
@@ -779,13 +791,57 @@ mod tests {
                 "mirror.example",
             );
 
-        match registry.trusted().coin_records_by_puzzle_hash(ph, false) {
-            Err(ChainSourceError::Malformed(m)) => assert!(
-                m.contains("exceeding") && m.contains("cap"),
-                "expected the record-cap error, got: {m}"
-            ),
-            other => panic!("an over-cap untrusted answer must fail closed, got {other:?}"),
-        }
+        // Both oversized answers are skipped -> no group votes -> no quorum -> fail closed.
+        assert_eq!(
+            registry.trusted().coin_records_by_puzzle_hash(ph, false),
+            Err(ChainSourceError::NoProvider),
+            "when every source floods, custody must fail closed"
+        );
+    }
+
+    /// #1341 (in-PR security fix): a SINGLE hostile member returning an over-cap flood must NOT abort
+    /// the whole quorum. It loses its vote (dropped before any canonicalization); the two honest,
+    /// independent groups that agree still form the quorum, so availability is preserved while the
+    /// DoS bound holds.
+    #[test]
+    fn oversized_quorum_member_is_skipped_not_fatal() {
+        let ph = Bytes32::new([0x22; 32]);
+        let a = record_for(coin_id(0x0A));
+        let b = record_for(coin_id(0x0B));
+        let flood = oversized_flood(ph);
+
+        let registry = ProviderRegistry::new()
+            .allow_public_quorum_custody(true)
+            .register(
+                Box::new(CoinsetProvider::new(
+                    "coinset",
+                    10,
+                    list_source(vec![a.clone(), b.clone()]),
+                )),
+                None,
+                "coinset.org",
+            )
+            .register(
+                Box::new(CustomProvider::new(
+                    "mirror",
+                    20,
+                    list_source(vec![b.clone(), a.clone()]),
+                )),
+                None,
+                "mirror.example",
+            )
+            .register(
+                Box::new(CustomProvider::new("flooder", 30, list_source(flood))),
+                None,
+                "flooder.example",
+            );
+
+        let records = registry
+            .trusted()
+            .coin_records_by_puzzle_hash(ph, false)
+            .expect("an honest 2-group agreement must still satisfy the quorum");
+        assert_eq!(records.len(), 2, "the flood must not enter the tally");
+        assert!(records.contains(&a) && records.contains(&b));
     }
 
     // ---- Test #7: discovery view returns a single-provider answer, inert for custody ----

@@ -620,8 +620,11 @@ only the false negative on ordering is removed). The canonical order computes ea
 ONCE into the sort key (O(n) hashes, not the O(n log n) a per-comparison `coin_id()` would cost).
 **Bounded untrusted input.** Before an untrusted quorum answer is canonicalized or compared, its
 record count is bounded: a list answer exceeding `MAX_QUORUM_RECORDS` (100,000 -- far above any
-legitimate puzzle-hash/parent fan-out) fails closed as `Malformed`, capping the CPU/memory a hostile
-source can force during a quorum. For `resolve_singleton_lineage`, cross-source
+legitimate puzzle-hash/parent fan-out) is DROPPED before any canonicalization, capping the CPU/memory
+a hostile source can force during a quorum. The oversized member simply loses its vote (exactly as a
+non-responding member would) -- it does NOT abort the whole read, so a single hostile provider cannot
+deny an otherwise-valid honest quorum. When no honest quorum can form (e.g. every source floods),
+custody still fails closed with `NoProvider`. For `resolve_singleton_lineage`, cross-source
 agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
 authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
 all-errors fails closed.
