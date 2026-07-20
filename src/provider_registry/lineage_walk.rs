@@ -21,7 +21,8 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use chia::puzzles::singleton::SingletonStruct;
+use chia::clvm_traits::FromClvm;
+use chia::puzzles::singleton::{SingletonArgs, SingletonStruct};
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_wallet_sdk::driver::Puzzle;
 use clvmr::{Allocator, NodePtr, SExp};
@@ -196,12 +197,17 @@ where
 /// Derives a singleton's recreation child from the spend that spent it, or `Ok(None)` when the
 /// spend creates no odd-amount coin (a melt / not a singleton recreation).
 ///
+/// `expected_launcher_id` is the launcher the WALK is authenticating: every top-layer hop's curried
+/// `singleton_struct.launcher_id` MUST equal it (see the identity binding below).
+///
 /// Fails closed with [`ChainSourceError::Malformed`] when the puzzle reveal does not hash to the
-/// spent coin's committed puzzle hash (an unauthenticated reveal) or the CLVM cannot be parsed/run.
-/// The odd-amount `CREATE_COIN` output is the singleton continuation (singleton amounts are odd by
-/// construction); its coin id is the next lineage member.
+/// spent coin's committed puzzle hash (an unauthenticated reveal), the puzzle is not a
+/// singleton-family puzzle, a top-layer hop belongs to a DIFFERENT singleton, or the CLVM cannot be
+/// parsed/run. The odd-amount `CREATE_COIN` output is the singleton continuation (singleton amounts
+/// are odd by construction); its coin id is the next lineage member.
 pub(crate) fn singleton_child_from_spend(
     spend: &CoinSpend,
+    expected_launcher_id: Bytes32,
 ) -> Result<Option<Bytes32>, ChainSourceError> {
     let mut allocator = Allocator::new();
 
@@ -217,19 +223,36 @@ pub(crate) fn singleton_child_from_spend(
         ));
     }
 
-    // Singleton-shape gate: a genuine lineage spend is either the one-time SINGLETON LAUNCHER (the
-    // very first hop) or a SINGLETON TOP-LAYER puzzle (every subsequent hop). Any other puzzle that
-    // happens to emit an odd `CREATE_COIN` is NOT a singleton recreation, so we refuse to treat its
-    // output as a lineage child. Because the singleton top layer morphs its recreation output into
-    // the singleton wrapper by construction, asserting the PARENT is a genuine singleton (or the
-    // launcher) is what guarantees the SELECTED child has singleton shape — verifying the child's
-    // curried shape directly is impossible from its puzzle hash alone. This layers on top of the
-    // reveal authentication above and the walk's coin-id binding; it does NOT replace them.
-    if !is_singleton_family_puzzle(&allocator, puzzle) {
-        return Err(ChainSourceError::Malformed(
-            "lineage spend puzzle is neither the singleton launcher nor a singleton top layer"
-                .to_string(),
-        ));
+    // Singleton-shape + identity gate: a genuine lineage spend is either the one-time SINGLETON
+    // LAUNCHER (the very first hop) or a SINGLETON TOP-LAYER puzzle (every subsequent hop). Any
+    // other puzzle that happens to emit an odd `CREATE_COIN` is NOT a singleton recreation, so we
+    // refuse to treat its output as a lineage child. Because the singleton top layer morphs its
+    // recreation output into the singleton wrapper by construction, asserting the PARENT is a
+    // genuine singleton (or the launcher) is what guarantees the SELECTED child has singleton shape.
+    // This layers on top of the reveal authentication above and the walk's coin-id binding; it does
+    // NOT replace them.
+    match classify_singleton_puzzle(&allocator, puzzle) {
+        // The launcher hop needs no launcher-id check: its coin_id IS `expected_launcher_id`, and
+        // the walk already binds the fetched launcher spend's coin id to the requested launcher.
+        Some(SingletonKind::Launcher) => {}
+        // IDENTITY binding: a top-layer hop must belong to THIS singleton. The shape gate alone
+        // proves the hop is *a* singleton; without this a shape-valid hop from a DIFFERENT singleton
+        // could be spliced into the lineage. `launcher_id` is the immutable identity curried into
+        // every top-layer coin, so a mismatch is a foreign coin — fail closed.
+        Some(SingletonKind::TopLayer { launcher_id }) => {
+            if launcher_id != expected_launcher_id {
+                return Err(ChainSourceError::Malformed(
+                    "lineage hop belongs to a different singleton (launcher_id mismatch)"
+                        .to_string(),
+                ));
+            }
+        }
+        None => {
+            return Err(ChainSourceError::Malformed(
+                "lineage spend puzzle is neither the singleton launcher nor a singleton top layer"
+                    .to_string(),
+            ));
+        }
     }
 
     let solution = clvmr::serde::node_from_bytes_backrefs(&mut allocator, spend.solution.as_ref())
@@ -249,23 +272,42 @@ pub(crate) fn singleton_child_from_spend(
     Ok(None)
 }
 
-/// Whether `puzzle` is a genuine singleton-lineage puzzle: the one-time SINGLETON LAUNCHER or a
-/// SINGLETON TOP-LAYER v1.1 puzzle. Any other puzzle is rejected by the shape gate.
+/// Which member of the singleton family a lineage-spend puzzle is.
+enum SingletonKind {
+    /// The one-time SINGLETON LAUNCHER puzzle (the very first lineage hop).
+    Launcher,
+    /// A SINGLETON TOP-LAYER v1.1 puzzle, carrying the `launcher_id` curried into its
+    /// `singleton_struct` — the immutable identity of the singleton it belongs to.
+    TopLayer { launcher_id: Bytes32 },
+}
+
+/// Classifies `puzzle` as a member of the singleton family, or `None` when it is neither the
+/// launcher nor a top-layer puzzle.
 ///
 /// The launcher is matched by its FULL puzzle hash: the launcher program is itself a compiled
 /// `(a (q . body) 1)`, so uncurrying it would yield the hash of its inner body, not the launcher —
 /// only its whole-puzzle tree hash equals the canonical launcher hash. The singleton top layer is
-/// matched by its uncurried MOD hash (it is `TOP_LAYER` curried with `(singleton_struct inner)`).
+/// matched by its uncurried MOD hash (it is `TOP_LAYER` curried with `(singleton_struct inner)`),
+/// and its curried `SingletonArgs` are parsed to recover the `launcher_id` for the identity binding.
 /// Both reference hashes are read off [`SingletonStruct::new`] rather than re-hardcoded, so they stay
 /// byte-identical with the `chia` puzzle constants.
-fn is_singleton_family_puzzle(allocator: &Allocator, puzzle: NodePtr) -> bool {
+fn classify_singleton_puzzle(allocator: &Allocator, puzzle: NodePtr) -> Option<SingletonKind> {
     let reference = SingletonStruct::new(Bytes32::default());
     let full_hash: Bytes32 = chia::clvm_utils::tree_hash(allocator, puzzle).into();
     if full_hash == reference.launcher_puzzle_hash {
-        return true;
+        return Some(SingletonKind::Launcher);
     }
-    let mod_hash: Bytes32 = Puzzle::parse(allocator, puzzle).mod_hash().into();
-    mod_hash == reference.mod_hash
+    let curried = Puzzle::parse(allocator, puzzle).as_curried()?;
+    let mod_hash: Bytes32 = curried.mod_hash.into();
+    if mod_hash != reference.mod_hash {
+        return None;
+    }
+    // Recover the curried launcher_id from the top layer's `SingletonArgs`. A top-layer mod hash
+    // whose args do not parse as a `SingletonArgs` is not a genuine top-layer coin.
+    let args = SingletonArgs::<NodePtr>::from_clvm(allocator, curried.args).ok()?;
+    Some(SingletonKind::TopLayer {
+        launcher_id: args.singleton_struct.launcher_id,
+    })
 }
 
 /// If `condition` is an odd-amount `CREATE_COIN`, returns the created coin's id (the singleton
@@ -561,11 +603,48 @@ mod tests {
         (spend, launcher_id)
     }
 
+    /// Builds a genuine curried SINGLETON TOP-LAYER v1.1 puzzle for `launcher_id` (inner puzzle is a
+    /// quoted single odd `CREATE_COIN`), returns its `NodePtr` and its tree hash. Curried with the
+    /// canonical launcher/mod hashes so it classifies as a real top-layer coin.
+    fn top_layer_puzzle(a: &mut Allocator, launcher_id: Bytes32) -> (NodePtr, [u8; 32]) {
+        use chia::clvm_traits::ToClvm;
+        use chia::clvm_utils::CurriedProgram;
+        use chia_puzzles::SINGLETON_TOP_LAYER_V1_1;
+
+        let mod_node = clvmr::serde::node_from_bytes(a, &SINGLETON_TOP_LAYER_V1_1).unwrap();
+        // A trivial inner puzzle `(q . ((51 ph 1)))` — irrelevant to classification, which reads the
+        // curried args, not the inner body.
+        let inner = a.new_atom(&[1]).unwrap();
+        let puzzle = CurriedProgram {
+            program: mod_node,
+            args: SingletonArgs::new(launcher_id, inner),
+        }
+        .to_clvm(a)
+        .unwrap();
+        let hash: [u8; 32] = chia::clvm_utils::tree_hash(a, puzzle).into();
+        (puzzle, hash)
+    }
+
+    /// A spend whose puzzle is the top layer for `launcher_id`; the coin's puzzle hash is set to the
+    /// reveal's tree hash so the reveal authenticates. The solution is nil (the identity check runs
+    /// BEFORE the CLVM, so a runnable singleton solution is unnecessary here).
+    fn top_layer_spend(launcher_id: Bytes32) -> CoinSpend {
+        let mut a = Allocator::new();
+        let (puzzle, hash) = top_layer_puzzle(&mut a, launcher_id);
+        let puzzle_bytes = clvmr::serde::node_to_bytes(&a, puzzle).unwrap();
+        let coin = Coin::new(Bytes32::new([0xAB; 32]), Bytes32::new(hash), 1);
+        CoinSpend::new(
+            coin,
+            Program::from(puzzle_bytes),
+            Program::from(vec![0x80]),
+        )
+    }
+
     #[test]
     fn extractor_returns_odd_create_coin_child_from_singleton_family_parent() {
         let eve_ph = [0x55u8; 32];
         let (spend, launcher_id) = launcher_spend(eve_ph, 1); // odd eve amount
-        let child = singleton_child_from_spend(&spend).unwrap();
+        let child = singleton_child_from_spend(&spend, launcher_id).unwrap();
         let expected = Coin::new(launcher_id, Bytes32::new(eve_ph), 1).coin_id();
         assert_eq!(child, Some(expected));
     }
@@ -574,8 +653,8 @@ mod tests {
     fn extractor_ignores_even_amount_create_coin() {
         // An even-amount CREATE_COIN is not a singleton recreation -> no child (a melt), even from a
         // genuine singleton-family (launcher) parent.
-        let (spend, _) = launcher_spend([0x55u8; 32], 2); // even
-        assert_eq!(singleton_child_from_spend(&spend).unwrap(), None);
+        let (spend, launcher_id) = launcher_spend([0x55u8; 32], 2); // even
+        assert_eq!(singleton_child_from_spend(&spend, launcher_id).unwrap(), None);
     }
 
     #[test]
@@ -586,40 +665,70 @@ mod tests {
         let (spend, _) = create_coin_spend([0x55u8; 32], 3); // odd, but not singleton-shaped
         assert!(
             matches!(
-                singleton_child_from_spend(&spend),
+                singleton_child_from_spend(&spend, Bytes32::default()),
                 Err(ChainSourceError::Malformed(_))
             ),
             "a non-singleton parent must fail closed at the shape gate"
         );
     }
 
+    /// #1338: a shape-valid top-layer hop belonging to a DIFFERENT singleton (its curried
+    /// `launcher_id` != the walk's launcher) must be rejected BEFORE it can be spliced in. The reveal
+    /// authenticates and the shape gate passes, so only the launcher-id identity binding catches it.
     #[test]
-    fn singleton_family_predicate_accepts_launcher_and_top_layer_only() {
-        use chia::clvm_traits::ToClvm;
-        use chia::clvm_utils::CurriedProgram;
-        use chia::puzzles::singleton::SingletonArgs;
-        use chia_puzzles::{SINGLETON_LAUNCHER, SINGLETON_TOP_LAYER_V1_1};
+    fn extractor_rejects_top_layer_of_a_different_singleton() {
+        let hop_launcher = Bytes32::new([0x11; 32]);
+        let walk_launcher = Bytes32::new([0x22; 32]);
+        assert_ne!(hop_launcher, walk_launcher);
+
+        let spend = top_layer_spend(hop_launcher);
+        let result = singleton_child_from_spend(&spend, walk_launcher);
+        assert!(
+            matches!(&result, Err(ChainSourceError::Malformed(m)) if m.contains("launcher_id mismatch")),
+            "a top-layer hop from a different singleton must fail closed, got {result:?}"
+        );
+    }
+
+    /// #1338: a top-layer hop of the SAME singleton passes the identity gate (it does not fail with
+    /// the launcher-id-mismatch error). It may then legitimately fail later (the trivial inner puzzle
+    /// is not a runnable singleton), so we assert only that the identity binding does NOT reject it.
+    #[test]
+    fn extractor_admits_top_layer_of_the_same_singleton_past_identity_gate() {
+        let launcher = Bytes32::new([0x33; 32]);
+        let spend = top_layer_spend(launcher);
+        match singleton_child_from_spend(&spend, launcher) {
+            Err(ChainSourceError::Malformed(m)) => assert!(
+                !m.contains("launcher_id mismatch"),
+                "a same-launcher hop must pass the identity gate, got {m}"
+            ),
+            _ => {} // Ok(_) also means the identity gate admitted it.
+        }
+    }
+
+    #[test]
+    fn classify_accepts_launcher_and_top_layer_extracting_launcher_id() {
+        use chia_puzzles::SINGLETON_LAUNCHER;
 
         let mut a = Allocator::new();
 
-        // The raw launcher puzzle is singleton-family.
+        // The raw launcher puzzle classifies as the launcher.
         let launcher = clvmr::serde::node_from_bytes(&mut a, &SINGLETON_LAUNCHER).unwrap();
-        assert!(is_singleton_family_puzzle(&a, launcher));
+        assert!(matches!(
+            classify_singleton_puzzle(&a, launcher),
+            Some(SingletonKind::Launcher)
+        ));
 
-        // A curried singleton top-layer puzzle is singleton-family.
-        let mod_node = clvmr::serde::node_from_bytes(&mut a, &SINGLETON_TOP_LAYER_V1_1).unwrap();
-        let inner = a.new_atom(&[1]).unwrap();
-        let singleton = CurriedProgram {
-            program: mod_node,
-            args: SingletonArgs::new(Bytes32::new([0x07; 32]), inner),
-        }
-        .to_clvm(&mut a)
-        .unwrap();
-        assert!(is_singleton_family_puzzle(&a, singleton));
+        // A curried top-layer puzzle classifies as TopLayer with the curried launcher_id recovered.
+        let lid = Bytes32::new([0x07; 32]);
+        let (singleton, _) = top_layer_puzzle(&mut a, lid);
+        assert!(matches!(
+            classify_singleton_puzzle(&a, singleton),
+            Some(SingletonKind::TopLayer { launcher_id }) if launcher_id == lid
+        ));
 
-        // An arbitrary (non-singleton) puzzle is NOT singleton-family.
+        // An arbitrary (non-singleton) puzzle classifies as neither.
         let bare = a.new_atom(&[0x80]).unwrap();
-        assert!(!is_singleton_family_puzzle(&a, bare));
+        assert!(classify_singleton_puzzle(&a, bare).is_none());
     }
 
     #[test]
@@ -646,7 +755,7 @@ mod tests {
             spend.coin.amount,
         );
         assert!(matches!(
-            singleton_child_from_spend(&spend),
+            singleton_child_from_spend(&spend, Bytes32::default()),
             Err(ChainSourceError::Malformed(_))
         ));
     }
@@ -657,7 +766,7 @@ mod tests {
         // 0xff is not a valid serialized CLVM program.
         let spend = CoinSpend::new(coin, Program::from(vec![0xff]), Program::from(vec![0x80]));
         assert!(matches!(
-            singleton_child_from_spend(&spend),
+            singleton_child_from_spend(&spend, Bytes32::default()),
             Err(ChainSourceError::Malformed(_))
         ));
     }
