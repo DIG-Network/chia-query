@@ -38,6 +38,18 @@ impl TrustLevel {
 /// The number of independent groups that must agree for a pure-public quorum to satisfy custody.
 const PUBLIC_QUORUM_THRESHOLD: usize = 2;
 
+/// The maximum number of coin records accepted in a single quorum answer from an UNTRUSTED public
+/// source.
+///
+/// A list read ([`ChainSource::coin_records_by_puzzle_hash`], [`ChainSource::coin_records_by_parent`])
+/// answers with an attacker-influenceable, unbounded `Vec`. Canonicalizing + comparing it costs CPU
+/// and memory proportional to its length, so a hostile source could return a huge list to exhaust
+/// resources during a quorum. This ceiling bounds that work and fails closed
+/// ([`ChainSourceError::Malformed`]) past it — mirroring the bounded-input discipline of #1323. It is
+/// generous: no legitimate puzzle hash or parent coin has anywhere near this many children, so a
+/// genuine answer is never rejected, while an adversarial flood is capped.
+const MAX_QUORUM_RECORDS: usize = 100_000;
+
 /// A boxed, dynamically-dispatched registry participant.
 type DynProvider = dyn ChainSourceProvider<Error = ChainSourceError>;
 
@@ -201,6 +213,13 @@ impl DiscoveryView<'_> {
 trait QuorumComparable {
     /// Whether two source answers agree for the purpose of a quorum, ignoring incidental ordering.
     fn quorum_eq(&self, other: &Self) -> bool;
+
+    /// Rejects an implausibly large answer from an untrusted source BEFORE it is canonicalized or
+    /// compared, bounding quorum CPU + memory. The default imposes no bound (fixed-size answers);
+    /// only unbounded list answers override it.
+    fn validate_bound(&self) -> Result<(), ChainSourceError> {
+        Ok(())
+    }
 }
 
 /// Answers with no meaningful internal ordering agree exactly when they are equal.
@@ -226,16 +245,31 @@ impl QuorumComparable for Vec<CoinRecord> {
     fn quorum_eq(&self, other: &Self) -> bool {
         canonical_order(self) == canonical_order(other)
     }
+
+    fn validate_bound(&self) -> Result<(), ChainSourceError> {
+        if self.len() > MAX_QUORUM_RECORDS {
+            return Err(ChainSourceError::Malformed(format!(
+                "untrusted source returned {} coin records, exceeding the {MAX_QUORUM_RECORDS} cap",
+                self.len()
+            )));
+        }
+        Ok(())
+    }
 }
 
-/// Borrows the records in a canonical order (by coin id) so two equal SETS returned in different
-/// orders compare equal. A coin id is a SHA-256 commitment to the whole coin, so it totally orders
-/// distinct coins; records sharing a coin but differing in metadata still differ after the sort, so
-/// genuine disagreement is preserved.
-fn canonical_order(records: &[CoinRecord]) -> Vec<&CoinRecord> {
-    let mut ordered: Vec<&CoinRecord> = records.iter().collect();
-    ordered.sort_by(|a, b| a.coin.coin_id().as_ref().cmp(b.coin.coin_id().as_ref()));
-    ordered
+/// Borrows the records in a canonical order keyed by coin id so two equal SETS returned in different
+/// orders compare equal.
+///
+/// Each record's coin id is a SHA-256 commitment to the whole coin, computed ONCE per record into the
+/// sort key here — so the comparison hashes O(n) times, not the O(n log n) a `sort_by` recomputing
+/// `coin_id()` in every comparison would cost. The id totally orders distinct coins; records sharing
+/// a coin but differing in metadata still differ (the comparison includes the record), so genuine
+/// disagreement is preserved.
+fn canonical_order(records: &[CoinRecord]) -> Vec<(Bytes32, &CoinRecord)> {
+    let mut keyed: Vec<(Bytes32, &CoinRecord)> =
+        records.iter().map(|r| (r.coin.coin_id(), r)).collect();
+    keyed.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+    keyed
 }
 
 /// Requires `threshold` DISTINCT independence groups to return the SAME answer for `query`.
@@ -262,6 +296,8 @@ where
             continue; // this group already contributed a representative answer
         }
         if let Ok(answer) = query(&*reg.provider) {
+            // Reject an implausibly large untrusted answer before it is canonicalized or compared.
+            answer.validate_bound()?;
             per_group.push((group, answer));
         }
     }
@@ -708,6 +744,48 @@ mod tests {
             Err(ChainSourceError::NoProvider),
             "genuinely different record sets must fail closed"
         );
+    }
+
+    /// #1341: an untrusted quorum source returning MORE than [`MAX_QUORUM_RECORDS`] records must
+    /// fail closed with the typed `Malformed` error before the oversized list is canonicalized —
+    /// bounding CPU/memory against a hostile flood.
+    #[test]
+    fn quorum_fails_closed_when_untrusted_source_exceeds_the_record_cap() {
+        let ph = Bytes32::new([0x22; 32]);
+        let flood: Vec<CoinRecord> = (0..=MAX_QUORUM_RECORDS as u32)
+            .map(|i| {
+                let coin = Coin::new(Bytes32::new([0x01; 32]), ph, u64::from(i) + 1);
+                let mut r = record_for(coin.coin_id());
+                r.coin = coin;
+                r
+            })
+            .collect();
+        assert!(flood.len() > MAX_QUORUM_RECORDS);
+
+        let registry = ProviderRegistry::new()
+            .allow_public_quorum_custody(true)
+            .register(
+                Box::new(CoinsetProvider::new(
+                    "coinset",
+                    10,
+                    list_source(flood.clone()),
+                )),
+                None,
+                "coinset.org",
+            )
+            .register(
+                Box::new(CustomProvider::new("mirror", 20, list_source(flood))),
+                None,
+                "mirror.example",
+            );
+
+        match registry.trusted().coin_records_by_puzzle_hash(ph, false) {
+            Err(ChainSourceError::Malformed(m)) => assert!(
+                m.contains("exceeding") && m.contains("cap"),
+                "expected the record-cap error, got: {m}"
+            ),
+            other => panic!("an over-cap untrusted answer must fail closed, got {other:?}"),
+        }
     }
 
     // ---- Test #7: discovery view returns a single-provider answer, inert for custody ----

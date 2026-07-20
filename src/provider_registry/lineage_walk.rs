@@ -633,11 +633,7 @@ mod tests {
         let (puzzle, hash) = top_layer_puzzle(&mut a, launcher_id);
         let puzzle_bytes = clvmr::serde::node_to_bytes(&a, puzzle).unwrap();
         let coin = Coin::new(Bytes32::new([0xAB; 32]), Bytes32::new(hash), 1);
-        CoinSpend::new(
-            coin,
-            Program::from(puzzle_bytes),
-            Program::from(vec![0x80]),
-        )
+        CoinSpend::new(coin, Program::from(puzzle_bytes), Program::from(vec![0x80]))
     }
 
     #[test]
@@ -654,7 +650,10 @@ mod tests {
         // An even-amount CREATE_COIN is not a singleton recreation -> no child (a melt), even from a
         // genuine singleton-family (launcher) parent.
         let (spend, launcher_id) = launcher_spend([0x55u8; 32], 2); // even
-        assert_eq!(singleton_child_from_spend(&spend, launcher_id).unwrap(), None);
+        assert_eq!(
+            singleton_child_from_spend(&spend, launcher_id).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -696,12 +695,14 @@ mod tests {
     fn extractor_admits_top_layer_of_the_same_singleton_past_identity_gate() {
         let launcher = Bytes32::new([0x33; 32]);
         let spend = top_layer_spend(launcher);
-        match singleton_child_from_spend(&spend, launcher) {
-            Err(ChainSourceError::Malformed(m)) => assert!(
+        // A later failure is fine (the trivial inner puzzle is not a runnable singleton); only the
+        // launcher-id-mismatch rejection would mean the identity gate wrongly rejected a same-launcher
+        // hop. Ok(_) equally means the gate admitted it.
+        if let Err(ChainSourceError::Malformed(m)) = singleton_child_from_spend(&spend, launcher) {
+            assert!(
                 !m.contains("launcher_id mismatch"),
                 "a same-launcher hop must pass the identity gate, got {m}"
-            ),
-            _ => {} // Ok(_) also means the identity gate admitted it.
+            );
         }
     }
 
