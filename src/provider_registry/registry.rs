@@ -136,7 +136,7 @@ impl TrustedView<'_> {
     /// qualifying quorum can answer.
     fn custody_read<T, Q>(&self, query: Q) -> Result<T, ChainSourceError>
     where
-        T: PartialEq + Clone,
+        T: QuorumComparable + Clone,
         Q: Fn(&DynProvider) -> Result<T, ChainSourceError>,
     {
         let trusted: Vec<&Registration> = self
@@ -189,19 +189,69 @@ impl DiscoveryView<'_> {
     }
 }
 
+/// Order-insensitive equality for quorum agreement.
+///
+/// Two honest, independent sources may return the SAME records in a DIFFERENT order — the list
+/// reads ([`ChainSource::coin_records_by_puzzle_hash`], [`ChainSource::coin_records_by_parent`])
+/// promise a set of matching coins, not an ordering. A byte-for-byte `Vec` comparison would make
+/// such sources spuriously "disagree" and fail an otherwise-satisfiable quorum (an availability
+/// nit). `quorum_eq` compares answers by VALUE independent of incidental ordering, while still
+/// treating genuinely different record SETS as disagreement — the quorum security property (SPEC §5)
+/// is preserved; only the false-negative on ordering is removed.
+trait QuorumComparable {
+    /// Whether two source answers agree for the purpose of a quorum, ignoring incidental ordering.
+    fn quorum_eq(&self, other: &Self) -> bool;
+}
+
+/// Answers with no meaningful internal ordering agree exactly when they are equal.
+macro_rules! quorum_eq_via_partial_eq {
+    ($($t:ty),+ $(,)?) => {
+        $(impl QuorumComparable for $t {
+            fn quorum_eq(&self, other: &Self) -> bool {
+                self == other
+            }
+        })+
+    };
+}
+
+quorum_eq_via_partial_eq!(
+    Option<CoinRecord>,
+    Option<CoinSpend>,
+    Option<SingletonLineage>,
+    Option<u32>,
+    Option<u64>,
+);
+
+impl QuorumComparable for Vec<CoinRecord> {
+    fn quorum_eq(&self, other: &Self) -> bool {
+        canonical_order(self) == canonical_order(other)
+    }
+}
+
+/// Borrows the records in a canonical order (by coin id) so two equal SETS returned in different
+/// orders compare equal. A coin id is a SHA-256 commitment to the whole coin, so it totally orders
+/// distinct coins; records sharing a coin but differing in metadata still differ after the sort, so
+/// genuine disagreement is preserved.
+fn canonical_order(records: &[CoinRecord]) -> Vec<&CoinRecord> {
+    let mut ordered: Vec<&CoinRecord> = records.iter().collect();
+    ordered.sort_by(|a, b| a.coin.coin_id().as_ref().cmp(b.coin.coin_id().as_ref()));
+    ordered
+}
+
 /// Requires `threshold` DISTINCT independence groups to return the SAME answer for `query`.
 ///
 /// Each group contributes at most one answer (its first provider that responds); the count is over
 /// distinct groups, so two providers in the same group can never satisfy a `threshold >= 2` on
-/// their own. Insufficient agreement — disagreement, too few groups, or all errors — fails closed
-/// (SPEC §5).
+/// their own. Agreement is order-insensitive ([`QuorumComparable`]), so two honest sources returning
+/// the same record set in a different order still agree. Insufficient agreement — disagreement, too
+/// few groups, or all errors — fails closed (SPEC §5).
 fn quorum_read<T, Q>(
     providers: &[Registration],
     threshold: usize,
     query: Q,
 ) -> Result<T, ChainSourceError>
 where
-    T: PartialEq + Clone,
+    T: QuorumComparable + Clone,
     Q: Fn(&DynProvider) -> Result<T, ChainSourceError>,
 {
     // One representative answer per independence group (the first provider in the group to answer).
@@ -216,9 +266,12 @@ where
         }
     }
 
-    // An answer qualifies when `threshold` distinct groups agree on it.
+    // An answer qualifies when `threshold` distinct groups agree on it (order-insensitively).
     for (_, candidate) in &per_group {
-        let agreeing = per_group.iter().filter(|(_, a)| a == candidate).count();
+        let agreeing = per_group
+            .iter()
+            .filter(|(_, a)| a.quorum_eq(candidate))
+            .count();
         if agreeing >= threshold {
             return Ok(candidate.clone());
         }
@@ -530,6 +583,130 @@ mod tests {
         assert_eq!(
             registry.trusted().coin_record(id),
             Err(ChainSourceError::NoProvider)
+        );
+    }
+
+    // ---- Order-insensitive quorum agreement (#1259 fix 1) ----
+
+    /// A test source returning a fixed, caller-controlled ORDER of records for the list reads, so a
+    /// quorum comparison can be exercised across sources that agree on the SET but differ in order.
+    struct FixedListSource {
+        records: Vec<CoinRecord>,
+    }
+
+    impl ChainSource for FixedListSource {
+        type Error = ChainSourceError;
+
+        fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+            Ok(None)
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(self.records.clone())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent_coin_id: Bytes32,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(self.records.clone())
+        }
+
+        fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> Result<Option<SingletonLineage>, Self::Error> {
+            Ok(None)
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            Ok(None)
+        }
+
+        fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn list_source(records: Vec<CoinRecord>) -> FixedListSource {
+        FixedListSource { records }
+    }
+
+    #[test]
+    fn quorum_agrees_on_same_record_set_in_different_order() {
+        let ph = Bytes32::new([0x22; 32]);
+        let a = record_for(coin_id(0x0A));
+        let b = record_for(coin_id(0x0B));
+
+        // Two INDEPENDENT public sources return the SAME set of records in REVERSED order. With the
+        // opt-in quorum, they must AGREE (order is not a source of disagreement).
+        let registry = ProviderRegistry::new()
+            .allow_public_quorum_custody(true)
+            .register(
+                Box::new(CoinsetProvider::new(
+                    "coinset",
+                    10,
+                    list_source(vec![a.clone(), b.clone()]),
+                )),
+                None,
+                "coinset.org",
+            )
+            .register(
+                Box::new(CustomProvider::new(
+                    "mirror",
+                    20,
+                    list_source(vec![b.clone(), a.clone()]),
+                )),
+                None,
+                "mirror.example",
+            );
+
+        let records = registry
+            .trusted()
+            .coin_records_by_puzzle_hash(ph, false)
+            .expect("honest sources agreeing on a set must satisfy the quorum");
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&a) && records.contains(&b));
+    }
+
+    #[test]
+    fn quorum_still_fails_closed_on_genuinely_different_record_sets() {
+        let ph = Bytes32::new([0x22; 32]);
+        let a = record_for(coin_id(0x0A));
+        let b = record_for(coin_id(0x0B));
+        let c = record_for(coin_id(0x0C));
+
+        // Different SETS ({a,b} vs {a,c}) must still be treated as disagreement -> fail closed. The
+        // order-insensitive comparison must not weaken the quorum into accepting different content.
+        let registry = ProviderRegistry::new()
+            .allow_public_quorum_custody(true)
+            .register(
+                Box::new(CoinsetProvider::new(
+                    "coinset",
+                    10,
+                    list_source(vec![a.clone(), b]),
+                )),
+                None,
+                "coinset.org",
+            )
+            .register(
+                Box::new(CustomProvider::new("mirror", 20, list_source(vec![c, a]))),
+                None,
+                "mirror.example",
+            );
+
+        assert_eq!(
+            registry.trusted().coin_records_by_puzzle_hash(ph, false),
+            Err(ChainSourceError::NoProvider),
+            "genuinely different record sets must fail closed"
         );
     }
 

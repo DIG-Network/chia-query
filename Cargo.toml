@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -78,6 +78,10 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 # Enables the in-memory `MockChainSource` for the provider-registry trust-model
 # tests. This merges the `testing` feature onto the native dependency above.
 dig-chainsource-interface = { version = "0.1", features = ["testing"] }
+# The canonical singleton launcher/top-layer program bytes, so the lineage-walk
+# tests build GENUINE singleton-family spends to exercise the singleton-shape gate
+# (pinned to the same 0.20.x the `chia` 0.26 stack resolves).
+chia-puzzles = "0.20"
 
 [[bin]]
 name = "coinset_drift"

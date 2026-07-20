@@ -556,10 +556,18 @@ the current unspent tip, collecting every member coin id. It is NEVER an echo of
 coin, so `SingletonLineage::contains` MEMBERSHIP is meaningful. Each hop is authenticated by
 `singleton_child_from_spend`: the spent coin's puzzle reveal MUST hash to its committed puzzle hash
 (`clvm_utils::tree_hash`), and the child is the odd-amount `CREATE_COIN` output of the parent spend
-(computed with `chia_protocol::Coin::coin_id`). Additionally, each hop binds the fetched spend to the
-requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to `launcher_id`),
-making the walk cryptographically self-authenticating from the launcher; a mismatch fails closed as
-`Malformed`. A revisited coin (cycle) fails closed as `Malformed`. The walk is bounded against
+(computed with `chia_protocol::Coin::coin_id`). The parent puzzle MUST additionally have
+singleton-family SHAPE -- it is either the one-time SINGLETON LAUNCHER (matched by its full puzzle
+hash) or a SINGLETON TOP-LAYER v1.1 puzzle (matched by its uncurried mod hash); any other puzzle that
+merely happens to emit an odd `CREATE_COIN` is NOT a singleton recreation and fails closed as
+`Malformed`. Because the singleton top layer morphs its recreation output into the singleton wrapper
+by construction, asserting the parent is genuine singleton shape is what guarantees the selected child
+is singleton-shaped. The `CREATE_COIN` amount is decoded fail-closed: an amount atom wider than 8
+bytes (a value that cannot fit `u64`) is rejected as `Malformed` rather than silently wrapped, so an
+overflowing amount can never be misread as a small odd value. Additionally, each hop binds the fetched
+spend to the requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to
+`launcher_id`), making the walk cryptographically self-authenticating from the launcher; a mismatch
+fails closed as `Malformed`. A revisited coin (cycle) fails closed as `Malformed`. The walk is bounded against
 resource-exhaustion DoS by TWO layers, because each generation is a strictly-sequential network
 round-trip (one fetch per hop on the coinset path, two on the peer path) with only per-request
 timeouts. (1) **Primary — an overall wall-clock deadline** (`WALK_DEADLINE`, 45s) wraps the entire
@@ -599,6 +607,11 @@ Providers are the four kind wrappers `CoinsetProvider` (PublicOracle), `LocalNod
 **Independence groups.** Each provider registers with an `independence_group` id; a quorum counts
 DISTINCT groups, so two providers in the same group (e.g. the same coinset.org listed twice) count as
 one and cannot alone satisfy a 2-group threshold. Quorum agreement compares converted answers for
-equality (for `resolve_singleton_lineage`, cross-source agreement compares the full lineage;
-consumers still apply the `SingletonLineage::contains` MEMBERSHIP authority test to the result, never
-tip/puzzle-hash equality). Disagreement, too few groups, or all-errors fails closed.
+equality, ORDER-INSENSITIVELY: the list reads (`coin_records_by_puzzle_hash`, `coin_records_by_parent`)
+return a SET of matching coins with no promised ordering, so two honest sources returning the same
+records in a different order AGREE (compared by canonical coin-id order) rather than spuriously
+disagreeing; a genuinely different record SET still fails closed (the security property is preserved,
+only the false negative on ordering is removed). For `resolve_singleton_lineage`, cross-source
+agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
+authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
+all-errors fails closed.

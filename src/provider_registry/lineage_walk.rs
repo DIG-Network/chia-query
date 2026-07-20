@@ -21,12 +21,18 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
+use chia::puzzles::singleton::SingletonStruct;
 use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_wallet_sdk::driver::Puzzle;
 use clvmr::{Allocator, NodePtr, SExp};
 use dig_chainsource_interface::{ChainSourceError, SingletonLineage};
 
 /// The CLVM opcode for a `CREATE_COIN` condition.
 const CREATE_COIN: u8 = 51;
+
+/// The maximum byte width of a CLVM coin-amount atom: a `u64` is exactly 8 bytes, so any wider atom
+/// cannot be a genuine coin amount and is rejected rather than wrapped ([`atom_to_u64`]).
+const MAX_AMOUNT_ATOM_BYTES: usize = 8;
 
 /// A generous CLVM evaluation budget for running a single puzzle+solution — the standard maximum
 /// block cost, comfortably above any one singleton spend.
@@ -211,6 +217,21 @@ pub(crate) fn singleton_child_from_spend(
         ));
     }
 
+    // Singleton-shape gate: a genuine lineage spend is either the one-time SINGLETON LAUNCHER (the
+    // very first hop) or a SINGLETON TOP-LAYER puzzle (every subsequent hop). Any other puzzle that
+    // happens to emit an odd `CREATE_COIN` is NOT a singleton recreation, so we refuse to treat its
+    // output as a lineage child. Because the singleton top layer morphs its recreation output into
+    // the singleton wrapper by construction, asserting the PARENT is a genuine singleton (or the
+    // launcher) is what guarantees the SELECTED child has singleton shape — verifying the child's
+    // curried shape directly is impossible from its puzzle hash alone. This layers on top of the
+    // reveal authentication above and the walk's coin-id binding; it does NOT replace them.
+    if !is_singleton_family_puzzle(&allocator, puzzle) {
+        return Err(ChainSourceError::Malformed(
+            "lineage spend puzzle is neither the singleton launcher nor a singleton top layer"
+                .to_string(),
+        ));
+    }
+
     let solution = clvmr::serde::node_from_bytes_backrefs(&mut allocator, spend.solution.as_ref())
         .map_err(|e| ChainSourceError::Malformed(format!("undecodable solution: {e}")))?;
 
@@ -221,32 +242,73 @@ pub(crate) fn singleton_child_from_spend(
 
     let parent_id = spend.coin.coin_id();
     for condition in list_iter(&allocator, output) {
-        if let Some(child) = create_coin_child(&allocator, condition, parent_id) {
+        if let Some(child) = create_coin_child(&allocator, condition, parent_id)? {
             return Ok(Some(child));
         }
     }
     Ok(None)
 }
 
-/// If `condition` is an odd-amount `CREATE_COIN`, returns the created coin's id (the singleton
-/// recreation child); otherwise `None`.
-fn create_coin_child(a: &Allocator, condition: NodePtr, parent_id: Bytes32) -> Option<Bytes32> {
-    let mut args = list_iter(a, condition);
-    let opcode = args.next()?;
-    if atom_bytes(a, opcode)? != [CREATE_COIN] {
-        return None;
+/// Whether `puzzle` is a genuine singleton-lineage puzzle: the one-time SINGLETON LAUNCHER or a
+/// SINGLETON TOP-LAYER v1.1 puzzle. Any other puzzle is rejected by the shape gate.
+///
+/// The launcher is matched by its FULL puzzle hash: the launcher program is itself a compiled
+/// `(a (q . body) 1)`, so uncurrying it would yield the hash of its inner body, not the launcher —
+/// only its whole-puzzle tree hash equals the canonical launcher hash. The singleton top layer is
+/// matched by its uncurried MOD hash (it is `TOP_LAYER` curried with `(singleton_struct inner)`).
+/// Both reference hashes are read off [`SingletonStruct::new`] rather than re-hardcoded, so they stay
+/// byte-identical with the `chia` puzzle constants.
+fn is_singleton_family_puzzle(allocator: &Allocator, puzzle: NodePtr) -> bool {
+    let reference = SingletonStruct::new(Bytes32::default());
+    let full_hash: Bytes32 = chia::clvm_utils::tree_hash(allocator, puzzle).into();
+    if full_hash == reference.launcher_puzzle_hash {
+        return true;
     }
-    let puzzle_hash_node = args.next()?;
-    let amount_node = args.next()?;
+    let mod_hash: Bytes32 = Puzzle::parse(allocator, puzzle).mod_hash().into();
+    mod_hash == reference.mod_hash
+}
 
-    let puzzle_hash: [u8; 32] = atom_bytes(a, puzzle_hash_node)?.try_into().ok()?;
-    let amount = atom_to_u64(&atom_bytes(a, amount_node)?);
+/// If `condition` is an odd-amount `CREATE_COIN`, returns the created coin's id (the singleton
+/// recreation child).
+///
+/// `Ok(None)` = this condition is not the singleton continuation (not a `CREATE_COIN`, malformed
+/// args, or an even amount) and should be skipped. `Err(Malformed)` = a `CREATE_COIN` whose amount
+/// atom overflows `u64` — a malformed amount is failed closed rather than wrapped into a bogus value
+/// (see [`atom_to_u64`]).
+fn create_coin_child(
+    a: &Allocator,
+    condition: NodePtr,
+    parent_id: Bytes32,
+) -> Result<Option<Bytes32>, ChainSourceError> {
+    let mut args = list_iter(a, condition);
+    let Some(opcode) = args.next() else {
+        return Ok(None);
+    };
+    if atom_bytes(a, opcode).as_deref() != Some(&[CREATE_COIN]) {
+        return Ok(None);
+    }
+    let (Some(puzzle_hash_node), Some(amount_node)) = (args.next(), args.next()) else {
+        return Ok(None);
+    };
+
+    let Some(puzzle_hash) = atom_bytes(a, puzzle_hash_node) else {
+        return Ok(None);
+    };
+    let Ok(puzzle_hash) = <[u8; 32]>::try_from(puzzle_hash) else {
+        return Ok(None);
+    };
+    let Some(amount_bytes) = atom_bytes(a, amount_node) else {
+        return Ok(None);
+    };
+    let amount = atom_to_u64(&amount_bytes)?;
 
     // Only the odd-amount output continues the singleton.
     if amount.is_multiple_of(2) {
-        return None;
+        return Ok(None);
     }
-    Some(Coin::new(parent_id, Bytes32::new(puzzle_hash), amount).coin_id())
+    Ok(Some(
+        Coin::new(parent_id, Bytes32::new(puzzle_hash), amount).coin_id(),
+    ))
 }
 
 /// The atom bytes of `node`, or `None` when it is a pair rather than an atom.
@@ -257,12 +319,20 @@ fn atom_bytes(a: &Allocator, node: NodePtr) -> Option<Vec<u8>> {
     }
 }
 
-/// Decodes a minimal big-endian CLVM atom into a `u64` (values above `u64` saturate, which no valid
-/// coin amount reaches).
-fn atom_to_u64(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0u64, |acc, &b| acc.wrapping_shl(8).wrapping_add(b as u64))
+/// Decodes a minimal big-endian CLVM atom into a `u64`, failing closed with
+/// [`ChainSourceError::Malformed`] when the atom is wider than 8 bytes.
+///
+/// A silent wrap/truncate would misread an overflowing amount as some smaller value — potentially an
+/// odd one that then looks like a singleton recreation — so an over-wide amount is rejected rather
+/// than masked. Within the 8-byte bound the fold cannot overflow, so no wrapping is needed.
+fn atom_to_u64(bytes: &[u8]) -> Result<u64, ChainSourceError> {
+    if bytes.len() > MAX_AMOUNT_ATOM_BYTES {
+        return Err(ChainSourceError::Malformed(format!(
+            "coin amount atom is {} bytes, exceeding the {MAX_AMOUNT_ATOM_BYTES}-byte u64 maximum",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
 }
 
 /// Iterates the elements of a proper CLVM list, stopping at the nil terminator.
@@ -459,20 +529,111 @@ mod tests {
         (spend, parent_id)
     }
 
+    /// Builds a GENUINE singleton LAUNCHER spend: the launcher coin (whose puzzle hash is the
+    /// canonical launcher hash, so the reveal authenticates) spent with a launcher solution that
+    /// creates the eve singleton at `eve_full_ph` with `amount`. The launcher is singleton-family, so
+    /// it passes the shape gate, and running it emits the eve `CREATE_COIN`. Returns the spend and the
+    /// launcher (parent) coin id.
+    fn launcher_spend(eve_full_ph: [u8; 32], amount: u8) -> (CoinSpend, Bytes32) {
+        use chia_puzzles::{SINGLETON_LAUNCHER, SINGLETON_LAUNCHER_HASH};
+
+        let mut a = Allocator::new();
+        let ph_atom = a.new_atom(&eve_full_ph).unwrap();
+        let amt_atom = a.new_atom(&[amount]).unwrap();
+        let nil = a.nil();
+        // LauncherSolution = (singleton_puzzle_hash amount key_value_list); key_value_list is ().
+        let tail = a.new_pair(nil, nil).unwrap();
+        let mid = a.new_pair(amt_atom, tail).unwrap();
+        let solution = a.new_pair(ph_atom, mid).unwrap();
+        let solution_bytes = clvmr::serde::node_to_bytes(&a, solution).unwrap();
+
+        let launcher = Coin::new(
+            Bytes32::new([0xAB; 32]),
+            Bytes32::new(SINGLETON_LAUNCHER_HASH),
+            amount as u64,
+        );
+        let launcher_id = launcher.coin_id();
+        let spend = CoinSpend::new(
+            launcher,
+            Program::from(SINGLETON_LAUNCHER.to_vec()),
+            Program::from(solution_bytes),
+        );
+        (spend, launcher_id)
+    }
+
     #[test]
-    fn extractor_returns_odd_create_coin_child() {
-        let child_ph = [0x55u8; 32];
-        let (spend, parent_id) = create_coin_spend(child_ph, 3); // odd
+    fn extractor_returns_odd_create_coin_child_from_singleton_family_parent() {
+        let eve_ph = [0x55u8; 32];
+        let (spend, launcher_id) = launcher_spend(eve_ph, 1); // odd eve amount
         let child = singleton_child_from_spend(&spend).unwrap();
-        let expected = Coin::new(parent_id, Bytes32::new(child_ph), 3).coin_id();
+        let expected = Coin::new(launcher_id, Bytes32::new(eve_ph), 1).coin_id();
         assert_eq!(child, Some(expected));
     }
 
     #[test]
     fn extractor_ignores_even_amount_create_coin() {
-        // An even-amount CREATE_COIN is not a singleton recreation -> no child (a melt).
-        let (spend, _) = create_coin_spend([0x55u8; 32], 2); // even
+        // An even-amount CREATE_COIN is not a singleton recreation -> no child (a melt), even from a
+        // genuine singleton-family (launcher) parent.
+        let (spend, _) = launcher_spend([0x55u8; 32], 2); // even
         assert_eq!(singleton_child_from_spend(&spend).unwrap(), None);
+    }
+
+    #[test]
+    fn extractor_rejects_non_singleton_shaped_parent() {
+        // #1259 fix 3: a bare (non-singleton) puzzle that emits an odd CREATE_COIN is NOT a singleton
+        // recreation. The reveal authenticates (it hashes to the coin's puzzle hash), so only the
+        // singleton-shape gate catches it -> fail closed rather than emit a bogus lineage child.
+        let (spend, _) = create_coin_spend([0x55u8; 32], 3); // odd, but not singleton-shaped
+        assert!(
+            matches!(
+                singleton_child_from_spend(&spend),
+                Err(ChainSourceError::Malformed(_))
+            ),
+            "a non-singleton parent must fail closed at the shape gate"
+        );
+    }
+
+    #[test]
+    fn singleton_family_predicate_accepts_launcher_and_top_layer_only() {
+        use chia::clvm_traits::ToClvm;
+        use chia::clvm_utils::CurriedProgram;
+        use chia::puzzles::singleton::SingletonArgs;
+        use chia_puzzles::{SINGLETON_LAUNCHER, SINGLETON_TOP_LAYER_V1_1};
+
+        let mut a = Allocator::new();
+
+        // The raw launcher puzzle is singleton-family.
+        let launcher = clvmr::serde::node_from_bytes(&mut a, &SINGLETON_LAUNCHER).unwrap();
+        assert!(is_singleton_family_puzzle(&a, launcher));
+
+        // A curried singleton top-layer puzzle is singleton-family.
+        let mod_node = clvmr::serde::node_from_bytes(&mut a, &SINGLETON_TOP_LAYER_V1_1).unwrap();
+        let inner = a.new_atom(&[1]).unwrap();
+        let singleton = CurriedProgram {
+            program: mod_node,
+            args: SingletonArgs::new(Bytes32::new([0x07; 32]), inner),
+        }
+        .to_clvm(&mut a)
+        .unwrap();
+        assert!(is_singleton_family_puzzle(&a, singleton));
+
+        // An arbitrary (non-singleton) puzzle is NOT singleton-family.
+        let bare = a.new_atom(&[0x80]).unwrap();
+        assert!(!is_singleton_family_puzzle(&a, bare));
+    }
+
+    #[test]
+    fn atom_to_u64_rejects_overflow_and_decodes_valid() {
+        // A >8-byte amount atom overflows u64 -> fail closed rather than wrap/truncate.
+        assert!(matches!(
+            atom_to_u64(&[0xFF; 9]),
+            Err(ChainSourceError::Malformed(_))
+        ));
+        // Exactly 8 bytes is the u64 maximum -> decoded, not rejected.
+        assert_eq!(atom_to_u64(&[0xFF; 8]).unwrap(), u64::MAX);
+        // A minimal big-endian atom decodes to its value; empty atom is zero.
+        assert_eq!(atom_to_u64(&[0x01, 0x00]).unwrap(), 256);
+        assert_eq!(atom_to_u64(&[]).unwrap(), 0);
     }
 
     #[test]

@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.2] - 2026-07-20
+
+### Bug Fixes
+- **provider-registry:** Order-insensitive quorum agreement — two honest independent sources
+  returning the same record set in a different order no longer spuriously disagree; genuinely
+  different record sets still fail closed (#1259)
+- **lineage:** `atom_to_u64` returns `Malformed` on an amount atom wider than 8 bytes instead of
+  silently wrapping/truncating (#1259)
+- **lineage:** `singleton_child_from_spend` asserts the parent has singleton-family shape (the
+  singleton launcher or a singleton top layer) before treating its odd `CREATE_COIN` as a lineage
+  child; a non-singleton puzzle fails closed as `Malformed` (#1259)
+
 ## [0.4.1] - 2026-07-20
 
 ### Bug Fixes
