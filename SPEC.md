@@ -562,7 +562,12 @@ hash) or a SINGLETON TOP-LAYER v1.1 puzzle (matched by its uncurried mod hash); 
 merely happens to emit an odd `CREATE_COIN` is NOT a singleton recreation and fails closed as
 `Malformed`. Because the singleton top layer morphs its recreation output into the singleton wrapper
 by construction, asserting the parent is genuine singleton shape is what guarantees the selected child
-is singleton-shaped. The `CREATE_COIN` amount is decoded fail-closed: an amount atom wider than 8
+is singleton-shaped. **Identity binding (beyond shape).** Shape alone proves a hop is *a* singleton,
+not *this* one -- so every TOP-LAYER hop additionally binds its curried `singleton_struct.launcher_id`
+(recovered by parsing the top layer's `SingletonArgs`) to the walk's `launcher_id`: a mismatch means
+the hop belongs to a DIFFERENT singleton and fails closed as `Malformed`, so a shape-valid hop from a
+foreign singleton cannot be spliced into this lineage. The launcher hop itself needs no such check --
+its coin id IS the `launcher_id`, already bound by the coin-id binding below. The `CREATE_COIN` amount is decoded fail-closed: an amount atom wider than 8
 bytes (a value that cannot fit `u64`) is rejected as `Malformed` rather than silently wrapped, so an
 overflowing amount can never be misread as a small odd value. Additionally, each hop binds the fetched
 spend to the requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to
@@ -611,7 +616,15 @@ equality, ORDER-INSENSITIVELY: the list reads (`coin_records_by_puzzle_hash`, `c
 return a SET of matching coins with no promised ordering, so two honest sources returning the same
 records in a different order AGREE (compared by canonical coin-id order) rather than spuriously
 disagreeing; a genuinely different record SET still fails closed (the security property is preserved,
-only the false negative on ordering is removed). For `resolve_singleton_lineage`, cross-source
+only the false negative on ordering is removed). The canonical order computes each record's coin id
+ONCE into the sort key (O(n) hashes, not the O(n log n) a per-comparison `coin_id()` would cost).
+**Bounded untrusted input.** Before an untrusted quorum answer is canonicalized or compared, its
+record count is bounded: a list answer exceeding `MAX_QUORUM_RECORDS` (100,000 -- far above any
+legitimate puzzle-hash/parent fan-out) is DROPPED before any canonicalization, capping the CPU/memory
+a hostile source can force during a quorum. The oversized member simply loses its vote (exactly as a
+non-responding member would) -- it does NOT abort the whole read, so a single hostile provider cannot
+deny an otherwise-valid honest quorum. When no honest quorum can form (e.g. every source floods),
+custody still fails closed with `NoProvider`. For `resolve_singleton_lineage`, cross-source
 agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
 authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
 all-errors fails closed.

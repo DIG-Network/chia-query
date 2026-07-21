@@ -114,7 +114,7 @@ impl ChainSource for ChiaQueryProvider {
                         }
                     }
                 },
-                singleton_child_from_spend,
+                move |spend| singleton_child_from_spend(spend, launcher_id),
             )
             .await
         };
