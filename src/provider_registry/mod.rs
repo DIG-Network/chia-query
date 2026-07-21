@@ -34,5 +34,6 @@ mod registry;
 pub use dig_chainsource_interface as interface;
 
 pub use chia_query_provider::ChiaQueryProvider;
+pub use coinset_source::{CoinsetChainSource, COINSET_URL_ENV, DEFAULT_COINSET_URL};
 pub use providers::{CoinsetProvider, CustomProvider, DigPeersProvider, LocalNodeProvider};
 pub use registry::{DiscoveryView, ProviderRegistry, TrustLevel, TrustedView};
