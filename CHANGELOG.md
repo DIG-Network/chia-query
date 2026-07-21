@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.5.0] - 2026-07-20
+## [0.5.0] - 2026-07-21
 
 ### Features
-- **provider:** Lightweight no-handshake coinset `ChainSource` (`CoinsetProvider::from_url` / `from_env`) for cheap coinset HTTP point-reads without a Chia-peer handshake or certs (#1354)
+- **provider:** Lightweight no-handshake coinset ChainSource (CoinsetProvider::from_url) (#11)
 
 ## [0.4.4] - 2026-07-21
 
