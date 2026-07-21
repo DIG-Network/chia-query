@@ -4,17 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.4.4] - 2026-07-20
+## [0.4.4] - 2026-07-21
 
 ### Bug Fixes
-- **coinset:** Drop the volatile `blockchain_state.peak` subtree from the drift
-  snapshot and lock the tolerated peak type-drift with regression tests. The peak
-  is the chain tip, so its transaction-only fields (`fees`, `timestamp`,
-  `prev_transaction_block_hash`, `reward_claims_incorporated`) flip between null
-  and int/string/array every block, causing false-positive drift alerts. The
-  `BlockRecord` decoder already tolerates both shapes (no type change); the
-  BlockRecord shape stays watched via the stable `get_block_record_by_height`
-  probe. (#1359)
+- **coinset:** Refresh peak snapshot for tolerated coinset drift (#12)
 
 ## [0.4.3] - 2026-07-21
 
