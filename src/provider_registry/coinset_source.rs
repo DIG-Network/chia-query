@@ -66,8 +66,11 @@ const COINSET_PROVIDER_PRIORITY: i32 = 30;
 
 /// The upper bound on coin records the source accepts from a single list read. A misbehaving or
 /// hostile coinset endpoint could answer a puzzle-hash/parent query with an unbounded list; capping
-/// it fails closed ([`ChainSourceError::Malformed`]) rather than letting one response balloon memory
-/// or downstream work (the bounded-untrusted-input discipline shared with the registry quorum cap).
+/// it fails closed ([`ChainSourceError::Malformed`]) rather than letting the record count drive
+/// unbounded DOWNSTREAM work. This record cap is complementary to — not a substitute for — the
+/// transport-level byte cap (`MAX_RESPONSE_BYTES` in [`crate::coinset::transport`]), which bounds the
+/// RECEIVE/PARSE peak by rejecting an over-large body before it is fully buffered and deserialized;
+/// this cap then bounds the work done on the records that survive that parse.
 const MAX_COIN_RECORDS: usize = 100_000;
 
 /// A synchronous, no-handshake [`ChainSource`] served entirely by coinset.org HTTP.

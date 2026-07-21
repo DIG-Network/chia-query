@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -62,7 +62,9 @@ clvmr = { version = "0.14", optional = true }
 chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
-reqwest = { version = "0.12", features = ["json"], optional = true }
+# `stream` (native-only) enables `bytes_stream()` for the transport-level response body cap.
+# reqwest is a native-only optional dep, so this feature never reaches the wasm `coinset` build.
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 rand = { version = "0.8", optional = true }
 futures-util = { version = "0.3", optional = true }
 
