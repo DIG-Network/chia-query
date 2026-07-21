@@ -9,6 +9,11 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Features
 - **provider:** Lightweight no-handshake coinset `ChainSource` (`CoinsetProvider::from_url` / `from_env`) for cheap coinset HTTP point-reads without a Chia-peer handshake or certs (#1354)
 
+## [0.4.4] - 2026-07-21
+
+### Bug Fixes
+- **coinset:** Refresh peak snapshot for tolerated coinset drift (#12)
+
 ## [0.4.3] - 2026-07-21
 
 ### Bug Fixes

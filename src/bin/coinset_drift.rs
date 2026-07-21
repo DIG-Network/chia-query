@@ -107,10 +107,63 @@ async fn collect_shapes() -> Result<Value, Box<dyn std::error::Error>> {
     let mut shapes = Map::new();
     for probe in probes() {
         let response = client.post_raw(probe.endpoint, &probe.body).await?;
-        shapes.insert(
-            probe.name.to_string(),
-            chia_query::drift::shape_of(&response),
-        );
+        let mut shape = chia_query::drift::shape_of(&response);
+        if probe.name == "get_blockchain_state" {
+            drop_volatile_peak(&mut shape);
+        }
+        shapes.insert(probe.name.to_string(), shape);
     }
     Ok(Value::Object(shapes))
+}
+
+/// Remove the `blockchain_state.peak` subtree from a `get_blockchain_state`
+/// shape.
+///
+/// `peak` is the chain tip, and roughly half of Chia blocks are non-transaction
+/// blocks. On a non-transaction-block peak, `fees`, `timestamp`,
+/// `prev_transaction_block_hash`, and `reward_claims_incorporated` are `null`;
+/// on a transaction-block peak they are an integer, integer, string, and array.
+/// The shape therefore flips with every block, so snapshotting `peak` produces
+/// unavoidable false-positive drift. The BlockRecord shape is watched stably by
+/// the dedicated `get_block_record_by_height` probe (height 1 is a permanent
+/// transaction block with every field populated), so dropping `peak` here loses
+/// no coverage while eliminating the flapping.
+fn drop_volatile_peak(shape: &mut Value) {
+    if let Some(state) = shape
+        .get_mut("blockchain_state")
+        .and_then(Value::as_object_mut)
+    {
+        state.remove("peak");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn drop_volatile_peak_removes_only_the_peak_subtree() {
+        let mut shape = json!({
+            "blockchain_state": {
+                "difficulty": "integer",
+                "peak": { "fees": "null", "height": "integer" },
+                "sync": { "synced": "boolean" }
+            },
+            "success": "boolean"
+        });
+        drop_volatile_peak(&mut shape);
+        let state = &shape["blockchain_state"];
+        assert!(state.get("peak").is_none(), "peak must be removed");
+        assert!(state.get("difficulty").is_some(), "siblings preserved");
+        assert!(state.get("sync").is_some(), "siblings preserved");
+    }
+
+    #[test]
+    fn drop_volatile_peak_is_a_noop_without_peak() {
+        let mut shape = json!({ "blockchain_state": { "difficulty": "integer" } });
+        let before = shape.clone();
+        drop_volatile_peak(&mut shape);
+        assert_eq!(shape, before);
+    }
 }
