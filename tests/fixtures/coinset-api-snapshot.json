@@ -53,37 +53,6 @@
       },
       "mempool_size": "integer",
       "node_id": "string",
-      "peak": {
-        "challenge_block_info_hash": "string",
-        "challenge_vdf_output": {
-          "data": "string"
-        },
-        "deficit": "integer",
-        "farmer_puzzle_hash": "string",
-        "fees": "null",
-        "finished_challenge_slot_hashes": "null",
-        "finished_infused_challenge_slot_hashes": "null",
-        "finished_reward_slot_hashes": "null",
-        "header_hash": "string",
-        "height": "integer",
-        "infused_challenge_vdf_output": {
-          "data": "string"
-        },
-        "overflow": "boolean",
-        "pool_puzzle_hash": "string",
-        "prev_hash": "string",
-        "prev_transaction_block_hash": "null",
-        "prev_transaction_block_height": "integer",
-        "required_iters": "integer",
-        "reward_claims_incorporated": "null",
-        "reward_infusion_new_challenge": "string",
-        "signage_point_index": "integer",
-        "sub_epoch_summary_included": "null",
-        "sub_slot_iters": "integer",
-        "timestamp": "null",
-        "total_iters": "integer",
-        "weight": "integer"
-      },
       "space": "integer",
       "sub_slot_iters": "integer",
       "sync": {

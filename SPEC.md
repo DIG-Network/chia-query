@@ -461,6 +461,16 @@ breaking changes (the automated backstop to the chia-query freshness preflight).
   `get_network_info`, `get_block_record_by_height`, and an error-envelope probe
   (`get_coin_record_by_name` on an absent coin — guards the
   `error`/`structuredError`/`traceback` shape).
+- **Volatile-peak exclusion.** The `blockchain_state.peak` subtree is dropped
+  from the `get_blockchain_state` shape before snapshotting/diffing: the peak is
+  the chain tip, and its `fees`/`timestamp`/`prev_transaction_block_hash`/
+  `reward_claims_incorporated` fields flip between `null` (non-transaction block)
+  and integer/string/array (transaction block) every block, which would produce
+  unavoidable false-positive drift. The BlockRecord shape is watched stably by
+  the `get_block_record_by_height` probe (height 1 is a permanent transaction
+  block with every field populated). The typed `BlockRecord` decoder tolerates
+  both peak variants (transaction-block ints/array + non-transaction-block
+  nulls), asserted by `types::response` unit tests.
 - **Binary.** `coinset_drift check` (native, `required-features = ["native"]`)
   probes live coinset, diffs against the snapshot, and exits non-zero on drift;
   `coinset_drift update` regenerates the snapshot.
