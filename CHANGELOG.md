@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.5.2] - 2026-07-21
 
 ### Refactor
-- **provider-registry:** Classify over-cap record counts as `ChainSourceError::TooManyRecords` instead of `Malformed` (adopts dig-chainsource-interface 0.2.0) (#1352)
+- **provider-registry:** Adopt ChainSourceError::TooManyRecords for over-cap record counts (#14)
 
 ## [0.5.1] - 2026-07-21
 
