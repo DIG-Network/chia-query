@@ -507,6 +507,47 @@ never unwinds across the trait boundary. **The facade MUST run on a multi-thread
 consumer that is itself async MUST wrap each call in `tokio::task::spawn_blocking` so the blocking
 read never runs on an async worker thread.
 
+### The lightweight coinset source (`CoinsetProvider::from_url`)
+
+`CoinsetChainSource` is a second `ChainSource` implementation that serves point-reads DIRECTLY over
+the coinset.org HTTP tier, with NO Chia-peer handshake, NO TLS certificate, and NO sync -- for
+consumers that need cheap chain point-reads without paying for the full `ChiaQueryProvider` router.
+It owns its own multi-thread tokio runtime and bridges each sync read to the async `CoinsetClient`
+via the same `run_blocking` facade (the SPEC 7 runtime rules above apply identically).
+
+Construction (native, `feature = "native"`):
+
+- `CoinsetProvider::from_url(coinset_url)` -- builds a registry-ready provider against an explicit
+  base URL.
+- `CoinsetProvider::from_env()` / `CoinsetChainSource::from_env()` -- reads `$DIG_COINSET_URL`
+  (`COINSET_URL_ENV`) when set and non-empty, else `DEFAULT_COINSET_URL` (`https://api.coinset.org`).
+  This is the CHAIN-read tier's canonical `$DIG_COINSET_URL` / `--coinset-url` override -- distinct
+  from the content-read node ladder.
+- `CoinsetChainSource::with_client(client)` -- from an already-built `CoinsetClient` (used with a
+  mock transport in tests).
+
+It registers as `ProviderKind::PublicOracle` with `trustless: false` at try-order priority `30`
+(coinset is a single public oracle that can lie; the registry's operator-assigned trust + quorum
+gates custody, never this source alone). It implements the L00 `ChainSource` trait, so a consumer
+hands it to a `ProviderRegistry` by dependency injection like any other source.
+
+Method support -- point-reads served, lineage refused (fail-closed):
+
+| Interface method | Coinset endpoint | Notes |
+|---|---|---|
+| `coin_record(id)` | `get_coin_record_by_name_opt` | provable absence -> `Ok(None)`; failure -> `Err` |
+| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` | list bounded by `MAX_COIN_RECORDS` (100_000) -> oversized is `Malformed` |
+| `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], .., true)` | list bounded by `MAX_COIN_RECORDS` |
+| `coin_spend(id)` | `get_puzzle_and_solution_opt` | unspent/unknown -> `Ok(None)`; failure -> `Err` |
+| `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | composed point-reads |
+| `peak_height()` | `get_blockchain_state` (`.peak.height`) | no peak -> `Ok(None)`; failure -> `Err` |
+| `block_timestamp(h)` | `get_block_record_by_height_opt` | no block / no timestamp -> `Ok(None)` |
+| `resolve_singleton_lineage(launcher)` | -- | `Unsupported` -- a genuine launcher->tip walk needs the CLVM singleton-shape machinery, not a lightweight point-read; use `ChiaQueryProvider` or walk `parent_spend`. Fails closed as `Err`, NEVER a false `Ok(None)`. |
+
+The same fail-closed `Ok(None)`-vs-`Err` contract and `ChiaQueryError -> ChainSourceError` mapping
+below apply; a misbehaving/hostile coinset endpoint answering an unbounded list read fails closed
+(`Malformed`) rather than causing unbounded work.
+
 ### Fail-closed method mapping (SPEC 3, the money-critical crux)
 
 Every read distinguishes `Ok(None)`/empty-`Vec` (a source that reliably answered "no such thing" --
