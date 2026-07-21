@@ -219,3 +219,91 @@ impl Coin {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `get_blockchain_state` payload whose `peak` uses the CURRENT (post-2026-07)
+    /// api.coinset.org shape: on a transaction-block peak, `fees` + `timestamp` are
+    /// integers, `prev_transaction_block_hash` is a hex string, and
+    /// `reward_claims_incorporated` is an ARRAY of coins. Earlier the drift monitor
+    /// snapshotted these as `null`/scalar on a non-transaction-block peak.
+    const PEAK_NEW_SHAPE: &str = r#"{
+        "peak": {
+            "header_hash": "0xabc",
+            "height": 9035425,
+            "weight": 123,
+            "prev_hash": "0xdef",
+            "total_iters": 456,
+            "signage_point_index": 7,
+            "farmer_puzzle_hash": "0xfarmer",
+            "pool_puzzle_hash": "0xpool",
+            "fees": 3000000000,
+            "timestamp": 1770000000,
+            "prev_transaction_block_hash": "0xprevtx",
+            "reward_claims_incorporated": [
+                { "parent_coin_info": "0x11", "puzzle_hash": "0x22", "amount": 1750000000000 },
+                { "parent_coin_info": "0x33", "puzzle_hash": "0x44", "amount": 250000000000 }
+            ]
+        }
+    }"#;
+
+    /// The OLD shape: a non-transaction-block peak where the same fields are `null`.
+    const PEAK_OLD_SHAPE: &str = r#"{
+        "peak": {
+            "header_hash": "0xabc",
+            "height": 9035424,
+            "fees": null,
+            "timestamp": null,
+            "prev_transaction_block_hash": null,
+            "reward_claims_incorporated": null
+        }
+    }"#;
+
+    /// The current live drift MUST remain tolerated: the new peak shape decodes with
+    /// no error, the consumed `height` field reads correctly, the typed `Option`
+    /// fields absorb the int values, and the flattened `extra` catch-all captures the
+    /// array + string fields. This locks the drift verdict so a future strict-field
+    /// regression is caught by CI.
+    #[test]
+    fn decodes_new_peak_shape_into_tolerant_fields() {
+        let state: BlockchainState =
+            serde_json::from_str(PEAK_NEW_SHAPE).expect("new peak shape must deserialize");
+        let peak = state.peak.expect("peak present");
+
+        // Consumed field stays exact.
+        assert_eq!(peak.height, 9035425);
+
+        // Newly-integer fields land in the typed Option fields.
+        assert_eq!(peak.fees, Some(3_000_000_000));
+        assert_eq!(peak.timestamp, Some(1_770_000_000));
+
+        // Newly-string / newly-array fields land untyped in `extra`.
+        assert_eq!(peak.extra["prev_transaction_block_hash"], "0xprevtx");
+        assert!(peak.extra["reward_claims_incorporated"].is_array());
+        assert_eq!(
+            peak.extra["reward_claims_incorporated"][0]["amount"],
+            1_750_000_000_000u64
+        );
+    }
+
+    /// The OLD (all-null) peak shape MUST still decode identically -- readers accept
+    /// every prior shape, so the refresh does not regress older responses.
+    #[test]
+    fn still_decodes_old_null_peak_shape() {
+        let state: BlockchainState =
+            serde_json::from_str(PEAK_OLD_SHAPE).expect("old peak shape must deserialize");
+        let peak = state.peak.expect("peak present");
+
+        assert_eq!(peak.height, 9035424);
+        assert_eq!(peak.fees, None);
+        assert_eq!(peak.timestamp, None);
+        assert!(peak.extra["prev_transaction_block_hash"].is_null());
+        assert!(peak.extra["reward_claims_incorporated"].is_null());
+    }
+}
