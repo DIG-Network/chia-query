@@ -23,6 +23,7 @@
 
 mod bridge;
 mod chia_query_provider;
+mod coinset_source;
 mod convert;
 mod lineage_walk;
 mod providers;
