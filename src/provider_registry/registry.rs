@@ -186,14 +186,25 @@ pub struct DiscoveryView<'a> {
 
 impl DiscoveryView<'_> {
     /// Answers `query` from the first provider that responds — NO trust or quorum guarantee.
+    ///
+    /// Even without a quorum, a discovery answer is still UNTRUSTED input, so each candidate is
+    /// bounded ([`QuorumComparable::validate_bound`]) before it is accepted — mirroring the quorum
+    /// path (#1341), which drops an over-cap member rather than aborting. An oversized answer here is
+    /// likewise treated as a non-answer: it records the bound violation in `last_error` and falls
+    /// through to the next provider, so one hostile source returning a multi-GB flood can neither be
+    /// returned to the caller nor deny an honest fallback provider its turn.
     fn discovery_read<T, Q>(&self, query: Q) -> Result<T, ChainSourceError>
     where
+        T: QuorumComparable,
         Q: Fn(&DynProvider) -> Result<T, ChainSourceError>,
     {
         let mut last_error = ChainSourceError::NoProvider;
         for reg in self.registry.by_priority() {
             match query(&*reg.provider) {
-                Ok(value) => return Ok(value),
+                Ok(value) => match value.validate_bound() {
+                    Ok(()) => return Ok(value),
+                    Err(error) => last_error = error,
+                },
                 Err(error) => last_error = error,
             }
         }
@@ -865,6 +876,54 @@ mod tests {
             registry.trusted().coin_record(id),
             Err(ChainSourceError::NoProvider)
         );
+    }
+
+    /// #1351: a discovery answer is untrusted too — an over-cap flood from the only provider must be
+    /// rejected (`Malformed`), never handed back to the caller unbounded.
+    #[test]
+    fn discovery_rejects_oversized_untrusted_response() {
+        let ph = Bytes32::new([0x22; 32]);
+        let flood = oversized_flood(ph);
+
+        let registry = ProviderRegistry::new().register(
+            Box::new(CoinsetProvider::new("coinset", 10, list_source(flood))),
+            None,
+            "coinset.org",
+        );
+
+        assert!(
+            matches!(
+                registry.any().coin_records_by_puzzle_hash(ph, false),
+                Err(ChainSourceError::Malformed(_))
+            ),
+            "an over-cap discovery answer must be rejected as Malformed"
+        );
+    }
+
+    /// #1351: a within-cap discovery answer still passes through unchanged (the bound only rejects
+    /// implausibly large responses).
+    #[test]
+    fn discovery_passes_within_cap_response() {
+        let ph = Bytes32::new([0x22; 32]);
+        let a = record_for(coin_id(0x0A));
+        let b = record_for(coin_id(0x0B));
+
+        let registry = ProviderRegistry::new().register(
+            Box::new(CoinsetProvider::new(
+                "coinset",
+                10,
+                list_source(vec![a.clone(), b.clone()]),
+            )),
+            None,
+            "coinset.org",
+        );
+
+        let records = registry
+            .any()
+            .coin_records_by_puzzle_hash(ph, false)
+            .expect("a within-cap discovery answer must pass through");
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&a) && records.contains(&b));
     }
 
     #[test]

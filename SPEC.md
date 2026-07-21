@@ -658,7 +658,12 @@ Providers are the four kind wrappers `CoinsetProvider` (PublicOracle), `LocalNod
   `allow_public_quorum_custody(true)`, which enables a quorum requiring **2 independent groups** to
   agree (logged loudly as reduced assurance). Otherwise custody fails closed with `NoProvider`.
 - **`registry.any()` -- the DISCOVERY view.** A single-provider, low-trust read for NON-custody use
-  (returns the first provider that responds). Its result MUST NOT be used to route funds.
+  (returns the first provider that responds WITHIN THE UNTRUSTED-INPUT BOUND below). Its result MUST NOT
+  be used to route funds. **Bounded untrusted input (discovery).** Before a discovery answer is returned,
+  its record count is bounded by the SAME cap as the quorum path (`QuorumComparable::validate_bound`,
+  `MAX_QUORUM_RECORDS` = 100,000): an answer exceeding the cap is DROPPED and the read continues to the
+  next provider (exactly as a non-responding provider would), so a hostile source cannot force unbounded
+  CPU/memory on the non-custody path. When every provider floods, the read fails closed with `Malformed`.
 
 **Independence groups.** Each provider registers with an `independence_group` id; a quorum counts
 DISTINCT groups, so two providers in the same group (e.g. the same coinset.org listed twice) count as
@@ -669,6 +674,13 @@ records in a different order AGREE (compared by canonical coin-id order) rather 
 disagreeing; a genuinely different record SET still fails closed (the security property is preserved,
 only the false negative on ordering is removed). The canonical order computes each record's coin id
 ONCE into the sort key (O(n) hashes, not the O(n log n) a per-comparison `coin_id()` would cost).
+**Transport response-body cap.** The native coinset HTTP transport bounds every response at the RECEIVE
+layer: a body whose `Content-Length` exceeds `MAX_RESPONSE_BYTES` (256 MiB) is rejected before download,
+and a body with absent/under-declared length is streamed with a running-size check that aborts once the
+accumulated bytes exceed the cap -- so an oversized or chunked hostile body is rejected BEFORE
+deserialization. This bounds the receive/parse peak memory (complementary to the `MAX_COIN_RECORDS` /
+`MAX_QUORUM_RECORDS` count caps, which bound downstream work). An over-cap body fails closed as a
+transport error.
 **Bounded untrusted input.** Before an untrusted quorum answer is canonicalized or compared, its
 record count is bounded: a list answer exceeding `MAX_QUORUM_RECORDS` (100,000 -- far above any
 legitimate puzzle-hash/parent fan-out) is DROPPED before any canonicalization, capping the CPU/memory
