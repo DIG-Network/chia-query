@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -57,7 +57,7 @@ chia = { version = "0.26", optional = true }
 # `chia_protocol` types the interface exposes (cargo unifies it with `chia`'s
 # re-export at the same 0.26.x).
 chia-protocol = { version = "0.26", optional = true }
-dig-chainsource-interface = { version = "0.1", optional = true }
+dig-chainsource-interface = { version = "0.2", optional = true }
 clvmr = { version = "0.14", optional = true }
 chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -79,7 +79,7 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 [dev-dependencies]
 # Enables the in-memory `MockChainSource` for the provider-registry trust-model
 # tests. This merges the `testing` feature onto the native dependency above.
-dig-chainsource-interface = { version = "0.1", features = ["testing"] }
+dig-chainsource-interface = { version = "0.2", features = ["testing"] }
 # The canonical singleton launcher/top-layer program bytes, so the lineage-walk
 # tests build GENUINE singleton-family spends to exercise the singleton-shape gate
 # (pinned to the same 0.20.x the `chia` 0.26 stack resolves).

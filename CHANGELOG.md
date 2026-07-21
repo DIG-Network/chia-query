@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.2] - 2026-07-21
+
+### Refactor
+- **provider-registry:** Classify over-cap record counts as `ChainSourceError::TooManyRecords` instead of `Malformed` (adopts dig-chainsource-interface 0.2.0) (#1352)
+
 ## [0.5.1] - 2026-07-21
 
 ### Bug Fixes

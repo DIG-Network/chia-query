@@ -45,7 +45,7 @@ const PUBLIC_QUORUM_THRESHOLD: usize = 2;
 /// answers with an attacker-influenceable, unbounded `Vec`. Canonicalizing + comparing it costs CPU
 /// and memory proportional to its length, so a hostile source could return a huge list to exhaust
 /// resources during a quorum. This ceiling bounds that work and fails closed
-/// ([`ChainSourceError::Malformed`]) past it — mirroring the bounded-input discipline of #1323. It is
+/// ([`ChainSourceError::TooManyRecords`]) past it — mirroring the bounded-input discipline of #1323. It is
 /// generous: no legitimate puzzle hash or parent coin has anywhere near this many children, so a
 /// genuine answer is never rejected, while an adversarial flood is capped.
 const MAX_QUORUM_RECORDS: usize = 100_000;
@@ -259,10 +259,10 @@ impl QuorumComparable for Vec<CoinRecord> {
 
     fn validate_bound(&self) -> Result<(), ChainSourceError> {
         if self.len() > MAX_QUORUM_RECORDS {
-            return Err(ChainSourceError::Malformed(format!(
-                "untrusted source returned {} coin records, exceeding the {MAX_QUORUM_RECORDS} cap",
-                self.len()
-            )));
+            return Err(ChainSourceError::TooManyRecords {
+                count: self.len(),
+                limit: MAX_QUORUM_RECORDS,
+            });
         }
         Ok(())
     }
@@ -879,7 +879,7 @@ mod tests {
     }
 
     /// #1351: a discovery answer is untrusted too — an over-cap flood from the only provider must be
-    /// rejected (`Malformed`), never handed back to the caller unbounded.
+    /// rejected (`TooManyRecords`), never handed back to the caller unbounded.
     #[test]
     fn discovery_rejects_oversized_untrusted_response() {
         let ph = Bytes32::new([0x22; 32]);
@@ -894,9 +894,10 @@ mod tests {
         assert!(
             matches!(
                 registry.any().coin_records_by_puzzle_hash(ph, false),
-                Err(ChainSourceError::Malformed(_))
+                Err(ChainSourceError::TooManyRecords { count, limit })
+                    if count == MAX_QUORUM_RECORDS + 1 && limit == MAX_QUORUM_RECORDS
             ),
-            "an over-cap discovery answer must be rejected as Malformed"
+            "an over-cap discovery answer must be rejected as TooManyRecords"
         );
     }
 

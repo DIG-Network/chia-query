@@ -66,7 +66,7 @@ const COINSET_PROVIDER_PRIORITY: i32 = 30;
 
 /// The upper bound on coin records the source accepts from a single list read. A misbehaving or
 /// hostile coinset endpoint could answer a puzzle-hash/parent query with an unbounded list; capping
-/// it fails closed ([`ChainSourceError::Malformed`]) rather than letting the record count drive
+/// it fails closed ([`ChainSourceError::TooManyRecords`]) rather than letting the record count drive
 /// unbounded DOWNSTREAM work. This record cap is complementary to — not a substitute for — the
 /// transport-level byte cap (`MAX_RESPONSE_BYTES` in [`crate::coinset::transport`]), which bounds the
 /// RECEIVE/PARSE peak by rejecting an over-large body before it is fully buffered and deserialized;
@@ -210,15 +210,16 @@ impl<T: HttpTransport> ChainSource for CoinsetChainSource<T> {
 }
 
 /// Converts a coinset list response into interface records, failing closed if the list exceeds
-/// [`MAX_COIN_RECORDS`] (hostile-input bound) or if any record is malformed.
+/// [`MAX_COIN_RECORDS`] (hostile-input bound, reported as [`ChainSourceError::TooManyRecords`]) or if
+/// any record is malformed.
 fn convert_records(
     records: Vec<crate::types::CoinRecord>,
 ) -> Result<Vec<CoinRecord>, ChainSourceError> {
     if records.len() > MAX_COIN_RECORDS {
-        return Err(ChainSourceError::Malformed(format!(
-            "coinset returned {} coin records, exceeding the {MAX_COIN_RECORDS} cap",
-            records.len()
-        )));
+        return Err(ChainSourceError::TooManyRecords {
+            count: records.len(),
+            limit: MAX_COIN_RECORDS,
+        });
     }
     records.iter().map(coin_record_from_chq).collect()
 }
@@ -513,8 +514,12 @@ mod tests {
             .coin_records_by_puzzle_hash(Bytes32::new([0x22; 32]), true)
             .unwrap_err();
         assert!(
-            matches!(err, ChainSourceError::Malformed(_)),
-            "an unbounded coinset list MUST fail closed, not be returned"
+            matches!(
+                err,
+                ChainSourceError::TooManyRecords { count, limit }
+                    if count == MAX_COIN_RECORDS + 1 && limit == MAX_COIN_RECORDS
+            ),
+            "an unbounded coinset list MUST fail closed as TooManyRecords, not be returned"
         );
     }
 }
