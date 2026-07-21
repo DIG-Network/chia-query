@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "chia",
  "chia-protocol",
@@ -895,9 +895,9 @@ dependencies = [
 
 [[package]]
 name = "dig-chainsource-interface"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01084c5fb2b4a14db1569da4fef039de14e3db8c5588ded3504945d7333a133c"
+checksum = "bae5c5f343e98e9c2b1242d14ed9496db1bd42872509a8a29bb061ca105c4249"
 dependencies = [
  "chia-protocol",
  "thiserror 2.0.18",

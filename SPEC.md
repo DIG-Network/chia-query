@@ -536,7 +536,7 @@ Method support -- point-reads served, lineage refused (fail-closed):
 | Interface method | Coinset endpoint | Notes |
 |---|---|---|
 | `coin_record(id)` | `get_coin_record_by_name_opt` | provable absence -> `Ok(None)`; failure -> `Err` |
-| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` | list bounded by `MAX_COIN_RECORDS` (100_000) -> oversized is `Malformed` |
+| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` | list bounded by `MAX_COIN_RECORDS` (100_000) -> oversized is `TooManyRecords` |
 | `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], .., true)` | list bounded by `MAX_COIN_RECORDS` |
 | `coin_spend(id)` | `get_puzzle_and_solution_opt` | unspent/unknown -> `Ok(None)`; failure -> `Err` |
 | `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | composed point-reads |
@@ -546,7 +546,7 @@ Method support -- point-reads served, lineage refused (fail-closed):
 
 The same fail-closed `Ok(None)`-vs-`Err` contract and `ChiaQueryError -> ChainSourceError` mapping
 below apply; a misbehaving/hostile coinset endpoint answering an unbounded list read fails closed
-(`Malformed`) rather than causing unbounded work.
+(`TooManyRecords`) rather than causing unbounded work.
 
 ### Fail-closed method mapping (SPEC 3, the money-critical crux)
 
@@ -663,7 +663,7 @@ Providers are the four kind wrappers `CoinsetProvider` (PublicOracle), `LocalNod
   its record count is bounded by the SAME cap as the quorum path (`QuorumComparable::validate_bound`,
   `MAX_QUORUM_RECORDS` = 100,000): an answer exceeding the cap is DROPPED and the read continues to the
   next provider (exactly as a non-responding provider would), so a hostile source cannot force unbounded
-  CPU/memory on the non-custody path. When every provider floods, the read fails closed with `Malformed`.
+  CPU/memory on the non-custody path. When every provider floods, the read fails closed with `TooManyRecords`.
 
 **Independence groups.** Each provider registers with an `independence_group` id; a quorum counts
 DISTINCT groups, so two providers in the same group (e.g. the same coinset.org listed twice) count as
