@@ -4,11 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.4.3] - 2026-07-20
+## [0.4.3] - 2026-07-21
 
 ### Bug Fixes
-- **lineage:** Bind each hop's singleton `launcher_id` to the walk identity (#1338)
-- **provider-registry:** Memoize `coin_id` in canonical order + bound untrusted quorum record count (#1341)
+- **provider-registry:** Launcher_id identity binding + quorum perf/bound hardening (#10)
 
 ## [0.4.2] - 2026-07-20
 
