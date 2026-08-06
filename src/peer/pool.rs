@@ -204,3 +204,42 @@ impl PeerPool {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::connect::create_generated_tls;
+
+    /// `max_peers: 0` attempts no connection at all, so the pool is deterministically
+    /// empty offline — an exact, network-free fixture for the empty-pool branch.
+    async fn pool_with_no_connection_attempts(
+        requirement: PeerRequirement,
+    ) -> Result<PeerPool, ChiaQueryError> {
+        PeerPool::new(
+            NetworkType::Mainnet,
+            create_generated_tls().expect("generate a TLS identity"),
+            0,
+            requirement,
+            Duration::from_millis(1),
+        )
+        .await
+    }
+
+    /// The control: an empty pool is still fatal when nothing can serve in its place.
+    #[tokio::test]
+    async fn empty_pool_is_fatal_when_peers_are_required() {
+        assert!(matches!(
+            pool_with_no_connection_attempts(PeerRequirement::Required).await,
+            Err(ChiaQueryError::PeerDiscoveryFailed)
+        ));
+    }
+
+    /// The fix: with a fallback able to serve, an empty pool must not deny the client.
+    #[tokio::test]
+    async fn empty_pool_is_tolerated_when_peers_are_optional() {
+        let pool = pool_with_no_connection_attempts(PeerRequirement::Optional)
+            .await
+            .expect("an optional peer pool must construct with zero peers");
+        assert!(!pool.has_peers().await);
+    }
+}

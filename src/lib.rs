@@ -66,7 +66,6 @@ mod native_client {
                 Self::Testnet11 => "testnet11",
             }
         }
-
     }
 
     // ---------------------------------------------------------------------------
@@ -89,7 +88,10 @@ mod native_client {
         Generated,
 
         /// Load an existing certificate/key pair, e.g. a real Chia node's wallet cert.
-        Files { cert_path: PathBuf, key_path: PathBuf },
+        Files {
+            cert_path: PathBuf,
+            key_path: PathBuf,
+        },
     }
 
     pub struct ChiaQueryConfig {

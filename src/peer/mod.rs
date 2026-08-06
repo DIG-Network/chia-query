@@ -19,8 +19,8 @@ use tokio_tungstenite::Connector;
 
 use crate::types::*;
 use crate::NetworkType;
-pub use pool::PeerRequirement;
 use pool::PeerPool;
+pub use pool::PeerRequirement;
 
 // ---------------------------------------------------------------------------
 // PeerBackend

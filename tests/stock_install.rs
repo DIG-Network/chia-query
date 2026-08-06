@@ -52,7 +52,10 @@ fn entries_under(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn default_config_generates_its_tls_identity() {
     assert!(
-        matches!(ChiaQueryConfig::default().tls_identity, TlsIdentity::Generated),
+        matches!(
+            ChiaQueryConfig::default().tls_identity,
+            TlsIdentity::Generated
+        ),
         "the default TLS identity must be generated, not read from the home directory"
     );
 }
@@ -73,6 +76,36 @@ fn generated_identity_writes_nothing_to_the_home_directory() {
         entries_under(&home),
         Vec::<PathBuf>::new(),
         "generating a TLS identity must not write to the home directory"
+    );
+}
+
+/// A GENERATED certificate is accepted by real mainnet full nodes.
+///
+/// This is the premise the whole fix rests on — that Chia peer TLS does not treat the
+/// client certificate as a credential. [`client_constructs_with_no_chia_installation`]
+/// cannot prove it, because with the coinset fallback enabled construction succeeds
+/// even when zero peers connect. Here the requirement is [`PeerRequirement::Required`],
+/// so the pool must genuinely complete a TLS handshake with a live node.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access"]
+async fn generated_identity_is_accepted_by_real_peers() {
+    empty_home("peers");
+
+    let tls = chia_query::peer::connect::create_generated_tls().expect("generate a TLS identity");
+    let peers = chia_query::peer::PeerBackend::new(
+        chia_query::NetworkType::Mainnet,
+        tls,
+        3,
+        chia_query::peer::PeerRequirement::Required,
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("a generated certificate must be accepted by mainnet full nodes");
+
+    assert!(
+        peers.has_peers().await,
+        "at least one mainnet peer must be connected with a generated certificate"
     );
 }
 
