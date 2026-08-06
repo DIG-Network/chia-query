@@ -26,6 +26,23 @@ struct PeerEntry {
 }
 
 // ---------------------------------------------------------------------------
+// PeerRequirement
+// ---------------------------------------------------------------------------
+
+/// Whether at least one peer must connect for the pool to be considered usable.
+///
+/// A client that can fall back to the coinset HTTP tier is still useful with zero
+/// peers, so failing construction on peer discovery would deny a keyless reader over a
+/// peer-tier problem it does not need (dig_ecosystem#2210).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRequirement {
+    /// Peer discovery failing is fatal.
+    Required,
+    /// An empty pool is acceptable; it refills in the background.
+    Optional,
+}
+
+// ---------------------------------------------------------------------------
 // PeerPool
 // ---------------------------------------------------------------------------
 
@@ -43,12 +60,14 @@ pub struct PeerPool {
 
 impl PeerPool {
     /// Spin up the pool by connecting to `max_peers` random full-node peers
-    /// concurrently.  At least one peer must succeed; otherwise we return
-    /// [`ChiaQueryError::PeerDiscoveryFailed`].
+    /// concurrently.  Under [`PeerRequirement::Required`] at least one peer must
+    /// succeed, otherwise we return [`ChiaQueryError::PeerDiscoveryFailed`]; under
+    /// [`PeerRequirement::Optional`] an empty pool is returned and refills later.
     pub async fn new(
         network: NetworkType,
         tls: Connector,
         max_peers: usize,
+        requirement: PeerRequirement,
         connect_timeout: Duration,
     ) -> Result<Self, ChiaQueryError> {
         let peak_height = Arc::new(AtomicU32::new(0));
@@ -78,7 +97,10 @@ impl PeerPool {
         }
 
         if initial.is_empty() {
-            return Err(ChiaQueryError::PeerDiscoveryFailed);
+            if requirement == PeerRequirement::Required {
+                return Err(ChiaQueryError::PeerDiscoveryFailed);
+            }
+            log::warn!("no peers connected; serving from the coinset fallback until one does");
         }
 
         let pool = Self {

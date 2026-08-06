@@ -368,6 +368,7 @@ dependencies = [
  "chia",
  "chia-protocol",
  "chia-puzzles",
+ "chia-ssl",
  "chia-wallet-sdk",
  "clvmr",
  "dig-chainsource-interface",
