@@ -27,15 +27,19 @@ let client = ChiaQuery::new(ChiaQueryConfig {
     max_peers: 3,
     coinset_base_url: "https://api.coinset.org".into(),
     coinset_fallback_enabled: true,
-    cert_path: "/path/to/wallet_node.crt".into(),
-    key_path: "/path/to/wallet_node.key".into(),
+    tls_identity: TlsIdentity::Files {
+        cert_path: "/path/to/wallet_node.crt".into(),
+        key_path: "/path/to/wallet_node.key".into(),
+    },
     peer_connect_timeout: Duration::from_secs(8),
     peer_request_timeout: Duration::from_secs(30),
     coinset_request_timeout: Duration::from_secs(30),
 }).await?;
 ```
 
-TLS certificates auto-generate if the files don't exist. Set `TRUSTED_FULLNODE` env var to an IP address to prioritize a specific peer. Localhost (`127.0.0.1`) is always tried before DNS discovery.
+No Chia installation is required: by default the peer TLS identity is generated in memory
+(`TlsIdentity::Generated`), because Chia full nodes accept any well-formed client certificate.
+Supply `TlsIdentity::Files` only to present an existing certificate. Set `TRUSTED_FULLNODE` env var to an IP address to prioritize a specific peer. Localhost (`127.0.0.1`) is always tried before DNS discovery.
 
 ## Types
 

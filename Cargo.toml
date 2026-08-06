@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -23,6 +23,7 @@ native = [
     "dep:chia-protocol",
     "dep:clvmr",
     "dep:chia-wallet-sdk",
+    "dep:chia-ssl",
     "dep:dig-chainsource-interface",
     "dep:tokio",
     "dep:tokio-tungstenite",
@@ -60,6 +61,10 @@ chia-protocol = { version = "0.26", optional = true }
 dig-chainsource-interface = { version = "0.2", optional = true }
 clvmr = { version = "0.14", optional = true }
 chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
+# Generates the peer TLS client identity in memory, so a query client never needs a
+# Chia installation on disk. Pinned to the 0.26.x chia-sdk-client 0.30 depends on, so
+# `ChiaCertificate` is the SAME type `create_native_tls_connector` accepts.
+chia-ssl = { version = "0.26", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 # `stream` (native-only) enables `bytes_stream()` for the transport-level response body cap.

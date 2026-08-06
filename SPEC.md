@@ -49,8 +49,7 @@ let client = ChiaQuery::new(ChiaQueryConfig {
     max_peers: 5,
     coinset_base_url: "https://api.coinset.org".to_string(),
     coinset_fallback_enabled: true,
-    cert_path: "~/.chia/mainnet/config/ssl/wallet/wallet_node.crt".into(),
-    key_path: "~/.chia/mainnet/config/ssl/wallet/wallet_node.key".into(),
+    tls_identity: TlsIdentity::Generated,
     peer_connect_timeout: Duration::from_secs(8),
     peer_request_timeout: Duration::from_secs(30),
     coinset_request_timeout: Duration::from_secs(30),
@@ -235,16 +234,28 @@ Default port: `58444`
 1. Resolve all introducer DNS names to socket addresses
 2. Shuffle the resolved addresses for randomness
 3. Attempt connections in batches of 10, with 8-second timeout per attempt
-4. Use `chia-wallet-sdk`'s `Peer::new()` with a TLS connector loaded from the Chia SSL cert/key files
+4. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
 5. Return the first successful connection
+
+If NO peer connects, construction fails with `PeerDiscoveryFailed` ONLY when
+`coinset_fallback_enabled` is `false`. With the fallback enabled the client MUST construct with an
+empty pool and serve from the coinset tier, refilling the pool in the background: the coinset tier
+is plain HTTP requiring neither a credential nor a peer, so a peer-tier failure MUST NOT deny it.
 
 #### TLS
 
-Uses the standard Chia wallet TLS certificates:
-- Mainnet: `~/.chia/mainnet/config/ssl/wallet/wallet_node.crt` and `wallet_node.key`
-- Testnet11: `~/.chia/testnet11/config/ssl/wallet/wallet_node.key` and `wallet_node.key`
+The Chia peer protocol does not treat the client certificate as a credential -- a full node accepts
+any well-formed certificate. The identity is therefore selected by `TlsIdentity`:
 
-Loaded via `chia-wallet-sdk`'s `load_ssl_cert()` and `create_native_tls_connector()`.
+- `TlsIdentity::Generated` (default) -- a fresh self-signed certificate generated in memory at
+  construction via `chia-ssl`'s `ChiaCertificate::generate()`. Nothing is read from or written to
+  disk, so a client MUST NOT require a Chia installation. The certificate lives for the process
+  lifetime; the peer-visible identity therefore changes on restart, which is immaterial because
+  peers are tracked by address.
+- `TlsIdentity::Files { cert_path, key_path }` -- an existing pair on disk, e.g. a real Chia node's
+  `wallet_node.crt`/`.key`, loaded via `chia-wallet-sdk`'s `load_ssl_cert()`.
+
+Both are converted with `create_native_tls_connector()`.
 
 ## Error Handling
 
@@ -346,11 +357,8 @@ struct ChiaQueryConfig {
     /// Whether to fall back to coinset.org when peers fail (default: true)
     coinset_fallback_enabled: bool,
 
-    /// Path to Chia TLS certificate file
-    cert_path: PathBuf,
-
-    /// Path to Chia TLS key file
-    key_path: PathBuf,
+    /// Source of the peer TLS client identity (default: `TlsIdentity::Generated`)
+    tls_identity: TlsIdentity,
 
     /// Timeout for peer connection attempts (default: 8s)
     peer_connect_timeout: Duration,

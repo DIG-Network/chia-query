@@ -363,11 +363,12 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "chia",
  "chia-protocol",
  "chia-puzzles",
+ "chia-ssl",
  "chia-wallet-sdk",
  "clvmr",
  "dig-chainsource-interface",

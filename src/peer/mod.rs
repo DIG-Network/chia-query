@@ -20,6 +20,7 @@ use tokio_tungstenite::Connector;
 use crate::types::*;
 use crate::NetworkType;
 use pool::PeerPool;
+pub use pool::PeerRequirement;
 
 // ---------------------------------------------------------------------------
 // PeerBackend
@@ -36,10 +37,11 @@ impl PeerBackend {
         network: crate::NetworkType,
         tls: Connector,
         max_peers: usize,
+        requirement: PeerRequirement,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ChiaQueryError> {
-        let pool = PeerPool::new(network, tls, max_peers, connect_timeout).await?;
+        let pool = PeerPool::new(network, tls, max_peers, requirement, connect_timeout).await?;
         Ok(Self {
             pool,
             network,

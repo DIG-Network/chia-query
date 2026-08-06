@@ -5,6 +5,7 @@ use std::time::Duration;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rand::seq::SliceRandom;
 
+use chia_ssl::ChiaCertificate;
 use chia_wallet_sdk::client::{
     connect_peer, create_native_tls_connector, load_ssl_cert, Network, Peer, PeerOptions,
 };
@@ -24,6 +25,27 @@ const TESTNET11_PORT: u16 = 58444;
 // TLS helpers
 // ---------------------------------------------------------------------------
 
+/// Build a TLS connector from a FRESHLY GENERATED, in-memory Chia certificate.
+///
+/// The Chia peer protocol does not treat the client certificate as a credential — a
+/// full node accepts any well-formed certificate — so a query client has no reason to
+/// require a Chia installation just to speak to peers. Generating avoids the whole
+/// class of "the certificate lives in a home directory this process cannot read or
+/// write" failures (dig_ecosystem#2210).
+///
+/// Nothing is written to disk. The certificate lives for the life of the process, so
+/// the peer-visible client identity changes on restart; that is harmless because peers
+/// are tracked by address, not by certificate, and persisting one would reintroduce
+/// the dependency on a writable well-known directory that this exists to remove.
+pub fn create_generated_tls() -> Result<Connector, ChiaQueryError> {
+    let cert = ChiaCertificate::generate().map_err(|e| ChiaQueryError::TlsError(e.to_string()))?;
+    create_native_tls_connector(&cert).map_err(|e| ChiaQueryError::TlsError(e.to_string()))
+}
+
+/// Build a TLS connector from an EXISTING certificate/key pair on disk.
+///
+/// Used only when a caller explicitly supplies [`TlsIdentity::Files`](crate::TlsIdentity::Files),
+/// e.g. to present a real Chia node's wallet certificate.
 pub fn create_tls(cert_path: &Path, key_path: &Path) -> Result<Connector, ChiaQueryError> {
     let cert_str = cert_path
         .to_str()

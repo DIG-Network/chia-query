@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chia_query::coinset::CoinsetClient;
-use chia_query::peer::connect::create_tls;
+use chia_query::peer::connect::create_generated_tls;
 use chia_query::peer::PeerBackend;
 use chia_query::types::*;
 use chia_query::NetworkType;
@@ -190,9 +190,7 @@ fn coin_id_hex(c: &Coin) -> String {
 async fn parity_all() {
     // -- Setup --------------------------------------------------------------
     eprintln!("=== Setting up ===");
-    let cert_dir = std::env::temp_dir().join("chia-query-parity-tests");
-    std::fs::create_dir_all(&cert_dir).unwrap();
-    let tls = create_tls(&cert_dir.join("test.crt"), &cert_dir.join("test.key")).expect("TLS");
+    let tls = create_generated_tls().expect("TLS");
 
     let coinset =
         CoinsetClient::new("https://api.coinset.org", Duration::from_secs(30)).expect("coinset");
@@ -200,6 +198,7 @@ async fn parity_all() {
         NetworkType::Mainnet,
         tls,
         5,
+        chia_query::peer::PeerRequirement::Required,
         Duration::from_secs(15),
         Duration::from_secs(60),
     )
