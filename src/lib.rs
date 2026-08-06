@@ -3,6 +3,10 @@
 //! Query the Chia blockchain through decentralized peer connections with
 //! automatic fallback to the [coinset.org](https://api.coinset.org) HTTP API.
 //!
+//! No Chia installation is required. The peer TLS client identity is generated in
+//! memory by default ([`TlsIdentity::Generated`]), so a client works from a service
+//! account with no home directory of its own.
+//!
 //! ```rust,no_run
 //! use chia_query::{ChiaQuery, ChiaQueryConfig};
 //!
