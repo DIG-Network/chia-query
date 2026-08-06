@@ -15,18 +15,29 @@ use std::path::{Path, PathBuf};
 
 use chia_query::{ChiaQuery, ChiaQueryConfig, TlsIdentity};
 
-/// Point the home directory at a fresh empty directory and return it.
+/// The ONE empty home directory this binary uses, created once and shared by every test.
 ///
-/// Writes both `USERPROFILE` and `HOME` so the fixture is platform-independent.
-/// Every test in this binary sets the SAME value, so the process-global mutation is
-/// safe under the default parallel test harness.
-fn empty_home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!("chia-query-2210-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).expect("create fake home");
-    std::env::set_var("USERPROFILE", &home);
-    std::env::set_var("HOME", &home);
-    home
+/// `USERPROFILE` and `HOME` are process-global, so a per-test directory is not isolation --
+/// it is three values racing two variables under the default parallel harness. That is not
+/// hypothetical: with a per-test directory, the generate-then-persist-to-home mutant SURVIVED
+/// two runs in three, because the write landed in a sibling test's home and the emptiness
+/// assertion inspected a directory the code under test never touched. A false green in the
+/// test offered as proof, and the same shape as the bug this file regresses -- asserting about
+/// a directory that is not the one the code used (dig-query#15 review).
+///
+/// One shared directory is also STRICTLY STRONGER: nothing in this binary may ever write to
+/// the home directory, so a stray write from any test trips any test's assertion.
+fn empty_home() -> PathBuf {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::temp_dir().join(format!("chia-query-2210-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create fake home");
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("HOME", &home);
+        home
+    })
+    .clone()
 }
 
 /// Every path under `root`, so a test can assert nothing was written there.
@@ -68,7 +79,7 @@ fn default_config_generates_its_tls_identity() {
 /// emptiness assertion below is what distinguishes this fix from that one.
 #[test]
 fn generated_identity_writes_nothing_to_the_home_directory() {
-    let home = empty_home("tls");
+    let home = empty_home();
 
     chia_query::peer::connect::create_generated_tls().expect("generate a TLS identity");
 
@@ -89,7 +100,7 @@ fn generated_identity_writes_nothing_to_the_home_directory() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires network access"]
 async fn generated_identity_is_accepted_by_real_peers() {
-    empty_home("peers");
+    empty_home();
 
     let tls = chia_query::peer::connect::create_generated_tls().expect("generate a TLS identity");
     let peers = chia_query::peer::PeerBackend::new(
@@ -115,7 +126,7 @@ async fn generated_identity_is_accepted_by_real_peers() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires network access"]
 async fn client_constructs_with_no_chia_installation() {
-    let home = empty_home("client");
+    let home = empty_home();
 
     ChiaQuery::new(ChiaQueryConfig::default())
         .await
