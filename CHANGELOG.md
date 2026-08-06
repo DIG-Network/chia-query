@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-08-06
+
+### Features
+- Generate the peer TLS identity so no Chia installation is required (#15)
+
 ## [0.5.2] - 2026-07-21
 
 ### Refactor
