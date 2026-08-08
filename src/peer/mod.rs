@@ -6,8 +6,8 @@ pub mod translate;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use chia::consensus::consensus_constants::ConsensusConstants;
-use chia::protocol::{
+use chia_consensus::consensus_constants::ConsensusConstants;
+use chia_protocol::{
     Bytes32, CoinStateFilters, FullBlock as ProtoFullBlock, RejectAdditionsRequest, RejectBlock,
     RejectHeaderRequest, RejectRemovalsRequest, RequestAdditions, RequestBlock, RequestBlockHeader,
     RequestFeeEstimates, RequestRemovals, RespondAdditions, RespondBlock, RespondBlockHeader,
@@ -676,7 +676,7 @@ impl PeerBackend {
             // We'll build a partial coin using the name as parent_coin_info
             // placeholder -- the puzzle_reveal and solution are the important
             // parts.  Callers who need the full coin can query separately.
-            &chia::protocol::Coin {
+            &chia_protocol::Coin {
                 parent_coin_info: response.coin_name,
                 puzzle_hash: Bytes32::default(),
                 amount: 0,
@@ -876,20 +876,20 @@ impl PeerBackend {
 // ---------------------------------------------------------------------------
 
 fn to_protocol_spend_bundle(bundle: &SpendBundle) -> Result<ProtoBundle, ChiaQueryError> {
-    let coin_spends: Vec<chia::protocol::CoinSpend> = bundle
+    let coin_spends: Vec<chia_protocol::CoinSpend> = bundle
         .coin_spends
         .iter()
         .map(|cs| {
-            Ok(chia::protocol::CoinSpend {
-                coin: chia::protocol::Coin {
+            Ok(chia_protocol::CoinSpend {
+                coin: chia_protocol::Coin {
                     parent_coin_info: translate::parse_bytes32(&cs.coin.parent_coin_info)?,
                     puzzle_hash: translate::parse_bytes32(&cs.coin.puzzle_hash)?,
                     amount: cs.coin.amount,
                 },
-                puzzle_reveal: chia::protocol::Program::from(chia::protocol::Bytes::from(
+                puzzle_reveal: chia_protocol::Program::from(chia_protocol::Bytes::from(
                     translate::parse_hex(&cs.puzzle_reveal)?,
                 )),
-                solution: chia::protocol::Program::from(chia::protocol::Bytes::from(
+                solution: chia_protocol::Program::from(chia_protocol::Bytes::from(
                     translate::parse_hex(&cs.solution)?,
                 )),
             })
@@ -900,7 +900,7 @@ fn to_protocol_spend_bundle(bundle: &SpendBundle) -> Result<ProtoBundle, ChiaQue
     let sig_arr: [u8; 96] = sig_bytes
         .try_into()
         .map_err(|_| ChiaQueryError::InvalidRequest("signature must be 96 bytes".into()))?;
-    let aggregated_signature = chia::bls::Signature::from_bytes(&sig_arr)
+    let aggregated_signature = chia_bls::Signature::from_bytes(&sig_arr)
         .map_err(|e| ChiaQueryError::InvalidRequest(format!("bad BLS signature: {e}")))?;
 
     Ok(ProtoBundle {

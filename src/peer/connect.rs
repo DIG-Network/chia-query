@@ -11,7 +11,7 @@ use chia_wallet_sdk::client::{
 };
 use tokio_tungstenite::Connector;
 
-use chia::protocol::Message;
+use chia_protocol::Message;
 use tokio::sync::mpsc;
 
 use crate::types::ChiaQueryError;

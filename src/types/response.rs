@@ -210,8 +210,8 @@ pub type MempoolItem = serde_json::Value;
 // only on native builds; the wasm coinset core never touches `chia`.
 #[cfg(feature = "native")]
 impl Coin {
-    /// Build from a `chia::protocol::Coin`, encoding hashes as 0x-prefixed hex.
-    pub fn from_protocol(c: &chia::protocol::Coin) -> Self {
+    /// Build from a `chia_protocol::Coin`, encoding hashes as 0x-prefixed hex.
+    pub fn from_protocol(c: &chia_protocol::Coin) -> Self {
         Self {
             parent_coin_info: format!("0x{}", hex::encode(c.parent_coin_info)),
             puzzle_hash: format!("0x{}", hex::encode(c.puzzle_hash)),

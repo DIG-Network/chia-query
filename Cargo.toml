@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -19,8 +19,13 @@ crate-type = ["cdylib", "rlib"]
 # reqwest, racing decentralized peers against the coinset.org fallback.
 default = ["native"]
 native = [
-    "dep:chia",
     "dep:chia-protocol",
+    "dep:chia-consensus",
+    "dep:chia-bls",
+    "dep:chia-traits",
+    "dep:chia-puzzle-types",
+    "dep:clvm-traits",
+    "dep:clvm-utils",
     "dep:clvmr",
     "dep:chia-wallet-sdk",
     "dep:chia-ssl",
@@ -52,19 +57,26 @@ sha2 = "0.10"
 log = "0.4"
 
 # --- native-only (the peer + routing tiers) ---
-chia = { version = "0.26", optional = true }
+# The chia component crates are taken DIRECTLY rather than through the `chia`
+# umbrella: the umbrella has no 0.36 release (it jumps 0.32 -> 0.42), and the
+# 0.36 family is the one `chia-wallet-sdk` 0.33 and `dig-chainsource-interface`
+# 0.3 both build against. Keeping them separate is what lets every
+# `chia_protocol` type in this crate be the SAME type those two expose.
+chia-protocol = { version = "0.36", optional = true }
+chia-consensus = { version = "0.36", optional = true }
+chia-bls = { version = "0.36", optional = true }
+chia-traits = { version = "0.36", optional = true }
+chia-puzzle-types = { version = "0.36", optional = true }
+clvm-traits = { version = "0.36", optional = true }
+clvm-utils = { version = "0.36", optional = true }
 # The canonical `ChainSource` provider interface chia-query implements + aggregates.
-# `chia-protocol` is pulled in directly so the provider module speaks the exact
-# `chia_protocol` types the interface exposes (cargo unifies it with `chia`'s
-# re-export at the same 0.26.x).
-chia-protocol = { version = "0.26", optional = true }
-dig-chainsource-interface = { version = "0.2", optional = true }
-clvmr = { version = "0.14", optional = true }
-chia-wallet-sdk = { version = "0.30", features = ["native-tls"], optional = true }
+dig-chainsource-interface = { version = "0.3", optional = true }
+clvmr = { version = "0.16", optional = true }
+chia-wallet-sdk = { version = "0.33", features = ["native-tls"], optional = true }
 # Generates the peer TLS client identity in memory, so a query client never needs a
-# Chia installation on disk. Pinned to the 0.26.x chia-sdk-client 0.30 depends on, so
+# Chia installation on disk. Pinned to the 0.36.x chia-sdk-client 0.33 depends on, so
 # `ChiaCertificate` is the SAME type `create_native_tls_connector` accepts.
-chia-ssl = { version = "0.26", optional = true }
+chia-ssl = { version = "0.36", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 # `stream` (native-only) enables `bytes_stream()` for the transport-level response body cap.
@@ -84,11 +96,11 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 [dev-dependencies]
 # Enables the in-memory `MockChainSource` for the provider-registry trust-model
 # tests. This merges the `testing` feature onto the native dependency above.
-dig-chainsource-interface = { version = "0.2", features = ["testing"] }
+dig-chainsource-interface = { version = "0.3", features = ["testing"] }
 # The canonical singleton launcher/top-layer program bytes, so the lineage-walk
 # tests build GENUINE singleton-family spends to exercise the singleton-shape gate
-# (pinned to the same 0.20.x the `chia` 0.26 stack resolves).
-chia-puzzles = "0.20"
+# (pinned to the same 0.20.3 `chia-wallet-sdk` 0.33 resolves).
+chia-puzzles = "0.20.3"
 
 [[bin]]
 name = "coinset_drift"

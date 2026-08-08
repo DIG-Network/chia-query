@@ -303,15 +303,25 @@ is always compiled. Everything else is optional and grouped by feature:
 ```toml
 [features]
 default = ["native"]
-native  = ["dep:chia", "dep:clvmr", "dep:chia-wallet-sdk", "dep:tokio",
+native  = ["dep:chia-protocol", "dep:chia-consensus", "dep:chia-bls",
+           "dep:chia-traits", "dep:chia-puzzle-types", "dep:clvm-traits",
+           "dep:clvm-utils", "dep:clvmr", "dep:chia-wallet-sdk", "dep:chia-ssl",
+           "dep:dig-chainsource-interface", "dep:tokio",
            "dep:tokio-tungstenite", "dep:reqwest", "dep:rand", "dep:futures-util"]
 coinset = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys",
            "dep:serde-wasm-bindgen", "dep:getrandom"]
 ```
 
-- **native** pulls the peer + routing stack: `chia`, `clvmr`,
-  `chia-wallet-sdk` (native-tls), `tokio`, `tokio-tungstenite`, `reqwest`,
-  `rand`, `futures-util`, and (linux-only) vendored `openssl`.
+- **native** pulls the peer + routing stack: the chia component crates
+  (`chia-protocol`, `chia-consensus`, `chia-bls`, `chia-traits`,
+  `chia-puzzle-types`, `clvm-traits`, `clvm-utils`), `clvmr`,
+  `chia-wallet-sdk` (native-tls), `chia-ssl`, `dig-chainsource-interface`,
+  `tokio`, `tokio-tungstenite`, `reqwest`, `rand`, `futures-util`, and
+  (linux-only) vendored `openssl`.
+  The component crates are taken directly rather than through the `chia`
+  umbrella: the umbrella publishes no 0.36 release (it jumps 0.32 to 0.42),
+  and 0.36 is the family `chia-wallet-sdk` 0.33 and
+  `dig-chainsource-interface` 0.3 are both built against.
 - **coinset** pulls the wasm bindings: `wasm-bindgen`, `wasm-bindgen-futures`,
   `js-sys`, `serde-wasm-bindgen`, and `getrandom` (js backend).
 
@@ -494,8 +504,9 @@ chia-query is the canonical `dig-chainsource-interface` registry: it implements 
 `ChainSource` trait over its async router and composes providers under an operator trust model whose
 custody view FAILS CLOSED. This surface is native-only (`feature = "native"`, module
 `provider_registry`); it never reaches the wasm coinset-only build. It depends on
-`dig-chainsource-interface = "0.1"` (crates.io), whose `chia-protocol 0.26` unifies with chia-query's
-`chia 0.26` umbrella at a single `chia-protocol 0.26.x`.
+`dig-chainsource-interface = "0.3"` (crates.io), whose `chia-protocol 0.36.1` unifies with
+chia-query's own `chia-protocol 0.36` and with `chia-wallet-sdk 0.33` at a single
+`chia-protocol 0.36.x`, so every `Bytes32`/`Coin`/`CoinSpend` crossing the trait boundary is one type.
 
 ### The blocking facade (`ChiaQueryProvider`) -- SPEC 7 runtime requirement
 
