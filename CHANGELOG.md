@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.0] - 2026-08-08
+
+### Features
+- **deps:** Migrate to the chia-0.36 family for dig-chainsource-interface 0.3 (#16)
+
 ## [0.6.0] - 2026-08-06
 
 ### Features
