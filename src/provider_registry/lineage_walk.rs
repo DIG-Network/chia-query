@@ -21,10 +21,10 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use chia::clvm_traits::FromClvm;
-use chia::puzzles::singleton::{SingletonArgs, SingletonStruct};
 use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_puzzle_types::singleton::{SingletonArgs, SingletonStruct};
 use chia_wallet_sdk::driver::Puzzle;
+use clvm_traits::FromClvm;
 use clvmr::{Allocator, NodePtr, SExp};
 use dig_chainsource_interface::{ChainSourceError, SingletonLineage};
 
@@ -216,7 +216,7 @@ pub(crate) fn singleton_child_from_spend(
             .map_err(|e| ChainSourceError::Malformed(format!("undecodable puzzle reveal: {e}")))?;
 
     // Authenticate the reveal against the coin it claims to spend.
-    let reveal_hash: [u8; 32] = chia::clvm_utils::tree_hash(&allocator, puzzle).into();
+    let reveal_hash: [u8; 32] = clvm_utils::tree_hash(&allocator, puzzle).into();
     if Bytes32::new(reveal_hash) != spend.coin.puzzle_hash {
         return Err(ChainSourceError::Malformed(
             "puzzle reveal does not hash to the spent coin's puzzle hash".to_string(),
@@ -293,7 +293,7 @@ enum SingletonKind {
 /// byte-identical with the `chia` puzzle constants.
 fn classify_singleton_puzzle(allocator: &Allocator, puzzle: NodePtr) -> Option<SingletonKind> {
     let reference = SingletonStruct::new(Bytes32::default());
-    let full_hash: Bytes32 = chia::clvm_utils::tree_hash(allocator, puzzle).into();
+    let full_hash: Bytes32 = clvm_utils::tree_hash(allocator, puzzle).into();
     if full_hash == reference.launcher_puzzle_hash {
         return Some(SingletonKind::Launcher);
     }
@@ -559,7 +559,7 @@ mod tests {
 
         let puzzle_bytes = clvmr::serde::node_to_bytes(&a, puzzle).unwrap();
         let solution_bytes = clvmr::serde::node_to_bytes(&a, nil).unwrap();
-        let puzzle_hash: [u8; 32] = chia::clvm_utils::tree_hash(&a, puzzle).into();
+        let puzzle_hash: [u8; 32] = clvm_utils::tree_hash(&a, puzzle).into();
 
         let coin = Coin::new(Bytes32::new([0xAB; 32]), Bytes32::new(puzzle_hash), 1);
         let parent_id = coin.coin_id();
@@ -607,9 +607,9 @@ mod tests {
     /// quoted single odd `CREATE_COIN`), returns its `NodePtr` and its tree hash. Curried with the
     /// canonical launcher/mod hashes so it classifies as a real top-layer coin.
     fn top_layer_puzzle(a: &mut Allocator, launcher_id: Bytes32) -> (NodePtr, [u8; 32]) {
-        use chia::clvm_traits::ToClvm;
-        use chia::clvm_utils::CurriedProgram;
         use chia_puzzles::SINGLETON_TOP_LAYER_V1_1;
+        use clvm_traits::ToClvm;
+        use clvm_utils::CurriedProgram;
 
         let mod_node = clvmr::serde::node_from_bytes(a, &SINGLETON_TOP_LAYER_V1_1).unwrap();
         // A trivial inner puzzle `(q . ((51 ph 1)))` — irrelevant to classification, which reads the
@@ -621,7 +621,7 @@ mod tests {
         }
         .to_clvm(a)
         .unwrap();
-        let hash: [u8; 32] = chia::clvm_utils::tree_hash(a, puzzle).into();
+        let hash: [u8; 32] = clvm_utils::tree_hash(a, puzzle).into();
         (puzzle, hash)
     }
 

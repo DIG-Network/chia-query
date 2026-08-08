@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use chia::consensus::consensus_constants::ConsensusConstants;
-use chia::consensus::flags::DONT_VALIDATE_SIGNATURE;
+use chia_consensus::consensus_constants::ConsensusConstants;
+use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
 use serde_json::Value;
 
 use crate::coinset::CoinsetClient;
@@ -27,7 +27,7 @@ fn run_puzzle_conditions(spend: &CoinSpend, constants: &ConsensusConstants) -> V
         return Vec::new();
     };
 
-    let mut allocator = chia::consensus::allocator::make_allocator(flags);
+    let mut allocator = chia_consensus::allocator::make_allocator(flags);
 
     let Ok(puzzle_node) = clvmr::serde::node_from_bytes(&mut allocator, &puzzle_bytes) else {
         return Vec::new();

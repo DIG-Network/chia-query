@@ -4,16 +4,16 @@
 //! a `FullBlock`'s CLVM generator.  Follows the same patterns as the
 //! chia-block-listener / chia-generator-parser crates.
 
-use chia::bls::Signature;
-use chia::consensus::additions_and_removals::additions_and_removals;
-use chia::consensus::consensus_constants::ConsensusConstants;
-use chia::consensus::flags::DONT_VALIDATE_SIGNATURE;
-use chia::consensus::get_puzzle_and_solution::get_puzzle_and_solution_for_coin;
-use chia::consensus::run_block_generator::run_block_generator2;
-use chia::consensus::{allocator::make_allocator, validation_error};
-use chia::protocol::{Bytes32, FullBlock};
+use chia_bls::Signature;
+use chia_consensus::additions_and_removals::additions_and_removals;
+use chia_consensus::consensus_constants::ConsensusConstants;
+use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
+use chia_consensus::get_puzzle_and_solution::get_puzzle_and_solution_for_coin;
+use chia_consensus::run_block_generator::run_block_generator2;
+use chia_consensus::{allocator::make_allocator, validation_error};
+use chia_protocol::{Bytes32, FullBlock};
 
-use clvmr::serde::{node_from_bytes_backrefs_record, node_to_bytes};
+use clvmr::serde::{node_from_bytes_backrefs, node_to_bytes};
 
 use crate::types::*;
 
@@ -59,9 +59,12 @@ pub fn block_additions_and_removals(
 
     additions.extend(reward_coins(block, height));
 
+    // `additions_and_removals` hands back each removal already paired with its
+    // pre-computed coin id; the id is redundant here because `CoinRecord`
+    // derives it from the coin itself.
     let removals: Vec<CoinRecord> = raw_removals
         .iter()
-        .map(|coin| CoinRecord {
+        .map(|(_coin_id, coin)| CoinRecord {
             coin: Coin::from_protocol(coin),
             confirmed_block_index: 0,
             spent_block_index: height,
@@ -108,13 +111,15 @@ pub fn block_spends(
     )
     .map_err(|e| ChiaQueryError::PeerConnection(format!("run_block_generator2 failed: {e:?}")))?;
 
-    let (program, backrefs) =
-        node_from_bytes_backrefs_record(&mut allocator, generator.as_ref())
-            .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
+    let program = node_from_bytes_backrefs(&mut allocator, generator.as_ref())
+        .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
 
-    let args =
-        chia::consensus::run_block_generator::setup_generator_args(&mut allocator, &block_refs)
-            .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
+    let args = chia_consensus::run_block_generator::setup_generator_args(
+        &mut allocator,
+        &block_refs,
+        flags,
+    )
+    .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
 
     let dialect = clvmr::chia_dialect::ChiaDialect::new(flags);
     let reduction = clvmr::run_program::run_program(
@@ -132,14 +137,14 @@ pub fn block_spends(
     for sc in &conds.spends {
         let parent_id: Bytes32 = allocator.atom(sc.parent_id).as_ref().try_into().unwrap();
         let puzzle_hash: Bytes32 = allocator.atom(sc.puzzle_hash).as_ref().try_into().unwrap();
-        let removal = chia::protocol::Coin {
+        let removal = chia_protocol::Coin {
             parent_coin_info: parent_id,
             puzzle_hash,
             amount: sc.coin_amount,
         };
 
         if let Ok((puzzle_node, solution_node)) =
-            get_puzzle_and_solution_for_coin(&allocator, generator_output, &backrefs, &removal)
+            get_puzzle_and_solution_for_coin(&allocator, generator_output, &removal)
         {
             let puzzle_bytes = node_to_bytes(&allocator, puzzle_node).unwrap_or_default();
             let solution_bytes = node_to_bytes(&allocator, solution_node).unwrap_or_default();
@@ -186,13 +191,15 @@ pub fn block_spends_with_conditions(
     )
     .map_err(|e| ChiaQueryError::PeerConnection(format!("run_block_generator2 failed: {e:?}")))?;
 
-    let (program, backrefs) =
-        node_from_bytes_backrefs_record(&mut allocator, generator.as_ref())
-            .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
+    let program = node_from_bytes_backrefs(&mut allocator, generator.as_ref())
+        .map_err(|e| ChiaQueryError::PeerConnection(format!("parse generator: {e:?}")))?;
 
-    let args =
-        chia::consensus::run_block_generator::setup_generator_args(&mut allocator, &block_refs)
-            .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
+    let args = chia_consensus::run_block_generator::setup_generator_args(
+        &mut allocator,
+        &block_refs,
+        flags,
+    )
+    .map_err(|e| ChiaQueryError::PeerConnection(format!("setup args: {e:?}")))?;
 
     let dialect = clvmr::chia_dialect::ChiaDialect::new(flags);
     let reduction = clvmr::run_program::run_program(
@@ -210,14 +217,14 @@ pub fn block_spends_with_conditions(
     for sc in &conds.spends {
         let parent_id: Bytes32 = allocator.atom(sc.parent_id).as_ref().try_into().unwrap();
         let puzzle_hash: Bytes32 = allocator.atom(sc.puzzle_hash).as_ref().try_into().unwrap();
-        let removal = chia::protocol::Coin {
+        let removal = chia_protocol::Coin {
             parent_coin_info: parent_id,
             puzzle_hash,
             amount: sc.coin_amount,
         };
 
         if let Ok((puzzle_node, solution_node)) =
-            get_puzzle_and_solution_for_coin(&allocator, generator_output, &backrefs, &removal)
+            get_puzzle_and_solution_for_coin(&allocator, generator_output, &removal)
         {
             let puzzle_bytes = node_to_bytes(&allocator, puzzle_node).unwrap_or_default();
             let solution_bytes = node_to_bytes(&allocator, solution_node).unwrap_or_default();

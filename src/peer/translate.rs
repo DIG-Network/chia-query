@@ -1,7 +1,7 @@
 //! Conversions between `chia_protocol` peer-protocol types and our public
 //! response types.
 
-use chia::protocol::{Bytes32, CoinState, HeaderBlock, Program, RespondAdditions, RespondRemovals};
+use chia_protocol::{Bytes32, CoinState, HeaderBlock, Program, RespondAdditions, RespondRemovals};
 
 use crate::types::{
     AdditionsAndRemovals, BlockRecord, ChiaQueryError, Coin, CoinRecord, CoinSpend, FeeEstimate,
@@ -58,7 +58,7 @@ pub fn coin_states_to_records(states: &[CoinState]) -> Vec<CoinRecord> {
 // ---------------------------------------------------------------------------
 
 pub fn make_coin_spend(
-    coin: &chia::protocol::Coin,
+    coin: &chia_protocol::Coin,
     puzzle: &Program,
     solution: &Program,
 ) -> CoinSpend {
@@ -184,7 +184,7 @@ pub fn additions_removals_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::protocol::{Coin as ProtoCoin, Program};
+    use chia_protocol::{Coin as ProtoCoin, Program};
 
     /// #1258 regression: the peer path must build a `CoinSpend` from the GENUINE spent coin, not a
     /// name-only placeholder. This proves `make_coin_spend` carries every genuine coin field through

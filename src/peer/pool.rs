@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chia::protocol::{Message, NewPeakWallet, ProtocolMessageTypes};
-use chia::traits::Streamable;
+use chia_protocol::{Message, NewPeakWallet, ProtocolMessageTypes};
+use chia_traits::Streamable;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, RwLock};
 
