@@ -58,7 +58,9 @@ jobs:
       # report rather than a confusing exit 4.
       #
       # Coverage is measure-only, and the suite is NO LONGER empty: 104 offline tests pass, and
-      # `cargo llvm-cov --all-features` measures roughly 45% lines / 53% regions. That is below the
+      # `cargo llvm-cov --all-features` measured ~45% lines / 53% regions on 2026-08-10. Those two
+      # percentages are hand-recorded and drift unwatched -- trust the job's own summary output
+      # over this comment whenever they disagree. That is below the
       # ecosystem's >= 80% floor, so the exemption that was justified by an empty suite is now
       # simply debt. It is tracked in DIG-Network/dig_ecosystem#2612 -- which is also where the
       # flip to the gated form belongs: `cargo llvm-cov nextest --fail-under-lines 80 --all-features
