@@ -252,8 +252,11 @@ any well-formed certificate. The identity is therefore selected by `TlsIdentity`
   disk, so a client MUST NOT require a Chia installation. The certificate lives for the process
   lifetime; the peer-visible identity therefore changes on restart, which is immaterial because
   peers are tracked by address.
-- `TlsIdentity::Files { cert_path, key_path }` -- an existing pair on disk, e.g. a real Chia node's
-  `wallet_node.crt`/`.key`, loaded via `chia-wallet-sdk`'s `load_ssl_cert()`.
+- `TlsIdentity::Files { cert_path, key_path }` -- a pair on disk, e.g. a real Chia node's
+  `wallet_node.crt`/`.key`, loaded via `chia-wallet-sdk`'s `load_ssl_cert()`. This variant MAY
+  write: when either path cannot be read, `load_ssl_cert` generates a certificate and persists it
+  AND its private key to the two given paths. An implementation MUST NOT assume this variant is
+  read-only, and both paths' parent directories MUST therefore be writable.
 
 Both are converted with `create_native_tls_connector()`.
 
@@ -327,6 +330,15 @@ coinset = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys",
   `chia-ssl` pin tracks `chia-sdk-client`'s rather than the 0.36 family. The
   two MUST agree, or `ChiaCertificate` becomes a different type from the one
   `create_native_tls_connector` accepts.
+  `chia-ssl` 0.42 transitively brings a pre-1.0 crypto stack -- `rsa`
+  `0.10.0-rc.18`, `pkcs1` `0.8.0-rc.4`, `crypto-bigint`, `crypto-primes`.
+  Those reach only `ChiaCertificate::generate()`, whose sole use of `rsa` is
+  key generation and PKCS#8 encoding; no signing, decryption, or
+  key-derivation path in this crate touches them, and the certificate they
+  produce protects nothing (the Chia CA private key is a public constant
+  compiled into `chia-ssl`). Note that the `rsa` requirement FLOATS: it also
+  matches later `0.10.0-rc.N`, so a fresh downstream resolve MAY select a
+  release candidate other than the one audited here.
 - **coinset** pulls the wasm bindings: `wasm-bindgen`, `wasm-bindgen-futures`,
   `js-sys`, `serde-wasm-bindgen`, and `getrandom` (js backend).
 

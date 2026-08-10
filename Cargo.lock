@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-consensus",

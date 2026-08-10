@@ -42,10 +42,17 @@ pub fn create_generated_tls() -> Result<Connector, ChiaQueryError> {
     create_native_tls_connector(&cert).map_err(|e| ChiaQueryError::TlsError(e.to_string()))
 }
 
-/// Build a TLS connector from an EXISTING certificate/key pair on disk.
+/// Build a TLS connector from a certificate/key pair on disk, CREATING one if it is absent.
 ///
 /// Used only when a caller explicitly supplies [`TlsIdentity::Files`](crate::TlsIdentity::Files),
 /// e.g. to present a real Chia node's wallet certificate.
+///
+/// This writes to the filesystem, which [`create_generated_tls`] deliberately does not. When
+/// either path cannot be read, `load_ssl_cert` generates a fresh certificate and PERSISTS both
+/// the certificate and its private key to the two paths given. So a caller that passes paths
+/// which do not yet exist gets a new key file on disk rather than an error — worth knowing,
+/// because the failure this crate exists to avoid (dig_ecosystem#2210) was exactly a write to a
+/// directory the process could not write to.
 pub fn create_tls(cert_path: &Path, key_path: &Path) -> Result<Connector, ChiaQueryError> {
     let cert_str = cert_path
         .to_str()
