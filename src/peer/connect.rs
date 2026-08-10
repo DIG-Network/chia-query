@@ -42,10 +42,25 @@ pub fn create_generated_tls() -> Result<Connector, ChiaQueryError> {
     create_native_tls_connector(&cert).map_err(|e| ChiaQueryError::TlsError(e.to_string()))
 }
 
-/// Build a TLS connector from an EXISTING certificate/key pair on disk.
+/// Build a TLS connector from a certificate/key pair on disk, GENERATING one if either file
+/// cannot be read.
 ///
 /// Used only when a caller explicitly supplies [`TlsIdentity::Files`](crate::TlsIdentity::Files),
 /// e.g. to present a real Chia node's wallet certificate.
+///
+/// This writes to the filesystem, which [`create_generated_tls`] deliberately does not. When
+/// EITHER path cannot be read — missing, permission-denied, or not valid UTF-8 — `load_ssl_cert`
+/// generates a fresh certificate and PERSISTS both it and its private key to the two paths given.
+/// Two consequences are easy to miss:
+///
+/// - Passing paths that do not yet exist yields a new certificate and key written to disk rather
+///   than an error, *provided both writes succeed*. If a parent directory is not writable the
+///   write error still surfaces as [`ChiaQueryError::TlsError`]. That distinction matters here:
+///   the failure this crate exists to avoid (dig_ecosystem#2210) was exactly a write to a
+///   directory the process could not write to.
+/// - Because the fallback triggers when *either* file fails to read, an unreadable key beside a
+///   readable certificate OVERWRITES that certificate with a newly generated one. This can
+///   replace a file the caller already had, not merely create a missing one.
 pub fn create_tls(cert_path: &Path, key_path: &Path) -> Result<Connector, ChiaQueryError> {
     let cert_str = cert_path
         .to_str()
