@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -59,7 +59,7 @@ log = "0.4"
 # --- native-only (the peer + routing tiers) ---
 # The chia component crates are taken DIRECTLY rather than through the `chia`
 # umbrella: the umbrella has no 0.36 release (it jumps 0.32 -> 0.42), and the
-# 0.36 family is the one `chia-wallet-sdk` 0.33 and `dig-chainsource-interface`
+# 0.36 family is the one `chia-wallet-sdk` 0.34 and `dig-chainsource-interface`
 # 0.3 both build against. Keeping them separate is what lets every
 # `chia_protocol` type in this crate be the SAME type those two expose.
 chia-protocol = { version = "0.36", optional = true }
@@ -72,11 +72,14 @@ clvm-utils = { version = "0.36", optional = true }
 # The canonical `ChainSource` provider interface chia-query implements + aggregates.
 dig-chainsource-interface = { version = "0.3", optional = true }
 clvmr = { version = "0.16", optional = true }
-chia-wallet-sdk = { version = "0.33", features = ["native-tls"], optional = true }
+chia-wallet-sdk = { version = "0.34", features = ["native-tls"], optional = true }
 # Generates the peer TLS client identity in memory, so a query client never needs a
-# Chia installation on disk. Pinned to the 0.36.x chia-sdk-client 0.33 depends on, so
-# `ChiaCertificate` is the SAME type `create_native_tls_connector` accepts.
-chia-ssl = { version = "0.36", optional = true }
+# Chia installation on disk. Pinned to the 0.42.x chia-sdk-client 0.34 depends on, so
+# `ChiaCertificate` is the SAME type `create_native_tls_connector` accepts. chia-ssl
+# is versioned independently of the 0.36 chia family above and moved 0.36 -> 0.42
+# under chia-wallet-sdk 0.34; this pin MUST track chia-sdk-client's, or the two
+# `ChiaCertificate` types diverge and the connector call stops compiling.
+chia-ssl = { version = "0.42", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 # `stream` (native-only) enables `bytes_stream()` for the transport-level response body cap.
@@ -99,7 +102,7 @@ getrandom = { version = "0.2", features = ["js"], optional = true }
 dig-chainsource-interface = { version = "0.3", features = ["testing"] }
 # The canonical singleton launcher/top-layer program bytes, so the lineage-walk
 # tests build GENUINE singleton-family spends to exercise the singleton-shape gate
-# (pinned to the same 0.20.3 `chia-wallet-sdk` 0.33 resolves).
+# (pinned to the same 0.20.3 `chia-wallet-sdk` 0.34 resolves).
 chia-puzzles = "0.20.3"
 
 [[bin]]
