@@ -320,8 +320,13 @@ coinset = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys",
   (linux-only) vendored `openssl`.
   The component crates are taken directly rather than through the `chia`
   umbrella: the umbrella publishes no 0.36 release (it jumps 0.32 to 0.42),
-  and 0.36 is the family `chia-wallet-sdk` 0.33 and
+  and 0.36 is the family `chia-wallet-sdk` 0.34 and
   `dig-chainsource-interface` 0.3 are both built against.
+  `chia-ssl` is the one exception to that family: it is versioned
+  independently and `chia-sdk-client` 0.34 requires `0.42`, so chia-query's
+  `chia-ssl` pin tracks `chia-sdk-client`'s rather than the 0.36 family. The
+  two MUST agree, or `ChiaCertificate` becomes a different type from the one
+  `create_native_tls_connector` accepts.
 - **coinset** pulls the wasm bindings: `wasm-bindgen`, `wasm-bindgen-futures`,
   `js-sys`, `serde-wasm-bindgen`, and `getrandom` (js backend).
 
@@ -505,7 +510,7 @@ chia-query is the canonical `dig-chainsource-interface` registry: it implements 
 custody view FAILS CLOSED. This surface is native-only (`feature = "native"`, module
 `provider_registry`); it never reaches the wasm coinset-only build. It depends on
 `dig-chainsource-interface = "0.3"` (crates.io), whose `chia-protocol 0.36.1` unifies with
-chia-query's own `chia-protocol 0.36` and with `chia-wallet-sdk 0.33` at a single
+chia-query's own `chia-protocol 0.36` and with `chia-wallet-sdk 0.34` at a single
 `chia-protocol 0.36.x`, so every `Bytes32`/`Coin`/`CoinSpend` crossing the trait boundary is one type.
 
 ### The blocking facade (`ChiaQueryProvider`) -- SPEC 7 runtime requirement
