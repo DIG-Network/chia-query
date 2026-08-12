@@ -1086,7 +1086,10 @@ async fn an_empty_pool_may_always_retry() {
     pool.try_refill().await;
     let after_first = dialer.attempt_count();
     assert_eq!(after_first, MAX_DIALS_PER_FILL, "the first refill swept");
-    assert!(pool.is_empty().await, "and the pool is empty, not merely short");
+    assert!(
+        pool.is_empty().await,
+        "and the pool is empty, not merely short"
+    );
 
     pool.try_refill().await;
     assert_eq!(
@@ -1158,7 +1161,6 @@ async fn a_refill_runs_behind_the_answer_when_a_member_can_serve_it() {
     // And the refill is detached rather than skipped: it still happens, just not in the way.
     wait_until("the detached refill to dial", || {
         let dialer = Arc::clone(&dialer);
-        let before = before;
         async move { dialer.attempt_count() > before }
     })
     .await;

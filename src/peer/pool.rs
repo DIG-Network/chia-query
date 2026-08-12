@@ -531,7 +531,13 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
 
         let width = order.len().min(MAX_DIALS_PER_FILL);
         let start = self.dial_cursor.fetch_add(width, Ordering::Relaxed) % order.len();
-        order.iter().cycle().skip(start).take(width).copied().collect()
+        order
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(width)
+            .copied()
+            .collect()
     }
 
     /// Admit an already-open connection to `addr`, unless the pool now holds that address or is

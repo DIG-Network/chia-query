@@ -123,9 +123,12 @@ pub fn trusted_fullnode_from_env(network: NetworkType) -> Option<SocketAddr> {
 /// others — `64:ff9b::7f00:1` is `127.0.0.1` on exactly the deployment this crate's IPv6-first
 /// rule steers toward.
 ///
-/// `Ipv6Addr::to_ipv4` is deliberately NOT used: it maps `::1` to `0.0.0.1`, which is not
-/// `Ipv4Addr::is_loopback`, so routing loopback through it would turn a refusal into an
-/// acceptance. `::` and `::1` are excluded here and refused by the v6 checks instead.
+/// `Ipv6Addr::to_ipv4` is deliberately NOT used, because it maps `::1` to `0.0.0.1` — an address
+/// that is not `Ipv4Addr::is_loopback`, so unwrapping loopback through it discards the very fact
+/// the check is about. Today that substitution would still be refused, by the `0.0.0.0/8` rule in
+/// [`is_non_global_ipv4`] rather than by the loopback one; the two are independent and the second
+/// is not a reason to rely on the first. `::` and `::1` are excluded here and refused by the v6
+/// checks, which is where they belong.
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(mapped) = v6.to_ipv4_mapped() {
         return Some(mapped);
@@ -468,8 +471,8 @@ mod tests {
     #[test]
     fn an_ipv4_address_wearing_an_ipv6_encoding_is_judged_by_the_ipv4_inside_it() {
         for dropped in [
-            addr("[::7f00:1]:8444"),       // ::/96 IPv4-compatible loopback
-            addr("[::a00:1]:8444"),        // ::/96 IPv4-compatible RFC1918
+            addr("[::7f00:1]:8444"),        // ::/96 IPv4-compatible loopback
+            addr("[::a00:1]:8444"),         // ::/96 IPv4-compatible RFC1918
             addr("[64:ff9b::7f00:1]:8444"), // NAT64 well-known prefix over loopback
             addr("[64:ff9b::a00:1]:8444"),  // NAT64 well-known prefix over RFC1918
         ] {
@@ -495,16 +498,16 @@ mod tests {
     #[test]
     fn reserved_and_documentation_ranges_are_not_globally_routable() {
         for dropped in [
-            addr("0.1.2.3:8444"),         // 0.0.0.0/8, "this network"
-            addr("100.64.0.1:8444"),      // carrier-grade NAT
-            addr("192.0.2.1:8444"),       // TEST-NET-1
-            addr("198.18.0.1:8444"),      // benchmarking
-            addr("198.51.100.1:8444"),    // TEST-NET-2
-            addr("203.0.113.1:8444"),     // TEST-NET-3
-            addr("240.0.0.1:8444"),       // reserved
-            addr("[2001:db8::1]:8444"),   // documentation
-            addr("[100::1]:8444"),        // discard-only
-            addr("[2001::1]:8444"),       // Teredo
+            addr("0.1.2.3:8444"),           // 0.0.0.0/8, "this network"
+            addr("100.64.0.1:8444"),        // carrier-grade NAT
+            addr("192.0.2.1:8444"),         // TEST-NET-1
+            addr("198.18.0.1:8444"),        // benchmarking
+            addr("198.51.100.1:8444"),      // TEST-NET-2
+            addr("203.0.113.1:8444"),       // TEST-NET-3
+            addr("240.0.0.1:8444"),         // reserved
+            addr("[2001:db8::1]:8444"),     // documentation
+            addr("[100::1]:8444"),          // discard-only
+            addr("[2001::1]:8444"),         // Teredo
             addr("[2002:102:304::1]:8444"), // 6to4
         ] {
             assert!(

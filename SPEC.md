@@ -276,24 +276,40 @@ struct PeerMember<P> {
    re-walks the whole candidate list on every request forever — at the 8-second default connect
    timeout over the ~124 addresses the mainnet introducers currently answer with, that is minutes
    per read and hundreds of outbound handshakes at real full nodes.
-4. **Refill gating**: `try_refill()` MUST be single-flight — a caller that finds a sweep already
+
+   Occupancy MUST be read from the member set, not from a fill's own admissions. A fill that
+   counts only what it admitted cannot see a concurrent fill's progress, so two overlapping fills
+   would exceed the budget between them.
+4. **Dial window**: the budget bounds what one fill COSTS and MUST NOT bound which candidates are
+   ever dialled. Successive fills MUST advance through the candidate list and wrap, so every
+   candidate is eventually dialable. A fixed window is not a smaller version of this rule but a
+   different failure: with no admissions the order is identical every time, so a host that cannot
+   reach the first 20 never tries the rest for the process's life, and re-dials those same 20 on
+   every read — from one source IP, which full nodes ban for.
+5. **Refill gating**: `try_refill()` MUST be single-flight — a caller that finds a sweep already
    running returns immediately rather than starting its own, so K concurrent requests cost one
-   sweep — and MUST NOT start a new sweep within the cooldown (60s) of one that fell short. A
+   sweep — and MUST NOT start a new sweep within the cooldown (60s) of one that fell SHORT. A
    fill that fell short has just demonstrated the network cannot currently supply `target`.
-   `fill()` itself is NOT gated: its guarantees must hold under concurrency rather than because
-   a caller serialized it.
-5. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
-   member. With a member in hand a sweep buys diversity, which the waiting request does not need;
-   with nothing to serve it buys availability and is the only thing that can help.
-6. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
+
+   An EMPTY pool MUST be exempt from the cooldown, however it became empty. Short is a diversity
+   problem and can wait; empty means every read is served by the single centralized HTTP fallback
+   the peer tier exists to avoid depending on, and waiting cannot improve it.
+
+   `fill()` itself is NOT gated, and it — not `try_refill()` — decides whether there is room:
+   that question is answered under concurrency, from the member set.
+6. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
+   member, and MUST run ahead of it when the pool is empty. With a member in hand a sweep buys
+   diversity, which the waiting request does not need; with nothing to serve it buys availability
+   and is the only thing that can help. `PeerPoolInner::select_refilling()` owns this decision.
+7. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
    NOT be used to draw a quorum sample — over N members it returns the same N peers in a cycle.
    Use `peer_members()`.
-7. **Ejection**: a failed request removes the member and records its address, which the next fill
+8. **Ejection**: a failed request removes the member and records its address, which the next fill
    deprioritises so a peer that just failed cannot immediately reclaim its slot. It is never
    permanently banned: once untried candidates are exhausted it is reconsidered.
-8. **Replacement**: `try_refill()` fills toward `target` when under it, subject to the gating
+9. **Replacement**: `try_refill()` fills toward `target` when under it, subject to the gating
    above.
-9. **Shutdown**: on `ChiaQuery::drop()`, all peer connections close.
+10. **Shutdown**: on `ChiaQuery::drop()`, all peer connections close.
 
 #### Peak claims
 
