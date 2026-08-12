@@ -111,6 +111,7 @@ All methods are `async` and return `Result<Response, ChiaQueryError>`.
 | Method | Request Fields | Response |
 |--------|---------------|----------|
 | `peer_count()` | none | `usize` |
+| `peer_peak_height()` | none | `Option<u32>` |
 
 `peer_count()` MUST report the number of peer connections the pool HOLDS at the moment of the
 call. It MUST NOT report `max_peers`: a client that is still filling reports the smaller number,
@@ -121,6 +122,12 @@ measurement.
 A peer leaves the count via `eject_peer`, which runs when a request to that peer fails. The count
 is therefore of peers held and believed usable, on the same liveness standard `has_peers()` has
 always answered by.
+
+`peer_peak_height()` MUST report the peak this client's OWN peers have announced via
+`NewPeakWallet`, and MUST make no network call. It is distinct from `peak_height_opt()`, which
+answers "what is the chain's peak" and consults coinset FIRST — a third party's view of the chain
+even on a client holding peers. An unobserved peak MUST be `None`, never `0`: every block is
+trivially above zero, so a leaked `0` silently satisfies any confirmation-depth comparison.
 
 #### Mempool
 

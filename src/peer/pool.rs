@@ -277,7 +277,11 @@ mod tests {
             peak_height: Arc::new(AtomicU32::new(0)),
         };
 
-        assert_eq!(pool.peer_count().await, 0, "held is 0 while the target is 5");
+        assert_eq!(
+            pool.peer_count().await,
+            0,
+            "held is 0 while the target is 5"
+        );
         assert!(!pool.has_peers().await);
     }
 }
