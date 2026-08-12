@@ -251,8 +251,14 @@ const EMPTY_RETRY_FLOOR: Duration = Duration::from_secs(1);
 /// exactly one full fill's worth of dials per cooldown, and a change to either constant carries
 /// through instead of silently drifting from it
 /// (`the_sustained_dial_rate_is_one_fill_per_cooldown` pins the relation).
+///
+/// Divided in NANOSECONDS rather than whole seconds. The value is identical at today's 60/20, but
+/// a seconds-first division truncates: any `MAX_DIALS_PER_FILL` above `REFILL_COOLDOWN`'s 60 makes
+/// this `Duration::ZERO`, and [`DialBudget::take`] divides the accrued credit BY it — so a future
+/// widening of one constant turns the aggregate bound into a panic instead of a smaller cost.
+/// Nanoseconds put that boundary at sixty billion dials per fill, which is not reachable.
 const DIAL_COST: Duration =
-    Duration::from_secs(REFILL_COOLDOWN.as_secs() / MAX_DIALS_PER_FILL as u64);
+    Duration::from_nanos((REFILL_COOLDOWN.as_nanos() / MAX_DIALS_PER_FILL as u128) as u64);
 
 /// The most dials a pool may save up while it is quiet, and so the most any one minute may spend
 /// above the sustained rate.

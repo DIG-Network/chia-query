@@ -325,6 +325,11 @@ struct PeerMember<P> {
      re-earns the bank, so a pool idle at `target` for an hour and then drained spends the full
      burst in its sixty-first minute — a state a first-minute exemption does not cover.
 
+     The allowance is PROCESS-LOCAL and starts full: a pool constructed fresh may spend the whole
+     burst immediately, and a restart re-grants it. DP-4 therefore bounds what one running pool
+     does, not what one host does — an operator restarting a node in a loop is outside this bound,
+     and MUST be bounded by whatever supervises the restart.
+
      DP-4 MUST be enforced by charging the dials themselves against an accruing allowance, not by
      the spacing of fills. Interval gating cannot deliver it: a pool churning between a member and
      none re-enters the empty state owing nothing each time round, which measures 6000 dials a
