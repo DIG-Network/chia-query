@@ -491,12 +491,17 @@ impl PeerBackend {
         self.pool.peer_members().await
     }
 
-    /// Ask ONE member for the header hash it serves at `height`.
+    /// Ask ONE member for the header hash it serves at `height`, or `None`.
     ///
-    /// The hash is COMPUTED from the returned header block, never read from a peer-supplied
-    /// field, so a peer cannot name a hash for a block it did not actually serve. Returns `None`
-    /// when that peer will not or cannot answer; a caller comparing members treats a `None` as
-    /// an abstention, not as agreement.
+    /// The answer is for the REQUESTED height or it is `None`. Two things have to hold for that,
+    /// and only the first is obvious: the hash is COMPUTED from the returned header block rather
+    /// than read from a peer-supplied field, so a peer cannot name a hash for a block it did not
+    /// serve; and the block is checked to actually sit at `height`, because a peer may answer a
+    /// request for H with a real block at H' whose hash is just as genuine and answers a
+    /// different question (see [`translate::header_hash_at_height`]).
+    ///
+    /// `None` — no answer, a refused request, a timeout, or a wrong-height answer — is an
+    /// ABSTENTION. A caller comparing members MUST NOT read it as agreement.
     ///
     /// Lives on the backend rather than on [`PeerMember`] because the request timeout and the
     /// network constants are the backend's, and threading them into every member would copy that
@@ -515,7 +520,7 @@ impl PeerBackend {
         .ok()?
         .ok()?;
 
-        Some(response.header_block.header_hash())
+        translate::header_hash_at_height(&response.header_block, height)
     }
 
     // =======================================================================

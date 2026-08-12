@@ -136,6 +136,22 @@ pub fn header_block_to_block_record(hb: &HeaderBlock) -> BlockRecord {
     }
 }
 
+/// The header hash `block` proves for `height`, or `None` when the block is not at that height.
+///
+/// The hash is COMPUTED from the foliage, so a peer cannot name a hash for a block it did not
+/// serve. That alone is not enough: a peer asked for height H may answer with a real block at
+/// H', and the hash of THAT block is equally genuine while answering a different question. Two
+/// peers each serving one frozen header would then compare EQUAL at every height — false
+/// agreement, which is the corroboration failure this guard exists to prevent.
+///
+/// `None` means abstention, never agreement.
+pub fn header_hash_at_height(block: &HeaderBlock, height: u32) -> Option<Bytes32> {
+    if block.height() != height {
+        return None;
+    }
+    Some(block.header_hash())
+}
+
 // ---------------------------------------------------------------------------
 // RequestAdditions / RequestRemovals -> AdditionsAndRemovals
 // ---------------------------------------------------------------------------
@@ -184,7 +200,115 @@ pub fn additions_removals_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia_protocol::{Coin as ProtoCoin, Program};
+    use chia_protocol::{
+        ClassgroupElement, Coin as ProtoCoin, Foliage, FoliageBlockData, PoolTarget, Program,
+        ProofOfSpace, RewardChainBlock, VDFInfo, VDFProof,
+    };
+
+    /// A structurally-valid `HeaderBlock` at `height`, whose foliage — and therefore whose
+    /// header hash — is keyed on `marker`.
+    ///
+    /// The height and the hashed content are varied INDEPENDENTLY on purpose. A fixture whose
+    /// hash were a function of its height could not tell "the guard compared heights" from
+    /// "the two blocks simply hashed differently", which is the property under test.
+    fn header_block_at(height: u32, marker: u8) -> HeaderBlock {
+        let vdf_info = VDFInfo {
+            challenge: Bytes32::new([0; 32]),
+            number_of_iterations: 0,
+            output: ClassgroupElement::default(),
+        };
+        let vdf_proof = || VDFProof {
+            witness_type: 0,
+            witness: Vec::new().into(),
+            normalized_to_identity: false,
+        };
+        HeaderBlock {
+            finished_sub_slots: Vec::new(),
+            reward_chain_block: RewardChainBlock {
+                weight: 0,
+                height,
+                total_iters: 0,
+                signage_point_index: 0,
+                pos_ss_cc_challenge_hash: Bytes32::new([0; 32]),
+                proof_of_space: ProofOfSpace {
+                    challenge: Bytes32::new([0; 32]),
+                    pool_public_key: None,
+                    pool_contract_puzzle_hash: None,
+                    plot_public_key: chia_bls::PublicKey::default(),
+                    version_and_size: 32,
+                    proof: Vec::new().into(),
+                },
+                challenge_chain_sp_vdf: None,
+                challenge_chain_sp_signature: chia_bls::Signature::default(),
+                challenge_chain_ip_vdf: vdf_info.clone(),
+                reward_chain_sp_vdf: None,
+                reward_chain_sp_signature: chia_bls::Signature::default(),
+                reward_chain_ip_vdf: vdf_info.clone(),
+                infused_challenge_chain_ip_vdf: None,
+                header_mmr_root: None,
+                is_transaction_block: false,
+            },
+            challenge_chain_sp_proof: None,
+            challenge_chain_ip_proof: vdf_proof(),
+            reward_chain_sp_proof: None,
+            reward_chain_ip_proof: vdf_proof(),
+            infused_challenge_chain_ip_proof: None,
+            foliage: Foliage {
+                prev_block_hash: Bytes32::new([marker; 32]),
+                reward_block_hash: Bytes32::new([marker; 32]),
+                foliage_block_data: FoliageBlockData {
+                    unfinished_reward_block_hash: Bytes32::new([marker; 32]),
+                    pool_target: PoolTarget {
+                        puzzle_hash: Bytes32::new([0; 32]),
+                        max_height: 0,
+                    },
+                    pool_signature: None,
+                    farmer_reward_puzzle_hash: Bytes32::new([0; 32]),
+                    extension_data: Bytes32::new([0; 32]),
+                },
+                foliage_block_data_signature: chia_bls::Signature::default(),
+                foliage_transaction_block_hash: None,
+                foliage_transaction_block_signature: None,
+            },
+            foliage_transaction_block: None,
+            transactions_filter: Vec::new().into(),
+            transactions_info: None,
+        }
+    }
+
+    /// A peer asked for height H may answer with a real block at H'. The hash it yields is
+    /// genuine and verifiable and answers a DIFFERENT question, so it must be refused.
+    ///
+    /// The control is the same block accepted at its own height — without it this test would
+    /// pass against a helper that returns `None` unconditionally.
+    #[test]
+    fn a_header_hash_is_returned_only_for_the_height_that_was_asked_for() {
+        let block = header_block_at(100, 0xAB);
+
+        assert_eq!(
+            header_hash_at_height(&block, 100),
+            Some(block.header_hash()),
+            "the control: a block AT the requested height answers with its computed hash"
+        );
+        assert_eq!(
+            header_hash_at_height(&block, 101),
+            None,
+            "a block at another height must abstain, not answer for the height asked"
+        );
+    }
+
+    /// The false-agreement shape this guard exists to stop (dig_ecosystem#2666): two members
+    /// both serving one frozen header compare EQUAL at any height, so a caller corroborating
+    /// across members reads unanimous agreement about a height neither peer answered for.
+    #[test]
+    fn two_peers_serving_one_stale_header_cannot_agree_at_a_height_neither_answered() {
+        let stale = header_block_at(100, 0xAB);
+
+        // Unguarded, both members would yield this identical hash at height 900 000.
+        assert_eq!(stale.header_hash(), header_block_at(100, 0xAB).header_hash());
+
+        assert_eq!(header_hash_at_height(&stale, 900_000), None);
+    }
 
     /// #1258 regression: the peer path must build a `CoinSpend` from the GENUINE spent coin, not a
     /// name-only placeholder. This proves `make_coin_spend` carries every genuine coin field through
