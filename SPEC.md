@@ -299,6 +299,12 @@ struct PeerMember<P> {
    outbound dials in its first minute of continuous emptiness, nor more than 20 per minute
    thereafter.
 
+   That exemption is from the COOLDOWN only, never from DP-4. Both intervals are chosen from the
+   pool's current state and the empty floor resets on admission, so a pool that admits a peer and
+   loses it again re-enters the empty state owing no interval at all — and nothing bounds how
+   often a pool may change state. An implementation MUST therefore hold DP-4 with a bound on the
+   DIALS rather than on the spacing of fills.
+
    `fill()` itself is NOT gated, and it — not `try_refill()` — decides whether there is room:
    that question is answered under concurrency, from the member set.
 5a. **Dial-cost bounds**: the gating above, the fill budget and the dial window together hold four
@@ -310,9 +316,17 @@ struct PeerMember<P> {
      empty.
    - **DP-3, per address**: at steady state no candidate is dialled more than once per
      cooldown (60s).
-   - **DP-4, aggregate**: sustained outbound dials stay at or under 20 per minute per pool. A
-     continuously-empty pool MAY burst to at most 120 dials in its first minute and MUST then
-     decay to the sustained rate; a pool at `target` dials nothing.
+   - **DP-4, aggregate**: sustained outbound dials stay at or under 20 per minute per pool, in
+     every state and across every sequence of transitions between them. A continuously-empty pool
+     MAY burst to at most 120 dials in its first minute and MUST then decay to the sustained rate;
+     a pool at `target` dials nothing.
+
+     DP-4 MUST be enforced by charging the dials themselves against an accruing allowance, not by
+     the spacing of fills. Interval gating cannot deliver it: a pool churning between a member and
+     none re-enters the empty state owing nothing each time round, which measures 6000 dials a
+     minute — fifty times this ceiling — under an interval-only policy. The allowance MUST permit
+     a bounded burst to be banked while the pool is quiet, so that a pool recovering from a
+     transient outage may spend hard once.
 6. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
    member. With a member in hand a sweep buys diversity, which the waiting request does not need.
 

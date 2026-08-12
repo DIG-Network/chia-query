@@ -1040,7 +1040,13 @@ async fn a_batch_is_dialled_concurrently() {
     );
 }
 
-/// Two concurrent fills cost ONE fill's dial budget between them, not one each.
+/// Neither concurrent fill dials a SECOND batch once the pool has reached target.
+///
+/// Named for what it proves rather than for the bound it defends. Two fills take their own
+/// windows from `dial_cursor`, so the general bound across a pair is two fills' budgets; this
+/// fixture's `target` is below the batch width, so each reaches target inside batch one and the
+/// pair costs one budget between them. The general claim is not on offer here — a future reader
+/// taking the old name as the contract would believe the pool bounds something it does not.
 ///
 /// A fill that measured occupancy from its OWN admissions cannot see a sibling's progress. Every
 /// one of the loser's ten connections is refused by the at-target ceiling, refusal marks nothing,
@@ -1052,7 +1058,7 @@ async fn a_batch_is_dialled_concurrently() {
 /// `target` is deliberately far below the batch width so the pool reaches it inside batch one,
 /// and the dialer must stall so the two fills genuinely interleave.
 #[tokio::test]
-async fn two_concurrent_fills_do_not_exceed_one_fills_dial_budget() {
+async fn neither_concurrent_fill_dials_a_second_batch_once_the_pool_is_at_target() {
     let reachable = book(30);
     let dialer = FakeDialer::reaching_slowly(&reachable);
     let pool = pool_with(

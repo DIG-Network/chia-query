@@ -290,7 +290,11 @@ impl DialBudget {
 
         let affordable = (self.credit.as_nanos() / DIAL_COST.as_nanos()) as usize;
         let allowed = wanted.min(affordable);
-        self.credit -= DIAL_COST * allowed as u32;
+        // Saturating, though `allowed <= affordable` makes it exact: `Duration`'s `-` PANICS on
+        // underflow, and this runs inside a fill on the request path and in a detached task. A
+        // future edit that got the relation wrong should overspend the budget and be caught by
+        // the ceiling test, not take the pool down with an arithmetic panic.
+        self.credit = self.credit.saturating_sub(DIAL_COST * allowed as u32);
         allowed
     }
 }
@@ -380,6 +384,14 @@ pub struct PeerPoolInner<P: Clone> {
     /// for the process's life while each read re-dials the identical twenty that just failed.
     /// Advancing by the window makes every candidate reachable across successive fills without
     /// widening what one fill costs.
+    ///
+    /// Two caveats, neither a defect, both easy to over-read. The reach property is SEQUENTIAL:
+    /// concurrent fills take adjacent wrapping windows, which overlap whenever the candidate list
+    /// is shorter than two windows, and `try_admit` rather than the cursor is what keeps the
+    /// result distinct. And `dial_window` re-partitions the list by the ejected set on every
+    /// fill, so the index carried here points into a DIFFERENT permutation each time; "every
+    /// candidate is eventually dialled" weakens as that set churns, and is a strong tendency
+    /// rather than a guarantee.
     dial_cursor: AtomicUsize,
     /// Held for the duration of a [`try_refill`](PeerPoolInner::try_refill) sweep.
     ///
