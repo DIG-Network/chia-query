@@ -1284,6 +1284,132 @@ async fn admission_resets_the_empty_backoff() {
     );
 }
 
+/// DP-4 under CHURN: a pool flapping between members and none cannot outrun the ceiling.
+///
+/// This is the state neither interval can bound, and the reason DP-4 is enforced by counting
+/// dials rather than by timing fills. Both intervals are chosen from the pool's CURRENT state,
+/// and an admission resets the empty backoff — so a pool that admits a peer and loses it again
+/// re-enters the empty state owing nothing and sweeps at once. The pool changes state as fast as
+/// its members churn, so an interval-only policy bounds the rate by nothing at all. Measured on
+/// the unbudgeted code, at this fixture's 100ms churn period: **6000 dials in one simulated
+/// minute** — fifty times the ceiling, at real mainnet full nodes, sustained.
+///
+/// The floor is the control, and it is the half that matters. A ceiling alone is satisfied by a
+/// pool that stopped dialling altogether, which is not pacing but giving up — the same
+/// over-correction an earlier round shipped as a flat sixty-second floor.
+#[tokio::test(start_paused = true)]
+async fn churn_between_admission_and_ejection_cannot_outrun_the_dial_ceiling() {
+    let reachable = book(60);
+    let (pool, dialer) = pool_over(book(60), &reachable, 5);
+
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < Duration::from_secs(60) {
+        pool.try_refill().await;
+        // Accepted-then-rejected is the worst regime and the realistic one: a peer that completes
+        // its handshake and then fails the request it was dialled for is ejected immediately.
+        for member in pool.peer_members().await {
+            pool.eject_peer(member.addr).await;
+        }
+        tokio::time::advance(step).await;
+        elapsed += step;
+    }
+
+    let dials = dialer.attempt_count();
+    assert!(
+        dials <= 6 * MAX_DIALS_PER_FILL,
+        "DP-4: {dials} dials in one minute of churn, ceiling {} — an admission followed by an \
+         ejection is manufacturing dial allowance",
+        6 * MAX_DIALS_PER_FILL
+    );
+    assert!(
+        dials >= 5 * MAX_DIALS_PER_FILL,
+        "DP-4: only {dials} dials in a minute of churn; a pool losing its members must keep \
+         replacing them at the sustained rate, not stop"
+    );
+}
+
+/// DP-4's two numbers are DP-1's budget in disguise, and only hold together.
+///
+/// The ceiling tests measure the composition, which passes for any self-consistent set of wrong
+/// constants; this pins the relation itself, so re-rating the pool by editing one constant fails
+/// loudly here rather than quietly widening what the pool is allowed to cost.
+#[test]
+fn the_sustained_dial_rate_is_one_fill_per_cooldown() {
+    assert_eq!(
+        DIAL_COST * MAX_DIALS_PER_FILL as u32,
+        REFILL_COOLDOWN,
+        "the sustained rate is no longer one fill's dials per short-pool cooldown"
+    );
+    assert_eq!(
+        DIAL_BURST as usize + MAX_DIALS_PER_FILL,
+        6 * MAX_DIALS_PER_FILL,
+        "the banked burst plus one minute's accrual is no longer DP-4's 120-dial first minute"
+    );
+}
+
+/// A clock armed while the pool was merely SHORT does not survive it emptying and recovering.
+///
+/// `last_short_fill` is only read in the non-empty branch, so an armed clock is invisible for as
+/// long as the pool has nothing — and reappears, still running, the moment a recovered pool drops
+/// below target again. That suppresses a refill of a genuinely short pool for the remainder of a
+/// minute that was started by a different, already-resolved shortfall.
+///
+/// The fixture is the whole sequence, because no shorter one can see it: short with the clock
+/// ARMED (proven by a suppressed sweep), drained to empty, recovered to target, then short again
+/// — all inside the original minute, so a surviving clock is still gating when the last refill is
+/// offered.
+#[tokio::test(start_paused = true)]
+async fn a_clock_armed_while_short_does_not_survive_the_pool_emptying() {
+    let dialer = FakeDialer::reaching(&[addr(1)]);
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&book(5)),
+        3,
+        Vec::new(),
+    );
+
+    pool.try_refill().await;
+    assert_eq!(pool.len().await, 1, "the pool is SHORT, not empty");
+
+    // The clock is genuinely armed, not merely assumed to be: a second sweep inside the cooldown
+    // makes no dials. Without this the final assertion passes against a pool that never armed it.
+    let armed_at = dialer.attempt_count();
+    pool.try_refill().await;
+    assert_eq!(
+        dialer.attempt_count(),
+        armed_at,
+        "the short-pool cooldown was never armed, so this fixture cannot see it survive"
+    );
+
+    pool.eject_peer(addr(1)).await;
+    assert!(pool.is_empty().await, "and is then drained to nothing");
+
+    dialer.set_reachable(&book(3));
+    tokio::time::advance(EMPTY_RETRY_FLOOR).await;
+    pool.try_refill().await;
+    assert_eq!(
+        pool.len().await,
+        3,
+        "the network came back and the pool reached target"
+    );
+
+    pool.eject_peer(addr(1)).await;
+    assert_eq!(
+        pool.len().await,
+        2,
+        "and is short again, well inside the original minute"
+    );
+
+    let recovered_at = dialer.attempt_count();
+    pool.try_refill().await;
+    assert!(
+        dialer.attempt_count() > recovered_at,
+        "a genuinely short pool was refused a refill by a clock armed before it emptied and \
+         recovered — that shortfall is over, and this one is new"
+    );
+}
+
 /// A detached refill does not make its caller wait, even when every dial hangs.
 ///
 /// The dialer never resolves, so an awaited fill could not return at all. Returning at all is

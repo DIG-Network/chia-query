@@ -176,10 +176,20 @@ impl AddressSource for IntroducerAddresses {
 //   120 dials — in its first minute, then decays to that steady rate. At target it dials nothing;
 //   short, it is bounded by `REFILL_COOLDOWN`.
 //
-// There is deliberately no rate limiter here. A token bucket would be a second independent policy
-// surface consulted before `fill`, and duplicating a decision across two places that each satisfy
-// any test of it is the exact shape that produced this PR's earlier defects (see the note on
-// [`PeerPoolInner::try_refill`]). Both throttles below gate the SAME call site.
+// DP-4 is the only one of the four that the intervals cannot deliver, and an earlier version of
+// this note claimed the opposite. Both intervals are chosen from the pool's CURRENT state, and
+// the empty backoff resets on admission — so a pool that admits a peer and loses it again
+// re-enters the empty state owing nothing. Nothing bounds how often a pool may change state, so
+// nothing bounded the dial rate: churning between one member and none measured **6000 dials a
+// minute** at real mainnet full nodes, fifty times this ceiling
+// (`churn_between_admission_and_ejection_cannot_outrun_the_dial_ceiling`).
+//
+// So DP-4 is enforced on the dials themselves, by [`DialBudget`], and the two intervals are
+// demoted to what they alone can do. They are not a duplicate of it: the intervals decide WHEN a
+// fill is offered and thereby SPREAD the burst — without them a pool would spend its whole
+// minute's allowance in the first hundred milliseconds and have nothing left when a transient
+// outage cleared. The budget decides HOW MANY dials any fill may spend and bounds the TOTAL. One
+// shapes distribution, one caps volume, and only the second is immune to a state transition.
 
 /// How many addresses one fill dials AT ONCE.
 ///
@@ -226,6 +236,64 @@ const REFILL_COOLDOWN: Duration = Duration::from_secs(60);
 /// that admits nothing — 1, 2, 4, 8, 16, 32, then capped at `REFILL_COOLDOWN` — and the FIRST
 /// admission resets it. Six fills land in the first minute, twenty dials a minute thereafter.
 const EMPTY_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+/// What one outbound dial costs against the pool's aggregate allowance.
+///
+/// `REFILL_COOLDOWN / MAX_DIALS_PER_FILL` — three seconds — so the sustained rate DP-4 names is
+/// exactly one full fill's worth of dials per cooldown, and a change to either constant carries
+/// through instead of silently drifting from it
+/// (`the_sustained_dial_rate_is_one_fill_per_cooldown` pins the relation).
+const DIAL_COST: Duration =
+    Duration::from_secs(REFILL_COOLDOWN.as_secs() / MAX_DIALS_PER_FILL as u64);
+
+/// The most dials a pool may save up while it is quiet, and so the most any one minute may spend
+/// above the sustained rate.
+///
+/// A hundred, which with the three-second cost puts DP-4's first-minute ceiling at 120: the
+/// hundred banked plus the twenty accrued while they are spent. Banking matters because the
+/// expensive states are transient — a boot before the network is up, a drain to empty — and a
+/// pool that had been idle for an hour should be allowed to spend hard to recover, once.
+const DIAL_BURST: u32 = 100;
+
+/// The pool's aggregate dial allowance: DP-4, enforced by counting dials rather than timing fills.
+///
+/// Credit accrues with elapsed time and is spent per dial, so no sequence of admissions,
+/// ejections or state changes can manufacture allowance — the quantity being counted is the only
+/// one a transition leaves alone. It is deliberately NOT consulted as a second veto before
+/// `fill`: it hands out a smaller allowance, and an exhausted allowance ends the fill. There is
+/// one gate on whether to fill (`try_refill`) and one bound on what a fill may spend, not two
+/// places that each independently say no.
+struct DialBudget {
+    /// Accrued and unspent, capped at `DIAL_COST * DIAL_BURST`.
+    credit: Duration,
+    /// When `credit` was last brought up to date.
+    updated: Instant,
+}
+
+impl DialBudget {
+    /// A budget that starts full, so a pool's first fill is never throttled by its own youth.
+    fn full() -> Self {
+        Self {
+            credit: DIAL_COST * DIAL_BURST,
+            updated: Instant::now(),
+        }
+    }
+
+    /// Accrue, then hand out at most `wanted` dials' worth of allowance, spending what it hands.
+    ///
+    /// Returns how many dials the caller may make — possibly zero.
+    fn take(&mut self, wanted: usize) -> usize {
+        let now = Instant::now();
+        self.credit =
+            (self.credit + now.saturating_duration_since(self.updated)).min(DIAL_COST * DIAL_BURST);
+        self.updated = now;
+
+        let affordable = (self.credit.as_nanos() / DIAL_COST.as_nanos()) as usize;
+        let allowed = wanted.min(affordable);
+        self.credit -= DIAL_COST * allowed as u32;
+        allowed
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Members
@@ -329,6 +397,8 @@ pub struct PeerPoolInner<P: Clone> {
     /// One field in one place: the alternative — a floor here and a counter somewhere else — is
     /// the split-policy shape this pool has already been bitten by.
     empty_backoff: RwLock<Option<(Instant, Duration)>>,
+    /// DP-4's aggregate ceiling. See [`DialBudget`] for why the two intervals above cannot be it.
+    dial_budget: Mutex<DialBudget>,
     dialer: Arc<dyn PeerDialer<P>>,
     /// Highest peak height claimed by ANY member. Kept as a shared `AtomicU32` updated with
     /// `fetch_max` because `router::get_blockchain_state` reads it directly.
@@ -358,6 +428,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             refilling: Mutex::new(()),
             last_short_fill: RwLock::new(None),
             empty_backoff: RwLock::new(None),
+            dial_budget: Mutex::new(DialBudget::full()),
             dialer,
             peak_height: Arc::new(AtomicU32::new(0)),
         }
@@ -582,6 +653,15 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
                 .collect();
             if batch.is_empty() {
                 continue;
+            }
+
+            // DP-4, charged on the dials themselves. An exhausted allowance ENDS the fill rather
+            // than shrinking the next batch: a pool out of credit should stop, not trickle a dial
+            // per batch through a loop that keeps re-reading occupancy.
+            let allowed = self.dial_budget.lock().await.take(batch.len());
+            let batch = &batch[..allowed];
+            if batch.is_empty() {
+                break;
             }
 
             // Concurrently, not in sequence. A batch of ten unreachable addresses at the default

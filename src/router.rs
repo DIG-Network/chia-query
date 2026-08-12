@@ -110,24 +110,45 @@ async fn dispatch_read<T>(
     }
 }
 
+/// Whether a read should consult the peer tier at all, starting a detached refill if not.
+///
+/// An EMPTY pool refills IN FRONT of the read that found it empty, which costs that read up to
+/// two connect-timeout sweeps for a decentralized answer the coinset tier would have given in
+/// milliseconds — and on the one read whose fill is least likely to succeed. Frictionless
+/// consumption settles it: when a fallback is configured the refill is detached and the read goes
+/// straight to the fallback, and because the fill still happens the NEXT read is peer-served.
+///
+/// With NO fallback configured there is nothing to be fast with, so the read keeps waiting on the
+/// fill — an answer late beats no answer. The pool is not even asked in that case, because the
+/// answer cannot change the decision.
+///
+/// A free function for the same reason [`dispatch_read`] is one: as a method it needs a router,
+/// which needs a live `PeerBackend`, which needs a socket — putting the decision itself out of
+/// reach of a test, which is how it came to ship untested. Over a flag, a lazy future and a
+/// closure, all three branches are directly assertable, INCLUDING the half a return value cannot
+/// show: that the detached refill was started, and started only here.
+async fn should_wait_for_peer_tier(
+    coinset_fallback_enabled: bool,
+    has_peers: impl std::future::Future<Output = bool>,
+    start_refill: impl FnOnce(),
+) -> bool {
+    if !coinset_fallback_enabled {
+        return true;
+    }
+    if has_peers.await {
+        return true;
+    }
+    start_refill();
+    false
+}
+
 impl QueryRouter {
-    /// Whether this read should consult the peer tier at all, starting a detached refill if not.
-    ///
-    /// An EMPTY pool refills IN FRONT of the read that found it empty, which costs that read up
-    /// to two connect-timeout sweeps for a decentralized answer the coinset tier would have given
-    /// in milliseconds — and on the one read whose fill is least likely to succeed. Frictionless
-    /// consumption settles it: when a fallback is configured the refill is detached and the read
-    /// goes straight to the fallback, and because the fill still happens the NEXT read is
-    /// peer-served.
-    ///
-    /// With NO fallback configured there is nothing to be fast with, so the read keeps waiting on
-    /// the fill — an answer late beats no answer.
+    /// This router's [`should_wait_for_peer_tier`] decision, over its own pool.
     async fn peer_tier_is_worth_waiting_for(&self) -> bool {
-        if !self.coinset_fallback_enabled || self.peer.has_peers().await {
-            return true;
-        }
-        self.peer.try_refill_detached();
-        false
+        should_wait_for_peer_tier(self.coinset_fallback_enabled, self.peer.has_peers(), || {
+            self.peer.try_refill_detached()
+        })
+        .await
     }
 
     /// Try `peer_fn` twice (each call will select a different peer because the
@@ -916,11 +937,109 @@ mod tests {
         assert_eq!(coinset.count(), 1, "and the fallback ran after both");
     }
 
+    /// A pool that records whether it was ASKED, and whether a refill was STARTED.
+    ///
+    /// Both are things a return value cannot show. `has_peers` is handed over as a lazy future so
+    /// "never consulted" is observable at all — the no-fallback branch must not pay for an answer
+    /// that cannot change its decision.
+    #[derive(Default)]
+    struct Pool {
+        asked: AtomicUsize,
+        refills: AtomicUsize,
+    }
+
+    impl Pool {
+        async fn has_peers(&self, answer: bool) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            answer
+        }
+
+        fn start_refill(&self) {
+            self.refills.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.asked.load(Ordering::Relaxed),
+                self.refills.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// An EMPTY pool with a fallback is NOT worth waiting for — and the refill starts anyway.
+    ///
+    /// Both halves, because either alone is satisfied by a wrong implementation: reporting the
+    /// tier unreachable without starting the refill leaves the pool empty forever and every read
+    /// on the fallback, and starting the refill while still reporting it reachable is the
+    /// in-front sweep this exists to remove.
+    #[tokio::test]
+    async fn an_empty_pool_with_a_fallback_is_not_worth_waiting_for() {
+        let pool = Pool::default();
+
+        let verdict =
+            should_wait_for_peer_tier(true, pool.has_peers(false), || pool.start_refill()).await;
+
+        assert!(!verdict, "an empty pool was reported worth waiting for");
+        assert_eq!(
+            pool.counts(),
+            (1, 1),
+            "the pool was asked once and exactly one detached refill was started"
+        );
+    }
+
+    /// The control on the pool's state: with a member in hand the tier IS worth waiting for, and
+    /// no refill is started HERE.
+    ///
+    /// Without it the short-circuit is satisfied by a router that never waits on a peer at all,
+    /// which deletes the peer tier rather than reordering it — and by one that starts a detached
+    /// refill on every read, which is a dial sweep per read wearing a different name.
+    /// `select_refilling` owns the behind-the-answer refill for this case; this decision must not
+    /// duplicate it.
+    #[tokio::test]
+    async fn a_pool_with_a_member_is_worth_waiting_for() {
+        let pool = Pool::default();
+
+        let verdict =
+            should_wait_for_peer_tier(true, pool.has_peers(true), || pool.start_refill()).await;
+
+        assert!(verdict, "a pool with a member was skipped");
+        assert_eq!(
+            pool.counts(),
+            (1, 0),
+            "a refill was started in front of a read the pool could already serve"
+        );
+    }
+
+    /// The control on the fallback: with none configured the tier is always worth waiting for,
+    /// and the pool is not even consulted.
+    ///
+    /// An answer late beats no answer, so emptiness cannot make this branch skip. The zero ask is
+    /// what distinguishes "the fallback is checked first" from "the pool happened to have a
+    /// member": a condition ordered the other way round would report the tier unreachable on an
+    /// empty pool with nowhere else to ask, which answers every read with an error.
+    #[tokio::test]
+    async fn without_a_fallback_the_peer_tier_is_always_worth_waiting_for() {
+        let pool = Pool::default();
+
+        let verdict =
+            should_wait_for_peer_tier(false, pool.has_peers(false), || pool.start_refill()).await;
+
+        assert!(
+            verdict,
+            "a read with nowhere else to ask skipped the peer tier"
+        );
+        assert_eq!(
+            pool.counts(),
+            (0, 0),
+            "the pool was consulted, or refilled, for a decision that could not use the answer"
+        );
+    }
+
     /// The other control: with NO fallback configured there is nothing to be fast with, so the
     /// read keeps waiting on the peer tier however empty the pool is.
     ///
-    /// `QueryRouter::peer_tier_is_worth_waiting_for` never reports the tier unreachable in that
-    /// configuration; this pins the behaviour `dispatch_read` must have when it does not.
+    /// `should_wait_for_peer_tier` never reports the tier unreachable in that configuration; this
+    /// pins the behaviour `dispatch_read` must have when it does not.
     #[tokio::test]
     async fn without_a_fallback_the_peer_tier_is_always_waited_on() {
         let (peer, retry, coinset) = (Calls::default(), Calls::default(), Calls::default());
