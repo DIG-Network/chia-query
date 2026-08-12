@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -114,12 +114,59 @@ pub fn trusted_fullnode_from_env(network: NetworkType) -> Option<SocketAddr> {
     )
 }
 
+/// Whether `addr` is an address a DISCOVERED peer could legitimately live at.
+///
+/// Introducer answers arrive over unauthenticated DNS, so this treats them as untrusted input.
+/// Anything that is not a globally routable unicast address is refused: loopback (the whole of
+/// `127.0.0.0/8` is on `lo`, so one process answers on all of it as distinct addresses),
+/// unspecified, link-local, unique-local, RFC1918, multicast and broadcast. IPv4-mapped IPv6 is
+/// unwrapped first, or `::ffff:127.0.0.1` would walk straight past the v4 checks.
+///
+/// Operator-named addresses are NOT subject to this — a local full node is the legitimate
+/// loopback case, and somebody asked for it.
+fn is_routable_peer(addr: &SocketAddr) -> bool {
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => {
+            let [first, second, ..] = v6.octets();
+            let is_unique_local = first & 0xfe == 0xfc;
+            let is_link_local = first == 0xfe && second & 0xc0 == 0x80;
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_unique_local
+                || is_link_local)
+        }
+    }
+}
+
+/// `discovered`, keeping only the addresses a real internet peer could be at.
+fn routable_only(discovered: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    discovered.into_iter().filter(is_routable_peer).collect()
+}
+
 /// Resolve candidate peer addresses from the network's DNS introducers.
 ///
 /// The returned list is shuffled — so a caller filling several slots does not hammer whichever
-/// introducer answers first — and de-duplicated. It holds DISCOVERED addresses only: no
-/// loopback and no hardcoded priority address. An address nobody configured must never reach
-/// the head of this list (dig_ecosystem#2648).
+/// introducer answers first — de-duplicated, and filtered to routable unicast addresses
+/// ([`is_routable_peer`]). It holds DISCOVERED addresses only: no loopback and no hardcoded
+/// priority address. An address nobody configured must never reach the head of this list
+/// (dig_ecosystem#2648).
+///
+/// Fails with [`ChiaQueryError::PeerDiscoveryFailed`] when nothing usable resolves. That error
+/// is meaningful and MUST NOT be cached as an empty candidate list: a single dropped DNS
+/// exchange would otherwise disable the peer tier for the process's life.
 pub async fn discover_addresses(
     network: NetworkType,
     timeout: Duration,
@@ -129,7 +176,7 @@ pub async fn discover_addresses(
         NetworkType::Testnet11 => Network::default_testnet11(),
     };
 
-    let mut addrs = net.lookup_all(timeout, BATCH_SIZE).await;
+    let mut addrs = routable_only(net.lookup_all(timeout, BATCH_SIZE).await);
     if addrs.is_empty() {
         return Err(ChiaQueryError::PeerDiscoveryFailed);
     }
@@ -222,7 +269,7 @@ pub async fn connect_random_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("a valid socket address")
@@ -278,6 +325,64 @@ mod tests {
         assert_eq!(
             candidate_list(&trusted, vec![addr("1.2.3.4:8444")]),
             vec![addr("10.0.0.9:8444"), addr("1.2.3.4:8444")]
+        );
+    }
+
+    /// SPEC "Candidate list": discovery contributes introducer-resolved addresses ONLY, and
+    /// `127.0.0.1` is a candidate only when an OPERATOR named it.
+    ///
+    /// The introducers are reached over DNS, which the client does not authenticate: a
+    /// DHCP-supplied resolver, a poisoned cache, or a user-level stub can answer with anything.
+    /// On Linux the whole of `127.0.0.0/8` is on `lo`, so one unprivileged process answers on
+    /// every one of those addresses as a DISTINCT `SocketAddr` — passing every admission guard
+    /// in the pool and filling it alone. The routable control is what proves the filter is a
+    /// filter and not a blanket refusal.
+    #[test]
+    fn discovery_keeps_routable_addresses_and_drops_the_rest() {
+        let routable = addr("1.2.3.4:8444");
+        let routable_v6 = addr("[2606:4700::1]:8444");
+
+        for kept in [routable, routable_v6] {
+            assert!(is_routable_peer(&kept), "{kept} is a real internet peer");
+        }
+
+        for dropped in [
+            addr("127.0.0.1:8444"),         // loopback
+            addr("127.0.0.9:8444"),         // the rest of 127.0.0.0/8, all on `lo`
+            addr("[::1]:8444"),             // loopback, v6
+            addr("[::ffff:127.0.0.1]:8444"), // loopback wearing a v6 address
+            addr("0.0.0.0:8444"),           // unspecified
+            addr("[::]:8444"),              // unspecified, v6
+            addr("10.0.0.1:8444"),          // RFC1918
+            addr("192.168.1.5:8444"),       // RFC1918
+            addr("169.254.1.1:8444"),       // link-local
+            addr("[fe80::1]:8444"),         // link-local, v6
+            addr("[fc00::1]:8444"),         // unique-local, v6
+            addr("224.0.0.1:8444"),         // multicast
+            addr("255.255.255.255:8444"),   // broadcast
+        ] {
+            assert!(
+                !is_routable_peer(&dropped),
+                "{dropped} must never be dialled merely because DNS named it"
+            );
+        }
+    }
+
+    /// The filter binds where it matters: on DISCOVERED addresses, never on operator-named ones.
+    /// An operator running a local node is the legitimate loopback case and must keep working.
+    #[test]
+    fn the_filter_applies_to_discovery_and_never_to_operator_configuration() {
+        let poisoned = vec![LOOPBACK, addr("10.0.0.1:8444"), addr("1.2.3.4:8444")];
+
+        assert_eq!(
+            candidate_list(&[], routable_only(poisoned.clone())),
+            vec![addr("1.2.3.4:8444")],
+            "only the routable discovered address survives"
+        );
+        assert_eq!(
+            candidate_list(&[LOOPBACK], routable_only(poisoned)),
+            vec![LOOPBACK, addr("1.2.3.4:8444")],
+            "an operator-named loopback address is still dialled, and still exactly once"
         );
     }
 
