@@ -347,19 +347,19 @@ mod tests {
         }
 
         for dropped in [
-            addr("127.0.0.1:8444"),         // loopback
-            addr("127.0.0.9:8444"),         // the rest of 127.0.0.0/8, all on `lo`
-            addr("[::1]:8444"),             // loopback, v6
+            addr("127.0.0.1:8444"),          // loopback
+            addr("127.0.0.9:8444"),          // the rest of 127.0.0.0/8, all on `lo`
+            addr("[::1]:8444"),              // loopback, v6
             addr("[::ffff:127.0.0.1]:8444"), // loopback wearing a v6 address
-            addr("0.0.0.0:8444"),           // unspecified
-            addr("[::]:8444"),              // unspecified, v6
-            addr("10.0.0.1:8444"),          // RFC1918
-            addr("192.168.1.5:8444"),       // RFC1918
-            addr("169.254.1.1:8444"),       // link-local
-            addr("[fe80::1]:8444"),         // link-local, v6
-            addr("[fc00::1]:8444"),         // unique-local, v6
-            addr("224.0.0.1:8444"),         // multicast
-            addr("255.255.255.255:8444"),   // broadcast
+            addr("0.0.0.0:8444"),            // unspecified
+            addr("[::]:8444"),               // unspecified, v6
+            addr("10.0.0.1:8444"),           // RFC1918
+            addr("192.168.1.5:8444"),        // RFC1918
+            addr("169.254.1.1:8444"),        // link-local
+            addr("[fe80::1]:8444"),          // link-local, v6
+            addr("[fc00::1]:8444"),          // unique-local, v6
+            addr("224.0.0.1:8444"),          // multicast
+            addr("255.255.255.255:8444"),    // broadcast
         ] {
             assert!(
                 !is_routable_peer(&dropped),

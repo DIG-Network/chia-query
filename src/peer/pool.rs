@@ -28,11 +28,11 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chia_protocol::{Bytes32, Message, NewPeakWallet, ProtocolMessageTypes};
 use chia_traits::Streamable;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use chia_wallet_sdk::client::Peer;
 use tokio_tungstenite::Connector;
@@ -109,6 +109,73 @@ impl PeerDialer<Peer> for NetworkDialer {
 }
 
 // ---------------------------------------------------------------------------
+// Address-source seam
+// ---------------------------------------------------------------------------
+
+/// The future returned by [`AddressSource::discover`].
+pub type DiscoverFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, ChiaQueryError>> + Send>>;
+
+/// Where the pool's discovered candidate addresses come from.
+///
+/// Behind a trait so the pool's own seeding path — composition of trusted with discovered, the
+/// resolve-once cache, and the retry after a failure — is reachable offline. Those are the parts
+/// no fixed address list can exercise, and the parts a wrong answer is most expensive in.
+///
+/// Failure MUST be distinguishable from an empty answer: the pool caches a SUCCESSFUL resolution
+/// for its life and retries a failed one.
+pub trait AddressSource: Send + Sync {
+    /// Resolve peer addresses, or report why not.
+    fn discover(&self) -> DiscoverFuture;
+}
+
+/// The production source: the network's DNS introducers.
+pub struct IntroducerAddresses {
+    network: NetworkType,
+    timeout: Duration,
+}
+
+impl IntroducerAddresses {
+    /// Resolve `network`'s introducers, giving up after `timeout`.
+    pub fn new(network: NetworkType, timeout: Duration) -> Self {
+        Self { network, timeout }
+    }
+}
+
+impl AddressSource for IntroducerAddresses {
+    fn discover(&self) -> DiscoverFuture {
+        let (network, timeout) = (self.network, self.timeout);
+        Box::pin(async move { connect::discover_addresses(network, timeout).await })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill cost
+// ---------------------------------------------------------------------------
+
+/// How many addresses one fill dials AT ONCE.
+///
+/// Ten, because that is the batch width introducer resolution already uses
+/// ([`connect`]); a serial sweep at an 8-second connect timeout costs 8 seconds per
+/// unreachable address, and the mainnet introducers currently answer with over a hundred.
+const DIAL_BATCH: usize = 10;
+
+/// The most addresses ONE fill will dial, however long the candidate list is.
+///
+/// Without a cap a host that cannot reach `target` distinct peers re-walks the entire candidate
+/// list on every fill forever, because the pool is permanently under target — the very condition
+/// address-distinct admission creates. Two batches bound the worst case at roughly twice the
+/// connect timeout, and a shortfall is then retried later rather than harder.
+const MAX_DIALS_PER_FILL: usize = 2 * DIAL_BATCH;
+
+/// How long after a fill that fell short before another sweep is worth attempting.
+///
+/// A fill that could not reach `target` just proved the network cannot currently supply it.
+/// Repeating it per request turns every read into a dial sweep and points up to a hundred
+/// outbound handshakes per read at real full nodes, which is behaviour worth being banned for.
+const REFILL_COOLDOWN: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
 // Members
 // ---------------------------------------------------------------------------
 
@@ -167,11 +234,15 @@ pub struct PeerPoolInner<P: Clone> {
     /// Addresses the OPERATOR named, dialled ahead of anything discovered.
     trusted: Vec<SocketAddr>,
     network: NetworkType,
-    connect_timeout: Duration,
-    /// The candidate list, resolved ONCE and then fixed for the pool's life.
+    discovery: Arc<dyn AddressSource>,
+    /// The candidate list, resolved ONCE — on SUCCESS — and then fixed for the pool's life.
     ///
     /// Fixed on purpose: re-resolving per fill would let a resolver that is fast or always-up
     /// reappear at the head of every future list, which is the bias in a slower disguise.
+    ///
+    /// A FAILED resolution is never stored. Caching one would let a single dropped DNS exchange
+    /// at boot — a DHCP or VPN race, a captive portal, an off-path attacker — downgrade the
+    /// client to the one centralized HTTP fallback permanently, with no retry and no TTL.
     addresses: RwLock<Option<Vec<SocketAddr>>>,
     /// Addresses ejected since they were last admitted, deprioritised on the next fill.
     ///
@@ -181,6 +252,13 @@ pub struct PeerPoolInner<P: Clone> {
     /// banned: once the untried candidates are exhausted a second pass reconsiders them, because
     /// a peer that failed earlier may be the only one left.
     ejected: RwLock<HashSet<SocketAddr>>,
+    /// Held for the duration of a [`try_refill`](PeerPoolInner::try_refill) sweep.
+    ///
+    /// Single-flight, not mutual exclusion: a caller that cannot take it returns at once rather
+    /// than queueing, so K concurrent reads over a short pool cost ONE sweep and not K.
+    refilling: Mutex<()>,
+    /// When a fill last ended under `target`, gating the next sweep by [`REFILL_COOLDOWN`].
+    last_short_fill: RwLock<Option<Instant>>,
     dialer: Arc<dyn PeerDialer<P>>,
     /// Highest peak height claimed by ANY member. Kept as a shared `AtomicU32` updated with
     /// `fetch_max` because `router::get_blockchain_state` reads it directly.
@@ -188,17 +266,14 @@ pub struct PeerPoolInner<P: Clone> {
 }
 
 impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
-    /// A pool that dials through `dialer` toward `target` members.
-    ///
-    /// `addresses` pre-seeds the candidate list; `None` means resolve it from DNS introducers on
-    /// the first fill.
+    /// A pool that dials through `dialer` toward `target` members, over addresses from
+    /// `discovery` behind the operator-named `trusted` ones.
     pub fn with_dialer(
         dialer: Arc<dyn PeerDialer<P>>,
+        discovery: Arc<dyn AddressSource>,
         target: usize,
         trusted: Vec<SocketAddr>,
         network: NetworkType,
-        connect_timeout: Duration,
-        addresses: Option<Vec<SocketAddr>>,
     ) -> Self {
         Self {
             members: RwLock::new(Vec::new()),
@@ -206,9 +281,11 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             target,
             trusted,
             network,
-            connect_timeout,
-            addresses: RwLock::new(addresses),
+            discovery,
+            addresses: RwLock::new(None),
             ejected: RwLock::new(HashSet::new()),
+            refilling: Mutex::new(()),
+            last_short_fill: RwLock::new(None),
             dialer,
             peak_height: Arc::new(AtomicU32::new(0)),
         }
@@ -225,8 +302,15 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
 
     /// Every current member, cloned.
     ///
-    /// The way to tell "several peers agree" from "one peer said it several times": members are
-    /// address-distinct by construction, so their [`PeakClaim`]s are independent claims.
+    /// Members are address-distinct by construction, which is what stops one peer being counted
+    /// several times over. Address-distinctness is NECESSARY for independent claims and it is
+    /// NOT SUFFICIENT: one operator can hold several addresses, and seeders list any node that
+    /// answers, so five distinct addresses may be five processes, one process, or one operator.
+    /// The guarantee also assumes an honest dialer — admission keys on the address the pool
+    /// REQUESTED, and [`with_dialer`](Self::with_dialer) lets a caller supply the connection.
+    ///
+    /// So this is the raw evidence a corroborating caller needs, not a quorum. Weighing how
+    /// independent these claims actually are is that caller's job.
     pub async fn peer_members(&self) -> Vec<PeerMember<P>> {
         self.members.read().await.clone()
     }
@@ -273,15 +357,40 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         self.members.read().await.is_empty()
     }
 
-    /// If the pool is under target, dial toward it.
+    /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time, and at most
+    /// one per [`REFILL_COOLDOWN`] after a sweep that fell short.
+    ///
+    /// This is the entry point every request path uses, and both bounds are about the request
+    /// path rather than about correctness. A pool that cannot reach `target` distinct peers is
+    /// under target PERMANENTLY, so an ungated refill re-walks the whole candidate list on every
+    /// read, once per concurrent read. [`fill`](Self::fill) itself stays unguarded: it is the
+    /// bare operation, and its own guarantees must hold under concurrency rather than because
+    /// something upstream serialized it.
     pub async fn try_refill(&self) {
         if self.len().await >= self.target {
             return;
         }
-        self.fill().await;
+        let Ok(_in_flight) = self.refilling.try_lock() else {
+            return;
+        };
+        if let Some(last_short) = *self.last_short_fill.read().await {
+            if last_short.elapsed() < REFILL_COOLDOWN {
+                return;
+            }
+        }
+
+        if self.fill().await < self.target {
+            *self.last_short_fill.write().await = Some(Instant::now());
+        }
     }
 
     /// Dial toward `target`, admitting each address AT MOST ONCE.
+    ///
+    /// Dials in CONCURRENT batches of [`DIAL_BATCH`] and stops after [`MAX_DIALS_PER_FILL`]
+    /// attempts. Batching does not relax distinctness: a batch is drawn only from addresses the
+    /// pool does not already hold, and every admission still passes the re-check under the
+    /// members write lock, which is what makes two batches — or two whole fills — safe to
+    /// overlap.
     ///
     /// Returns the number of members held afterwards. Falling short is ordinary and is reported
     /// by that number rather than by an error: a pool with three members is degraded, not
@@ -305,36 +414,58 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             .iter()
             .copied()
             .partition(|a| !ejected.contains(a));
+        let order: Vec<SocketAddr> = fresh.into_iter().chain(retry).collect();
 
-        for addr in fresh.into_iter().chain(retry) {
-            if held.len() >= self.target {
+        let mut dialled = 0usize;
+        for chunk in order.chunks(DIAL_BATCH) {
+            if held.len() >= self.target || dialled >= MAX_DIALS_PER_FILL {
                 break;
             }
-            if held.contains(&addr) {
+            let batch: Vec<SocketAddr> = chunk
+                .iter()
+                .copied()
+                .filter(|addr| !held.contains(addr))
+                .take(MAX_DIALS_PER_FILL - dialled)
+                .collect();
+            if batch.is_empty() {
                 continue;
             }
-            if self.try_admit(addr, &mut held).await {
-                self.ejected.write().await.remove(&addr);
+            dialled += batch.len();
+
+            let connections = futures_util::future::join_all(
+                batch
+                    .iter()
+                    .map(|addr| async move { (*addr, self.dialer.dial(*addr).await) }),
+            )
+            .await;
+
+            for (addr, outcome) in connections {
+                match outcome {
+                    Ok(connection) => {
+                        if self.try_admit(addr, connection, &mut held).await {
+                            self.ejected.write().await.remove(&addr);
+                        }
+                    }
+                    Err(e) => log::debug!("connect to {addr} failed: {e}"),
+                }
             }
         }
 
         self.len().await
     }
 
-    /// Dial `addr` and admit it if the pool still has room and does not already hold it.
+    /// Admit an already-open connection to `addr`, unless the pool now holds that address or is
+    /// now at target.
     ///
-    /// Returns whether it was admitted. `held` is marked either way: a dialled address is not
-    /// retried within one fill, whatever the outcome.
-    async fn try_admit(&self, addr: SocketAddr, held: &mut HashSet<SocketAddr>) -> bool {
-        let (peer, receiver) = match self.dialer.dial(addr).await {
-            Ok(connection) => connection,
-            Err(e) => {
-                log::debug!("connect to {addr} failed: {e}");
-                return false;
-            }
-        };
-        held.insert(addr);
-
+    /// Returns whether it was admitted, and marks `held` only then: `held` means "members this
+    /// pool holds", so a REFUSED connection must not consume the room the fill loop reads from
+    /// it. What bounds the work instead is the dial count, which is the thing that costs.
+    async fn try_admit(
+        &self,
+        addr: SocketAddr,
+        (peer, receiver): (P, mpsc::Receiver<Message>),
+        held: &mut HashSet<SocketAddr>,
+    ) -> bool {
         let peak = Arc::new(RwLock::new(None));
         {
             let mut members = self.members.write().await;
@@ -353,24 +484,33 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
                 peak: Arc::clone(&peak),
             });
         }
+        held.insert(addr);
         self.spawn_receiver_handler(peak, receiver);
         true
     }
 
-    /// The dial order, resolved once and then reused.
+    /// The dial order: operator-named addresses, then discovered ones — resolved once on
+    /// SUCCESS and reused, re-attempted after a failure.
+    ///
+    /// The asymmetry is the point. A successful resolution is fixed for the pool's life so a
+    /// fast resolver cannot keep reappearing at the head of the list. A FAILED one is not stored
+    /// at all: discovery failing is a transient network condition, and remembering it would
+    /// leave the pool with an empty candidate list forever — no TTL, no invalidation, no retry —
+    /// having permanently traded a peer tier for one centralized HTTP endpoint.
+    ///
+    /// Operator-named addresses are still returned when discovery fails: they need no resolver.
     async fn candidate_addresses(&self) -> Vec<SocketAddr> {
         if let Some(addresses) = self.addresses.read().await.as_ref() {
             return addresses.clone();
         }
 
-        let discovered = connect::discover_addresses(self.network, self.connect_timeout)
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("peer discovery failed: {e}");
-                Vec::new()
-            });
-        let candidates = connect::candidate_list(&self.trusted, discovered);
+        let Ok(discovered) = self.discovery.discover().await.inspect_err(|e| {
+            log::warn!("peer discovery failed, retrying on a later fill: {e}");
+        }) else {
+            return connect::candidate_list(&self.trusted, Vec::new());
+        };
 
+        let candidates = connect::candidate_list(&self.trusted, discovered);
         let mut slot = self.addresses.write().await;
         // A concurrent fill may have resolved first; either list is valid, so keep whichever
         // landed to preserve the resolve-once guarantee.
@@ -432,8 +572,11 @@ impl PeerPool {
         }
 
         let dialer = Arc::new(NetworkDialer::new(network, tls, connect_timeout));
-        let pool = Self::with_dialer(dialer, max_peers, trusted, network, connect_timeout, None);
-        pool.fill().await;
+        let discovery = Arc::new(IntroducerAddresses::new(network, connect_timeout));
+        let pool = Self::with_dialer(dialer, discovery, max_peers, trusted, network);
+        // Through `try_refill` rather than `fill` so a construction that falls short arms the
+        // cooldown, and the first request does not immediately repeat the sweep that just failed.
+        pool.try_refill().await;
 
         if pool.is_empty().await {
             if requirement == PeerRequirement::Required {

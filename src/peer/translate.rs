@@ -305,7 +305,10 @@ mod tests {
         let stale = header_block_at(100, 0xAB);
 
         // Unguarded, both members would yield this identical hash at height 900 000.
-        assert_eq!(stale.header_hash(), header_block_at(100, 0xAB).header_hash());
+        assert_eq!(
+            stale.header_hash(),
+            header_block_at(100, 0xAB).header_hash()
+        );
 
         assert_eq!(header_hash_at_height(&stale, 900_000), None);
     }

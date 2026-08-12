@@ -4,6 +4,7 @@ pub mod pool;
 pub mod translate;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chia_consensus::consensus_constants::ConsensusConstants;
@@ -27,7 +28,7 @@ pub use pool::{PeakClaim, PeerDialer, PeerMember, PeerRequirement};
 // ---------------------------------------------------------------------------
 
 pub struct PeerBackend {
-    pool: PeerPool,
+    pool: Arc<PeerPool>,
     network: NetworkType,
     request_timeout: Duration,
 }
@@ -52,7 +53,7 @@ impl PeerBackend {
         )
         .await?;
         Ok(Self {
-            pool,
+            pool: Arc::new(pool),
             network,
             request_timeout,
         })
@@ -81,10 +82,22 @@ impl PeerBackend {
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------
 
+    /// A peer to serve this request with, refilling the pool if it must.
+    ///
+    /// A fill is a bounded but real sweep of outbound TLS dials, so where it sits relative to
+    /// selection decides what a read costs. With a usable member in hand the sweep buys
+    /// DIVERSITY, which the caller waiting on a read does not need right now — so it runs behind
+    /// the answer. With nothing to serve it buys AVAILABILITY and is the only thing that can
+    /// help, so it runs in front. `try_refill` is single-flight and cooldown-gated either way,
+    /// which is what keeps the detached case from accumulating sweeps.
     async fn pick(&self) -> Result<(Peer, SocketAddr), ChiaQueryError> {
-        // Attempt a background refill if under capacity.
-        self.pool.try_refill().await;
+        if let Some(picked) = self.pool.select_peer().await {
+            let pool = Arc::clone(&self.pool);
+            tokio::spawn(async move { pool.try_refill().await });
+            return Ok(picked);
+        }
 
+        self.pool.try_refill().await;
         self.pool
             .select_peer()
             .await
@@ -485,8 +498,12 @@ impl PeerBackend {
         self.pool.peak_height()
     }
 
-    /// Every held peer and its own peak claim. Members are address-distinct, so these are
-    /// independent claims rather than one peer counted repeatedly (dig_ecosystem#2648).
+    /// Every held peer and its own peak claim.
+    ///
+    /// Members are address-distinct, so no single peer is counted repeatedly
+    /// (dig_ecosystem#2648). That is NECESSARY for these to be independent claims and it is NOT
+    /// SUFFICIENT — several addresses can be one process or one operator, and seeders list any
+    /// node that answers. Weigh independence here; do not assume it from the count.
     pub async fn peer_members(&self) -> Vec<PeerMember<Peer>> {
         self.pool.peer_members().await
     }

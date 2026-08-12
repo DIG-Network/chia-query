@@ -9,6 +9,7 @@
 
 use super::*;
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
 use chia_protocol::Bytes32;
@@ -24,11 +25,60 @@ struct FakePeer {
     addr: SocketAddr,
 }
 
+/// A candidate source that answers with a fixed list, counting how often it was asked.
+///
+/// The count is what makes the resolve-once guarantee observable: "the list did not change"
+/// is satisfied by a pool that re-resolves and happens to get the same answer.
+struct FixedAddresses {
+    /// One answer per call, the last repeating thereafter. `None` is a discovery FAILURE, which
+    /// the pool must treat differently from an empty success.
+    answers: Mutex<Vec<Option<Vec<SocketAddr>>>>,
+    calls: AtomicUsize,
+}
+
+impl FixedAddresses {
+    /// Answers `addrs` every time it is asked.
+    fn always(addrs: &[SocketAddr]) -> Arc<Self> {
+        Self::in_turn(vec![Some(addrs.to_vec())])
+    }
+
+    /// Answers each of `answers` in turn, repeating the last one thereafter.
+    fn in_turn(answers: Vec<Option<Vec<SocketAddr>>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(answers),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl AddressSource for FixedAddresses {
+    fn discover(&self) -> DiscoverFuture {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let mut answers = self.answers.lock().expect("answers are not poisoned");
+        let answer = if answers.len() > 1 {
+            answers.remove(0)
+        } else {
+            answers[0].clone()
+        };
+        Box::pin(async move { answer.ok_or(ChiaQueryError::PeerDiscoveryFailed) })
+    }
+}
+
 /// A dialer that answers only for addresses in its book, and records every connection it
 /// handed out — including the ones the pool went on to reject.
 struct FakeDialer {
     /// Addresses that answer. Anything else fails to connect.
     reachable: HashSet<SocketAddr>,
+    /// EVERY dial the pool asked for, in order, reachable or not.
+    ///
+    /// Attempts rather than successes, because what needs bounding is the work a fill does:
+    /// a count of successes cannot tell a fill that swept a hundred unreachable addresses from
+    /// one that stopped after the first.
+    attempted: Mutex<Vec<SocketAddr>>,
     /// Every dial that succeeded, in order, with the sender for that connection.
     handed_out: Mutex<Vec<(SocketAddr, mpsc::Sender<Message>)>>,
     /// Holds dials to this address until two of them have arrived.
@@ -43,6 +93,7 @@ impl FakeDialer {
     fn reaching(addrs: &[SocketAddr]) -> Arc<Self> {
         Arc::new(Self {
             reachable: addrs.iter().copied().collect(),
+            attempted: Mutex::new(Vec::new()),
             handed_out: Mutex::new(Vec::new()),
             contended: None,
         })
@@ -52,9 +103,25 @@ impl FakeDialer {
     fn reaching_with_contention(addrs: &[SocketAddr], addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             reachable: addrs.iter().copied().collect(),
+            attempted: Mutex::new(Vec::new()),
             handed_out: Mutex::new(Vec::new()),
             contended: Some((addr, Arc::new(tokio::sync::Barrier::new(2)))),
         })
+    }
+
+    /// Every address the pool asked for, in dial order.
+    fn attempts(&self) -> Vec<SocketAddr> {
+        self.attempted
+            .lock()
+            .expect("dial log is not poisoned")
+            .clone()
+    }
+
+    fn attempt_count(&self) -> usize {
+        self.attempted
+            .lock()
+            .expect("dial log is not poisoned")
+            .len()
     }
 
     /// The senders handed out for `addr`, in dial order.
@@ -68,7 +135,8 @@ impl FakeDialer {
             .collect()
     }
 
-    fn dial_count(&self) -> usize {
+    /// Dials that CONNECTED. See [`attempt_count`](Self::attempt_count) for dials made.
+    fn connected_count(&self) -> usize {
         self.handed_out
             .lock()
             .expect("dial log is not poisoned")
@@ -78,6 +146,10 @@ impl FakeDialer {
 
 impl PeerDialer<FakePeer> for FakeDialer {
     fn dial(&self, addr: SocketAddr) -> DialFuture<FakePeer> {
+        self.attempted
+            .lock()
+            .expect("dial log is not poisoned")
+            .push(addr);
         if !self.reachable.contains(&addr) {
             return Box::pin(async move {
                 Err(ChiaQueryError::PeerConnection(format!(
@@ -115,22 +187,37 @@ fn book(count: u8) -> Vec<SocketAddr> {
     (1..=count).map(addr).collect()
 }
 
-/// A pool over `candidates`, reaching everything in `reachable`.
+/// A pool discovering `candidates`, reaching everything in `reachable`.
 fn pool_over(
     candidates: Vec<SocketAddr>,
     reachable: &[SocketAddr],
     target: usize,
 ) -> (PeerPoolInner<FakePeer>, Arc<FakeDialer>) {
     let dialer = FakeDialer::reaching(reachable);
-    let pool = PeerPoolInner::with_dialer(
-        Arc::clone(&dialer) as Arc<dyn PeerDialer<FakePeer>>,
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&candidates),
         target,
         Vec::new(),
-        NetworkType::Mainnet,
-        Duration::from_millis(1),
-        Some(candidates),
     );
     (pool, dialer)
+}
+
+/// A pool over an explicit dialer, address source and trusted list — the full production
+/// seeding path, with only the network at its edges replaced.
+fn pool_with(
+    dialer: Arc<FakeDialer>,
+    discovery: Arc<FixedAddresses>,
+    target: usize,
+    trusted: Vec<SocketAddr>,
+) -> PeerPoolInner<FakePeer> {
+    PeerPoolInner::with_dialer(
+        dialer as Arc<dyn PeerDialer<FakePeer>>,
+        discovery as Arc<dyn AddressSource>,
+        target,
+        trusted,
+        NetworkType::Mainnet,
+    )
 }
 
 async fn held_addresses(pool: &PeerPoolInner<FakePeer>) -> Vec<SocketAddr> {
@@ -183,17 +270,22 @@ where
 // Admission
 // ---------------------------------------------------------------------------
 
-/// #2648, the core defect: one address offered for every slot fills exactly ONE.
+/// #2648, the core defect: one address offered for every slot fills exactly ONE, and is dialled
+/// exactly once.
 ///
 /// Before the fix, five independent `connect_random_peer` calls each returned the one address
 /// that answered and the pool pushed all five unconditionally.
 #[tokio::test]
 async fn one_address_offered_repeatedly_yields_one_member() {
     let squatter = addr(1);
-    let (pool, _dialer) = pool_over(vec![squatter; 5], &[squatter], 5);
+    let (pool, dialer) = pool_over(vec![squatter; 5], &[squatter], 5);
 
     assert_eq!(pool.fill().await, 1);
     assert_eq!(held_addresses(&pool).await, vec![squatter]);
+    // The dial count is the discriminating half. Holding one member is also what a pool that
+    // dialled the squatter five times and refused four would report, and those differ in the
+    // work done and in how a real full node sees this client.
+    assert_eq!(dialer.attempts(), vec![squatter]);
 }
 
 /// The same collapse in its realistic shape: the candidate list is full of real peers, but only
@@ -205,12 +297,62 @@ async fn a_single_reachable_address_cannot_occupy_more_than_one_slot() {
 
     assert_eq!(pool.fill().await, 1);
     assert_eq!(held_addresses(&pool).await, vec![squatter]);
-    // Every other candidate was genuinely attempted, so the shortfall is the network's, not a
-    // premature stop.
+    assert_eq!(dialer.connected_count(), 1, "only the squatter connects");
+    // The shortfall is the network's and not a premature stop: every one of the eight
+    // candidates was genuinely attempted. `connected_count` alone cannot say this — a fill that
+    // broke out after its first success produces exactly the same 1.
+    assert_eq!(dialer.attempt_count(), 8, "every candidate was attempted");
+}
+
+/// A held address is skipped BEFORE it is dialled, not dialled and then refused.
+///
+/// Anchors the pre-dial skip specifically. The write-lock re-check would keep the member set
+/// distinct without it, so the realized membership cannot tell the two apart — what can is the
+/// wasted connection: to a real full node an unnecessary redial is an unexplained second
+/// handshake from a client that already holds an open session.
+#[tokio::test]
+async fn an_address_the_pool_already_holds_is_never_dialled_again() {
+    let reachable = book(3);
+    let (pool, dialer) = pool_over(reachable.clone(), &reachable[..1], 3);
+
+    assert_eq!(pool.fill().await, 1, "only the first address answers");
     assert_eq!(
-        dialer.dial_count(),
-        1,
-        "only the reachable address connects"
+        dialer.attempts(),
+        reachable,
+        "the first fill tried all three"
+    );
+
+    // A second fill over the same list: the pool is still under target, so it sweeps again —
+    // and must leave the address it already holds alone.
+    assert_eq!(pool.fill().await, 1);
+    let second_sweep = &dialer.attempts()[reachable.len()..];
+    assert!(
+        !second_sweep.contains(&reachable[0]),
+        "the held address was re-dialled: {second_sweep:?}"
+    );
+    assert_eq!(
+        second_sweep,
+        &reachable[1..],
+        "the untried ones were retried"
+    );
+}
+
+/// A fill stops at `target` and does not overshoot it, even when more addresses answer.
+///
+/// Anchors the count ceiling on its own. Distinctness is satisfied by an overshooting pool
+/// too — six distinct members is still six distinct addresses — so only the size can see this.
+#[tokio::test]
+async fn a_fill_admits_no_more_members_than_the_target() {
+    let reachable = book(10);
+    let (pool, dialer) = pool_over(reachable.clone(), &reachable, 3);
+
+    assert_eq!(pool.fill().await, 3);
+    assert_eq!(held_addresses(&pool).await.len(), 3);
+    // Dialling happens a batch at a time, so more connections may be opened than there is room
+    // for; what must not happen is admitting them. The surplus is refused and dropped.
+    assert!(
+        dialer.connected_count() >= 3,
+        "the fixture must produce surplus connections for the ceiling to refuse"
     );
 }
 
@@ -247,25 +389,31 @@ async fn pool_refills_to_target_after_a_member_is_evicted() {
     );
 }
 
-/// Two fills racing over the same book: the write-lock re-check is what keeps the realized set
-/// distinct.
+/// Two fills racing over the same book: the ADDRESS half of the write-lock re-check is what
+/// keeps the realized set distinct.
 ///
-/// The contention gate is essential rather than decorative. Without it the first fill runs to
-/// completion before the second is ever polled — every dial resolves immediately — so the two
-/// fills never overlap and the test cannot see a duplicate even with every guard removed. It
-/// was written that way first, and passed against deliberately broken code.
+/// Two fixture choices are load-bearing, and each was arrived at by watching this test pass
+/// against deliberately broken code.
+///
+/// The contention gate is the first. Without it the winning fill runs to completion before the
+/// loser is ever polled — every dial resolves immediately — so the two never overlap and no
+/// duplicate can arise however many guards are removed.
+///
+/// The TARGET EXCEEDING THE BOOK is the second, and it is the subtler one. With `target = 5`
+/// over six addresses the loser is refused by `members.len() >= target` — the COUNT ceiling —
+/// before the address comparison is ever reached, so the nearest wrong implementation (a
+/// target-only re-check) satisfies the assertion identically. `target = 9` over six reachable
+/// addresses makes the ceiling unreachable, leaving the address check as the only guard under
+/// test. Do NOT tidy the target back down to the size of the book.
+///
+/// Both conjuncts of that re-check are separately necessary and both must survive: the count
+/// ceiling is what stops a racing fill overshooting, and is anchored by
+/// [`a_fill_admits_no_more_members_than_the_target`].
 #[tokio::test]
 async fn concurrent_fills_cannot_admit_the_same_address_twice() {
     let reachable = book(6);
     let dialer = FakeDialer::reaching_with_contention(&reachable, reachable[0]);
-    let pool = PeerPoolInner::with_dialer(
-        Arc::clone(&dialer) as Arc<dyn PeerDialer<FakePeer>>,
-        5,
-        Vec::new(),
-        NetworkType::Mainnet,
-        Duration::from_millis(1),
-        Some(reachable.clone()),
-    );
+    let pool = pool_with(dialer, FixedAddresses::always(&reachable), 9, Vec::new());
 
     let (a, b) = tokio::join!(pool.fill(), pool.fill());
 
@@ -275,8 +423,11 @@ async fn concurrent_fills_cannot_admit_the_same_address_twice() {
         held.len(),
         "concurrent fills admitted a duplicate: {held:?}"
     );
-    assert!(held.len() <= 5, "pool overshot its target: {held:?}");
-    assert!(a <= 5 && b <= 5);
+    assert!(
+        held.len() <= reachable.len(),
+        "the pool holds more members than there are reachable addresses: {held:?}"
+    );
+    assert!(a <= reachable.len() && b <= reachable.len());
 }
 
 /// The drop-on-rejection, and the only test that can see it.
@@ -292,13 +443,11 @@ async fn a_rejected_duplicate_never_feeds_the_shared_peak() {
     // connection is genuinely opened and then REFUSED at the write-lock re-check. The honest
     // peer is the control: the pool is not simply inert.
     let dialer = FakeDialer::reaching_with_contention(&[squatter, honest], squatter);
-    let pool = PeerPoolInner::with_dialer(
-        Arc::clone(&dialer) as Arc<dyn PeerDialer<FakePeer>>,
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&[squatter, honest]),
         3,
         Vec::new(),
-        NetworkType::Mainnet,
-        Duration::from_millis(1),
-        Some(vec![squatter, honest]),
     );
 
     tokio::join!(pool.fill(), pool.fill());
@@ -349,6 +498,201 @@ async fn a_rejected_duplicate_never_feeds_the_shared_peak() {
 
     // And the shared peak still reflects only the admitted peer.
     assert_eq!(pool.peak_height(), 100);
+}
+
+// ---------------------------------------------------------------------------
+// Seeding: discovery, trusted addresses, and what is cached
+// ---------------------------------------------------------------------------
+
+/// A FAILED discovery is never cached, so a dropped DNS exchange costs one fill and not the
+/// process's life.
+///
+/// The failure is deliberately transient and the source then answers normally — an
+/// always-failing source could not tell "not cached" from "cached and empty", because both look
+/// like an empty pool forever. The retry succeeding is the whole observation.
+#[tokio::test]
+async fn a_failed_discovery_is_retried_rather_than_cached() {
+    let reachable = book(3);
+    let dialer = FakeDialer::reaching(&reachable);
+    let discovery = FixedAddresses::in_turn(vec![None, Some(reachable.clone())]);
+    let pool = pool_with(Arc::clone(&dialer), Arc::clone(&discovery), 3, Vec::new());
+
+    assert_eq!(pool.fill().await, 0, "nothing resolved, so nothing is held");
+    assert_eq!(dialer.attempt_count(), 0, "and nothing was dialled");
+
+    assert_eq!(pool.fill().await, 3, "the next fill resolves and fills");
+    assert_eq!(
+        discovery.call_count(),
+        2,
+        "discovery was asked a second time"
+    );
+}
+
+/// A SUCCESSFUL resolution is fixed for the pool's life.
+///
+/// Re-resolving per fill would let a resolver that is fast or always up reappear at the head of
+/// every subsequent list. The call count is the discriminating assertion: a pool that
+/// re-resolved and got the same answer would hold the same members.
+#[tokio::test]
+async fn a_successful_resolution_is_not_repeated_on_a_later_fill() {
+    let reachable = book(3);
+    let dialer = FakeDialer::reaching(&reachable[..1]);
+    let discovery = FixedAddresses::always(&reachable);
+    let pool = pool_with(Arc::clone(&dialer), Arc::clone(&discovery), 3, Vec::new());
+
+    assert_eq!(pool.fill().await, 1);
+    assert_eq!(
+        pool.fill().await,
+        1,
+        "still under target, so it fills again"
+    );
+    assert_eq!(
+        discovery.call_count(),
+        1,
+        "the candidate list is resolved once and then fixed"
+    );
+}
+
+/// Operator-named addresses reach the pool through the REAL seeding path, ahead of discovery,
+/// and occupy at most one slot even when discovery names them too.
+///
+/// This is the claim the crate makes about a configured local node, and until now no test
+/// reached the composition that has to hold it up: an operator who configures a node and
+/// silently gets zero peers would not have been caught.
+#[tokio::test]
+async fn a_trusted_address_is_dialled_first_and_occupies_one_slot() {
+    let configured = addr(1);
+    let discovered = vec![configured, addr(2), addr(3)];
+    let dialer = FakeDialer::reaching(&discovered);
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&discovered),
+        3,
+        vec![configured],
+    );
+
+    assert_eq!(pool.fill().await, 3);
+    assert_eq!(
+        dialer.attempts().first(),
+        Some(&configured),
+        "the operator's address is dialled before anything discovered"
+    );
+    assert_eq!(
+        dialer
+            .attempts()
+            .iter()
+            .filter(|a| **a == configured)
+            .count(),
+        1,
+        "and offered twice - by configuration and by discovery - it is still dialled once"
+    );
+    assert_eq!(
+        held_addresses(&pool)
+            .await
+            .iter()
+            .filter(|a| **a == configured)
+            .count(),
+        1,
+        "and occupies exactly one slot"
+    );
+}
+
+/// The pool's own seeding path is the one production uses: nothing pre-seeds the candidate
+/// list, so discovery is genuinely consulted.
+///
+/// Without this, a pool that never asked its address source would look identical to one that
+/// did — which is how the trusted/discovered composition went untested.
+#[tokio::test]
+async fn a_fill_consults_the_address_source() {
+    let reachable = book(2);
+    let discovery = FixedAddresses::always(&reachable);
+    let pool = pool_with(
+        FakeDialer::reaching(&reachable),
+        Arc::clone(&discovery),
+        2,
+        Vec::new(),
+    );
+
+    assert_eq!(discovery.call_count(), 0, "not before it is needed");
+    assert_eq!(pool.fill().await, 2);
+    assert_eq!(discovery.call_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// What a fill costs
+// ---------------------------------------------------------------------------
+
+/// One fill dials a BOUNDED number of addresses, however long the candidate list is.
+///
+/// The candidate list is 60 here because the mainnet introducers currently answer with over a
+/// hundred addresses; a serial unbounded sweep at the 8-second default connect timeout is over
+/// sixteen minutes of dials, paid on construction and again on every read that finds the pool
+/// short. Address-distinct admission is what makes that permanent: a host that cannot reach
+/// `target` DISTINCT peers is under target forever, where the duplicate-admitting pool this PR
+/// replaces was satisfied by one reachable peer and stopped sweeping.
+///
+/// Nothing is reachable on purpose — that is the case where the cap has to hold, and the one
+/// where an early success cannot hide the sweep's real length.
+#[tokio::test]
+async fn one_fill_dials_a_bounded_number_of_addresses() {
+    let candidates = book(60);
+    let (pool, dialer) = pool_over(candidates.clone(), &[], 5);
+
+    assert_eq!(pool.fill().await, 0);
+    assert!(
+        dialer.attempt_count() <= MAX_DIALS_PER_FILL,
+        "one fill dialled {} of {} candidates, past the {MAX_DIALS_PER_FILL} cap",
+        dialer.attempt_count(),
+        candidates.len()
+    );
+    assert_eq!(
+        dialer.attempt_count(),
+        MAX_DIALS_PER_FILL,
+        "and it does spend its whole budget rather than stopping early"
+    );
+}
+
+/// Concurrent requests over a short pool cost ONE sweep, not one per request.
+///
+/// Without single-flight, K concurrent reads run K independent sweeps — up to K times the dial
+/// cap in outbound handshakes from one client, which real full nodes rate-limit and ban source
+/// IPs for. The two-address book keeps the pool permanently short so every caller qualifies to
+/// sweep, which is the condition under which this goes wrong.
+#[tokio::test]
+async fn concurrent_refills_over_a_short_pool_sweep_once() {
+    let candidates = book(30);
+    let (pool, dialer) = pool_over(candidates, &[], 5);
+
+    let refills = (0..8).map(|_| pool.try_refill());
+    futures_util::future::join_all(refills).await;
+
+    assert!(
+        dialer.attempt_count() <= MAX_DIALS_PER_FILL,
+        "eight concurrent refills ran more than one sweep: {} dials",
+        dialer.attempt_count()
+    );
+}
+
+/// A refill that fell short is not repeated on the very next request.
+///
+/// A pool that cannot reach `target` has just demonstrated the network cannot currently supply
+/// it. Retrying per request puts the dial cap in front of every single read.
+#[tokio::test]
+async fn a_refill_that_fell_short_is_not_immediately_repeated() {
+    let reachable = book(1);
+    let (pool, dialer) = pool_over(book(30), &reachable, 5);
+
+    pool.try_refill().await;
+    let after_first = dialer.attempt_count();
+    assert!(after_first > 0, "the first refill did sweep");
+    assert_eq!(pool.len().await, 1, "and fell short of the target");
+
+    pool.try_refill().await;
+    assert_eq!(
+        dialer.attempt_count(),
+        after_first,
+        "the second refill swept again inside the cooldown"
+    );
 }
 
 // ---------------------------------------------------------------------------
