@@ -237,7 +237,17 @@ pub async fn discover_addresses(
         NetworkType::Testnet11 => Network::default_testnet11(),
     };
 
-    let mut addrs = routable_only(net.lookup_all(timeout, BATCH_SIZE).await);
+    finish_discovery(net.lookup_all(timeout, BATCH_SIZE).await)
+}
+
+/// Everything [`discover_addresses`] does to a resolved list, split out so all of it is reachable
+/// without a resolver.
+///
+/// The network call is the one line of that function a test cannot execute, so it is the only
+/// line left in it. Filtering, the failed-resolution error and de-duplication are decisions, and
+/// a decision that only ever runs against real DNS is a decision no test protects.
+fn finish_discovery(resolved: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, ChiaQueryError> {
+    let mut addrs = routable_only(resolved);
     if addrs.is_empty() {
         return Err(ChiaQueryError::PeerDiscoveryFailed);
     }
@@ -539,6 +549,40 @@ mod tests {
             vec![addr("10.0.0.9:8444")],
             "a private address an operator named is kept; the same address discovered is not"
         );
+    }
+
+    /// The PUBLIC resolver filters too, and a resolution that yields nothing dialable is a
+    /// FAILURE rather than an empty success.
+    ///
+    /// This is the seam a consumer building its own pool over this crate calls directly
+    /// (dig-node#213), so it has to be safe by default: handing back an unfiltered list would
+    /// give that consumer the very loopback bias it exists to escape. The distinction between
+    /// failure and emptiness is equally load-bearing — the pool caches a successful resolution
+    /// for its life and retries a failed one, so "resolved only junk" reported as a success
+    /// would disable the peer tier permanently.
+    #[test]
+    fn a_resolution_is_filtered_and_an_unusable_one_is_a_failure() {
+        let real = addr("1.2.3.4:8444");
+        let kept = finish_discovery(vec![
+            addr("127.0.0.1:8444"),
+            real,
+            addr("10.0.0.1:8444"),
+            real,
+        ])
+        .expect("a resolution containing a real peer succeeds");
+        assert_eq!(kept, vec![real], "filtered, and de-duplicated");
+
+        assert!(
+            matches!(
+                finish_discovery(vec![addr("127.0.0.1:8444"), addr("192.168.0.1:8444")]),
+                Err(ChiaQueryError::PeerDiscoveryFailed)
+            ),
+            "a resolution of nothing dialable must not be cacheable as a success"
+        );
+        assert!(matches!(
+            finish_discovery(Vec::new()),
+            Err(ChiaQueryError::PeerDiscoveryFailed)
+        ));
     }
 
     #[test]

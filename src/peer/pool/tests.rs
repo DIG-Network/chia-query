@@ -937,29 +937,45 @@ async fn successive_fills_dial_different_addresses() {
 /// walked once and then abandoned.
 ///
 /// Disjointness alone is satisfied by a cursor that runs off the end and stops dialling alto-
-/// gether, which is a worse failure than the one it replaced. Three fills over a 60-address book
-/// cover it exactly; the fourth must return to the beginning.
+/// gether, which is a worse failure than the one it replaced.
+///
+/// The book is FIFTY, deliberately not a whole number of windows. A candidate list whose length
+/// divides evenly by the budget hides the whole failure: every window then starts at an exact
+/// multiple, so a cursor that merely clamps at the end of the list lands on the head anyway and
+/// looks like it wrapped. At fifty the third window starts at 40 with ten addresses left, so a
+/// window that does not wrap silently shrinks to half a budget — the pool quietly dialling less
+/// than it is allowed to, once per lap, forever. Do NOT round this book up to sixty.
 #[tokio::test]
 async fn the_dial_window_wraps_and_covers_every_candidate() {
-    let candidates = book(60);
+    let candidates = book(50);
     let (pool, dialer) = pool_over(candidates.clone(), &[], 5);
 
+    let mut windows = Vec::new();
+    let mut seen = 0;
     for _ in 0..3 {
         pool.fill().await;
+        windows.push(dialer.attempts()[seen..].to_vec());
+        seen = dialer.attempt_count();
+    }
+
+    for (n, window) in windows.iter().enumerate() {
+        assert_eq!(
+            window.len(),
+            MAX_DIALS_PER_FILL,
+            "fill {n} spent {} of its {MAX_DIALS_PER_FILL}-dial budget",
+            window.len()
+        );
     }
     let swept: HashSet<SocketAddr> = dialer.attempts().into_iter().collect();
     assert_eq!(
         swept.len(),
         candidates.len(),
-        "three fills of twenty must cover a sixty-address book"
+        "three full windows over a fifty-address book must cover all of it"
     );
-
-    let before = dialer.attempt_count();
-    pool.fill().await;
     assert_eq!(
-        dialer.attempts()[before..],
-        candidates[..MAX_DIALS_PER_FILL],
-        "the fourth fill returns to the head of the list"
+        windows[2][10..],
+        candidates[..10],
+        "the window that runs off the end continues at the head rather than shrinking"
     );
 }
 
