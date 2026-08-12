@@ -59,6 +59,28 @@ impl PeerBackend {
         })
     }
 
+    /// A backend over an already-built pool, for tests that need a REAL `PeerBackend` without a
+    /// socket.
+    ///
+    /// `new` resolves introducers and dials, so it cannot appear in a unit test; `pool` is private
+    /// to this module, so `router`'s tests cannot assemble one either. That combination is what
+    /// left `QueryRouter::peer_tier_is_worth_waiting_for` — four lines of pure delegation deciding
+    /// whether every read consults the peer tier — deletable with the suite green. Paired with a
+    /// dialer that only ever fails, this reaches that decision over the production types without
+    /// opening a connection.
+    #[cfg(test)]
+    pub(crate) fn over_pool(
+        pool: Arc<PeerPool>,
+        network: NetworkType,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            pool,
+            network,
+            request_timeout,
+        }
+    }
+
     /// Get the consensus constants for the configured network.
     pub fn constants(&self) -> &ConsensusConstants {
         match self.network {

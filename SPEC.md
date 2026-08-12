@@ -316,17 +316,26 @@ struct PeerMember<P> {
      empty.
    - **DP-3, per address**: at steady state no candidate is dialled more than once per
      cooldown (60s).
-   - **DP-4, aggregate**: sustained outbound dials stay at or under 20 per minute per pool, in
-     every state and across every sequence of transitions between them. A continuously-empty pool
-     MAY burst to at most 120 dials in its first minute and MUST then decay to the sustained rate;
-     a pool at `target` dials nothing.
+   - **DP-4, aggregate**: a pool MUST NOT make more than 120 outbound dials in ANY one minute, in
+     ANY state and across every sequence of transitions between them; and MUST NOT exceed 20 dials
+     per minute averaged over any window longer than 300s. A pool at `target` dials nothing.
+
+     Stated over ANY minute on purpose. "A continuously-empty pool may burst to 120 in its FIRST
+     minute" is the weaker claim an implementation banking a burst does not satisfy: quiet time
+     re-earns the bank, so a pool idle at `target` for an hour and then drained spends the full
+     burst in its sixty-first minute — a state a first-minute exemption does not cover.
 
      DP-4 MUST be enforced by charging the dials themselves against an accruing allowance, not by
      the spacing of fills. Interval gating cannot deliver it: a pool churning between a member and
      none re-enters the empty state owing nothing each time round, which measures 6000 dials a
-     minute — fifty times this ceiling — under an interval-only policy. The allowance MUST permit
-     a bounded burst to be banked while the pool is quiet, so that a pool recovering from a
-     transient outage may spend hard once.
+     minute — fifty times this ceiling — under an interval-only policy. The allowance MUST cap what
+     quiet time can bank; an uncapped accrual measures 1309 dials in one minute after an idle hour.
+
+   DP-1 and DP-2 bound ONE fill each, so an implementation MUST NOT expose an ungated fill entry
+   point outside the pool: a caller invoking the fill directly runs unboundedly many concurrent
+   fills past the single-flight lock, and only DP-4 survives that. Measured from outside the crate,
+   50 concurrent direct fills held 50 in flight and 100 dials open, against stated bounds of 1
+   and 10.
 6. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
    member. With a member in hand a sweep buys diversity, which the waiting request does not need.
 

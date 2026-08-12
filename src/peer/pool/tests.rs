@@ -1335,6 +1335,53 @@ async fn churn_between_admission_and_ejection_cannot_outrun_the_dial_ceiling() {
     );
 }
 
+/// Quiet time cannot bank an UNBOUNDED allowance — the burst cap is what makes DP-4 a ceiling.
+///
+/// Without `.min(DIAL_COST * DIAL_BURST)` credit accrues forever while the pool is healthy, and a
+/// pool that sits at target overnight can spend the whole night's accrual the moment it drains.
+/// Measured: **1309 dials in one minute** after a single idle hour, eleven times the ceiling, with
+/// every other DP-4 test green — because they all start from a young or continuously-busy pool and
+/// none of them ever banks more than the cap would have allowed.
+///
+/// The idle period MUST exceed `DIAL_COST * DIAL_BURST` (300s), and an hour is chosen to be
+/// unmistakably past it. A shorter one is the silent, permissive failure of this test: below the
+/// cap, capped and uncapped accrual are indistinguishable and it passes against both.
+#[tokio::test(start_paused = true)]
+async fn a_long_quiet_period_cannot_bank_more_than_the_burst() {
+    let reachable = book(60);
+    let (pool, dialer) = pool_over(book(60), &reachable, 5);
+
+    pool.try_refill().await;
+    let after_fill = dialer.attempt_count();
+    assert_eq!(pool.len().await, 5, "the pool starts healthy, at target");
+
+    tokio::time::advance(Duration::from_secs(3600)).await;
+
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < Duration::from_secs(60) {
+        for member in pool.peer_members().await {
+            pool.eject_peer(member.addr).await;
+        }
+        pool.try_refill().await;
+        tokio::time::advance(step).await;
+        elapsed += step;
+    }
+
+    let dials = dialer.attempt_count() - after_fill;
+    assert!(
+        dials <= 6 * MAX_DIALS_PER_FILL,
+        "DP-4: {dials} dials in the minute after an idle hour, ceiling {} — quiet time is \
+         banking an unbounded allowance",
+        6 * MAX_DIALS_PER_FILL
+    );
+    assert!(
+        dials >= 5 * MAX_DIALS_PER_FILL,
+        "DP-4: only {dials} dials after an idle hour; a pool that has been quiet must be allowed \
+         to spend its banked burst to recover"
+    );
+}
+
 /// DP-4's two numbers are DP-1's budget in disguise, and only hold together.
 ///
 /// The ceiling tests measure the composition, which passes for any self-consistent set of wrong

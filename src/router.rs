@@ -860,6 +860,8 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     /// A source that records that it was ASKED, distinct from what it answered.
     ///
@@ -964,6 +966,133 @@ mod tests {
                 self.refills.load(Ordering::Relaxed),
             )
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The router's OWN wiring of the decision, over a real PeerBackend
+    // -----------------------------------------------------------------------
+    //
+    // The tests below this block exercise `should_wait_for_peer_tier` directly, which proves the
+    // DECISION but not the four lines that feed it from the router's own fields — those stayed
+    // deletable with the suite green. These reach `QueryRouter::peer_tier_is_worth_waiting_for`
+    // itself, over a genuine `PeerBackend` and a genuine `PeerPoolInner<Peer>`, with only the
+    // dialer replaced. A dialer that only ever FAILS never has to produce a `chia_wallet_sdk`
+    // `Peer`, which is what makes a socket-free router possible at all; the price is that the
+    // pool is always empty here, so the peer-present branch stays with the direct tests.
+
+    /// A dialer that fails every dial, recording that it was asked.
+    ///
+    /// Recording the ATTEMPT is the whole point: "the detached refill was started" is invisible in
+    /// the return value, and a refill that starts and then fails to connect is indistinguishable
+    /// from a successful one as far as this decision is concerned.
+    struct FailingDialer(Arc<AtomicUsize>);
+
+    impl crate::peer::pool::PeerDialer<chia_wallet_sdk::client::Peer> for FailingDialer {
+        fn dial(
+            &self,
+            addr: std::net::SocketAddr,
+        ) -> crate::peer::pool::DialFuture<chia_wallet_sdk::client::Peer> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Err(ChiaQueryError::PeerConnection(format!(
+                    "{addr} unreachable"
+                )))
+            })
+        }
+    }
+
+    /// One routable candidate, so a refill that starts has something to dial at.
+    struct OneCandidate;
+
+    impl crate::peer::pool::AddressSource for OneCandidate {
+        fn discover(&self) -> crate::peer::pool::DiscoverFuture {
+            Box::pin(async {
+                Ok(vec!["1.2.3.4:8444"
+                    .parse()
+                    .expect("a valid socket address")])
+            })
+        }
+    }
+
+    /// A router whose peer pool is real, empty, and reachable only through a failing dialer.
+    fn router_over_an_empty_pool(
+        coinset_fallback_enabled: bool,
+    ) -> (QueryRouter, Arc<AtomicUsize>) {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let pool = crate::peer::pool::PeerPoolInner::with_dialer(
+            Arc::new(FailingDialer(Arc::clone(&dials))),
+            Arc::new(OneCandidate),
+            5,
+            Vec::new(),
+            crate::NetworkType::Mainnet,
+        );
+        let router = QueryRouter {
+            peer: PeerBackend::over_pool(
+                Arc::new(pool),
+                crate::NetworkType::Mainnet,
+                Duration::from_secs(5),
+            ),
+            // Never issued: the decision under test does not reach the fallback. The address is
+            // deliberately unroutable so a regression that DID issue one fails loudly.
+            coinset: crate::coinset::CoinsetClient::new(
+                "http://127.0.0.1:1",
+                Duration::from_secs(1),
+            )
+            .expect("a client that is never asked for anything"),
+            coinset_fallback_enabled,
+        };
+        (router, dials)
+    }
+
+    /// Let the detached refill's spawned task reach its dial, without an unbounded wait.
+    async fn dials_after_yielding(dials: &AtomicUsize) -> usize {
+        for _ in 0..64 {
+            if dials.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        dials.load(Ordering::Relaxed)
+    }
+
+    /// THE ROUTER decides an empty pool is not worth waiting for, and starts the refill.
+    ///
+    /// The same property as the direct test below, asserted one layer up — through the four lines
+    /// that read the router's own fields. Replacing that method's body with `true` leaves every
+    /// direct test green, which is exactly how the behaviour shipped uncovered.
+    #[tokio::test]
+    async fn the_router_skips_an_empty_peer_tier_when_it_has_a_fallback() {
+        let (router, dials) = router_over_an_empty_pool(true);
+
+        assert!(
+            !router.peer_tier_is_worth_waiting_for().await,
+            "the router waited on a peer tier holding nothing, with a fallback configured"
+        );
+        assert!(
+            dials_after_yielding(&dials).await > 0,
+            "no detached refill was started, so the pool would stay empty and every read would \
+             be served by the fallback for the process's life"
+        );
+    }
+
+    /// THE ROUTER waits on the peer tier when it has nowhere else to ask, and starts no refill
+    /// in front of the read.
+    ///
+    /// Feeding the flag inverted — the nearest wrong wiring — makes this branch report the tier
+    /// unreachable on an empty pool with no fallback, which answers every read with an error.
+    #[tokio::test]
+    async fn the_router_waits_on_an_empty_peer_tier_when_it_has_no_fallback() {
+        let (router, dials) = router_over_an_empty_pool(false);
+
+        assert!(
+            router.peer_tier_is_worth_waiting_for().await,
+            "the router skipped the peer tier for a read that has nowhere else to go"
+        );
+        assert_eq!(
+            dials_after_yielding(&dials).await,
+            0,
+            "a detached refill was started for a read that is about to wait on a fill anyway"
+        );
     }
 
     /// An EMPTY pool with a fallback is NOT worth waiting for — and the refill starts anyway.

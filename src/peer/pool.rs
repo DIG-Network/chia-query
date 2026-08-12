@@ -171,10 +171,18 @@ impl AddressSource for IntroducerAddresses {
 // - **DP-3, per address.** No candidate is dialled more than once per `REFILL_COOLDOWN` at steady
 //   state. This holds by construction once fills are further apart than the time it takes
 //   `dial_cursor` to wrap, and is a consequence of DP-1 and DP-4 rather than a separate check.
-// - **DP-4, aggregate.** Sustained outbound dials stay at or under `MAX_DIALS_PER_FILL` per
-//   minute per pool in every state. A CONTINUOUSLY EMPTY pool may burst to at most six fills —
-//   120 dials — in its first minute, then decays to that steady rate. At target it dials nothing;
-//   short, it is bounded by `REFILL_COOLDOWN`.
+// - **DP-4, aggregate.** At most `DIAL_BURST + MAX_DIALS_PER_FILL` — 120 — dials in ANY one
+//   minute, in ANY state; and at most `MAX_DIALS_PER_FILL` per minute averaged over any window
+//   longer than `DIAL_COST * DIAL_BURST` (300s). At target a pool dials nothing.
+//
+//   Stated over ANY minute and ANY state deliberately, because the earlier wording — "a
+//   continuously-empty pool may burst to 120 in its FIRST minute" — was measurably false of this
+//   code: the bank is re-earned after 300s of quiet, so a pool idle at target for an hour then
+//   drained spends 119 in its SIXTY-FIRST minute, a state that wording granted no exemption to.
+//   DP-1 and DP-2 bound one fill each, so they hold only for callers that go through
+//   [`try_refill`](PeerPoolInner::try_refill); [`fill`](PeerPoolInner::fill) is crate-private for
+//   that reason. DP-4 is the only one of the four that survives an arbitrary caller, because it
+//   is the only one that is not per-fill.
 //
 // DP-4 is the only one of the four that the intervals cannot deliver, and an earlier version of
 // this note claimed the opposite. Both intervals are chosen from the pool's CURRENT state, and
@@ -249,10 +257,16 @@ const DIAL_COST: Duration =
 /// The most dials a pool may save up while it is quiet, and so the most any one minute may spend
 /// above the sustained rate.
 ///
-/// A hundred, which with the three-second cost puts DP-4's first-minute ceiling at 120: the
-/// hundred banked plus the twenty accrued while they are spent. Banking matters because the
-/// expensive states are transient — a boot before the network is up, a drain to empty — and a
-/// pool that had been idle for an hour should be allowed to spend hard to recover, once.
+/// A hundred, which with the three-second cost puts DP-4's any-minute ceiling at 120: the hundred
+/// banked plus the twenty accrued while they are spent. Banking matters because the expensive
+/// states are transient — a boot before the network is up, a drain to empty — and a pool that has
+/// been idle should be allowed to spend hard to recover.
+///
+/// The bank is RE-EARNED, not one-shot: `DIAL_COST * DIAL_BURST` (300s) of quiet refills it, so a
+/// pool that is idle, drained, and idle again may spend it each time. That is the intended
+/// behaviour and the reason DP-4 is stated over ANY minute rather than a first one — a pool idle
+/// at target for an hour and then drained spends the full burst in its sixty-first minute
+/// (`a_long_quiet_period_cannot_bank_more_than_the_burst` holds the ceiling there).
 const DIAL_BURST: u32 = 100;
 
 /// The pool's aggregate dial allowance: DP-4, enforced by counting dials rather than timing fills.
@@ -632,7 +646,14 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
     /// Returns the number of members held afterwards. Falling short is ordinary and is reported
     /// by that number rather than by an error: a pool with three members is degraded, not
     /// broken, and the caller decides what a shortfall means.
-    pub async fn fill(&self) -> usize {
+    ///
+    /// CRATE-PRIVATE, and that is a correctness property rather than tidiness. DP-1 and DP-2 are
+    /// stated as holding "in every state", but they are per-FILL bounds: a consumer calling this
+    /// directly runs as many concurrent fills as it likes, past the single-flight lock that
+    /// `try_refill` owns. Measured from outside the crate, 50 concurrent calls held 50 fills in
+    /// flight and 100 dials open against stated bounds of 1 and 10. Only DP-4 survived that,
+    /// because the budget is the one bound that is not per-fill. `try_refill` is the entry point.
+    pub(crate) async fn fill(&self) -> usize {
         let mut window: Option<Vec<SocketAddr>> = None;
         let mut batch_start = 0;
 
