@@ -68,6 +68,11 @@ impl PeerBackend {
         self.pool.has_peers().await
     }
 
+    /// How many peers this backend HOLDS right now — see [`PeerPool::peer_count`].
+    pub async fn peer_count(&self) -> usize {
+        self.pool.peer_count().await
+    }
+
     // -----------------------------------------------------------------------
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------
