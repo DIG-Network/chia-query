@@ -183,6 +183,14 @@ const MAX_DIALS_PER_FILL: usize = 2 * DIAL_BATCH;
 /// exists to avoid depending on, and waiting cannot improve it.
 const REFILL_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// How long an EMPTY pool waits before trying another in-front refill sweep.
+///
+/// Empty must stay exempt from the one-minute short-pool cooldown, or construction that starts
+/// with zero peers and ejection that drains to zero both black out the peer tier. But ungated
+/// empty retries put a full dial budget in front of every read. A short backoff keeps retries
+/// frequent without paying that full sweep cost twice per read.
+const EMPTY_REFILL_COOLDOWN: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Members
 // ---------------------------------------------------------------------------
@@ -375,8 +383,15 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
     /// Drop the member at `addr`. The freed slot refills on the next
     /// [`try_refill`](Self::try_refill).
     pub async fn eject_peer(&self, addr: SocketAddr) {
-        self.members.write().await.retain(|m| m.addr != addr);
+        let became_empty = {
+            let mut members = self.members.write().await;
+            members.retain(|m| m.addr != addr);
+            members.is_empty()
+        };
         self.ejected.write().await.insert(addr);
+        if became_empty {
+            *self.last_short_fill.write().await = None;
+        }
         log::debug!(
             "peer {addr} ejected from pool; will refill on next request (network={:?})",
             self.network,
@@ -419,11 +434,14 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         let Ok(_in_flight) = self.refilling.try_lock() else {
             return;
         };
-        if !self.is_empty().await {
-            if let Some(last_short) = *self.last_short_fill.read().await {
-                if last_short.elapsed() < REFILL_COOLDOWN {
-                    return;
-                }
+        if let Some(last_short) = *self.last_short_fill.read().await {
+            let cooldown = if self.is_empty().await {
+                EMPTY_REFILL_COOLDOWN
+            } else {
+                REFILL_COOLDOWN
+            };
+            if last_short.elapsed() < cooldown {
+                return;
             }
         }
 

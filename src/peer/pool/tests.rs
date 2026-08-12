@@ -1065,14 +1065,12 @@ async fn a_refill_that_fell_short_is_not_immediately_repeated() {
     );
 }
 
-/// An EMPTY pool may always retry. The cooldown throttles a short pool; it must never black out
-/// a pool that has nothing to serve with.
+/// An EMPTY pool retries far sooner than `REFILL_COOLDOWN`.
 ///
-/// A pool that fell short at construction — a boot before the network is up, a DHCP or VPN race —
-/// holds zero members and arms the cooldown, and an undifferentiated cooldown then refuses to
-/// dial for a full minute while every read is answered by the one centralized HTTP endpoint the
-/// peer tier exists to avoid depending on. Waiting cannot improve an empty pool; only dialling
-/// can. `select_peer` already draws this distinction, and this is the fill side of it.
+/// Empty must not inherit the one-minute short-pool cooldown: a pool that fell short at
+/// construction would otherwise sit at zero peers for a minute. This test names that property
+/// directly: once the empty cooldown has elapsed — while still far short of
+/// `REFILL_COOLDOWN` — another sweep is allowed.
 #[tokio::test]
 async fn an_empty_pool_may_always_retry() {
     let dialer = FakeDialer::reaching(&[]);
@@ -1094,8 +1092,40 @@ async fn an_empty_pool_may_always_retry() {
     pool.try_refill().await;
     assert_eq!(
         dialer.attempt_count(),
+        after_first,
+        "an empty refill retried without waiting out its own cooldown"
+    );
+
+    *pool.last_short_fill.write().await =
+        Some(Instant::now() - EMPTY_REFILL_COOLDOWN - Duration::from_millis(1));
+    pool.try_refill().await;
+    assert_eq!(
+        dialer.attempt_count(),
         2 * MAX_DIALS_PER_FILL,
-        "an empty pool was blacked out by the cooldown"
+        "an empty pool inherited the one-minute short-pool cooldown"
+    );
+}
+
+/// Two immediate empty-pool refill attempts spend one fill budget, not two.
+///
+/// This is the read-path cost bound: an empty pool is filled in front of the answer, and a
+/// host that can reach no peer must not pay a full sweep on both peer attempts of every read.
+#[tokio::test]
+async fn back_to_back_empty_refills_do_not_each_spend_a_full_sweep() {
+    let dialer = FakeDialer::reaching(&[]);
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&book(60)),
+        5,
+        Vec::new(),
+    );
+
+    pool.try_refill().await;
+    pool.try_refill().await;
+    assert_eq!(
+        dialer.attempt_count(),
+        MAX_DIALS_PER_FILL,
+        "two immediate empty-pool refills each spent a full dial budget"
     );
 }
 
