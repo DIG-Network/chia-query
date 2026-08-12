@@ -157,6 +157,21 @@ impl PeerPool {
         !self.entries.read().await.is_empty()
     }
 
+    /// How many peers the pool HOLDS right now.
+    ///
+    /// This is a live count of the connections currently in the pool, not
+    /// [`max_peers`](Self::new)'s target: a pool that is still filling reports what it has, and
+    /// reports the target only once it has reached it. A caller showing this number to a user is
+    /// stating a fact about the machine, so a configured intention must never stand in for it.
+    ///
+    /// A peer is removed by [`eject_peer`](Self::eject_peer), which runs when a request to it
+    /// FAILS. So the count is of peers held and believed usable; a connection that has died
+    /// silently is still counted until something tries to use it. That is the same liveness
+    /// standard [`has_peers`](Self::has_peers) has always answered by, made countable.
+    pub async fn peer_count(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
     /// If the pool is under capacity, try to connect one new peer.
     /// Also spawns a background task to handle its inbound `NewPeakWallet`
     /// messages.
@@ -240,6 +255,33 @@ mod tests {
         let pool = pool_with_no_connection_attempts(PeerRequirement::Optional)
             .await
             .expect("an optional peer pool must construct with zero peers");
+        assert!(!pool.has_peers().await);
+    }
+
+    /// **The count is what is HELD, never what was asked for.**
+    ///
+    /// Built by hand rather than through [`PeerPool::new`] so `max_peers` can be a realistic 5
+    /// while the pool provably holds nothing — the one shape that separates a measurement from a
+    /// configured intention. A `peer_count` that returned `max_peers` would satisfy every
+    /// assertion reachable through the offline constructor, whose `max_peers` is necessarily 0,
+    /// and would then report "5 peers" on a machine holding none.
+    #[tokio::test]
+    async fn an_unfilled_pool_counts_what_it_holds_not_the_target_it_was_given() {
+        let pool = PeerPool {
+            entries: RwLock::new(Vec::new()),
+            next_idx: AtomicUsize::new(0),
+            max_peers: 5,
+            tls: create_generated_tls().expect("generate a TLS identity"),
+            network: NetworkType::Mainnet,
+            connect_timeout: Duration::from_millis(1),
+            peak_height: Arc::new(AtomicU32::new(0)),
+        };
+
+        assert_eq!(
+            pool.peer_count().await,
+            0,
+            "held is 0 while the target is 5"
+        );
         assert!(!pool.has_peers().await);
     }
 }

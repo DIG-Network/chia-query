@@ -297,6 +297,38 @@ mod native_client {
             self.router.peak_height_opt().await
         }
 
+        /// How many Chia full-node peers this client HOLDS right now.
+        ///
+        /// Exposed because a consumer that presents itself as a light client has to be able to
+        /// SAY how many peers it is a client of, and until now the pool's size was observable
+        /// only as the boolean [`has_peers`](peer::PeerBackend::has_peers). A count is not
+        /// derivable from that, and a consumer with no way to read it is left either silent or
+        /// quoting [`ChiaQueryConfig::max_peers`] — an intention presented as a measurement.
+        ///
+        /// It is the LIVE count, never the target: a filling pool reports the smaller number.
+        /// See [`peer::pool::PeerPool::peer_count`] for what "held" means with respect to a peer
+        /// that has died without being used since.
+        pub async fn peer_count(&self) -> usize {
+            self.router.peer.peer_count().await
+        }
+
+        /// The peak height this client's OWN peers have reported, or `None` when they have
+        /// reported none yet.
+        ///
+        /// Distinct from [`peak_height_opt`](Self::peak_height_opt), which answers "what is the
+        /// chain's peak" and consults coinset FIRST — so its figure is a third party's view of
+        /// the chain even on a client holding peers. This one answers "what have MY peers told
+        /// me", which is the only form of the question a light client can demonstrate, and it
+        /// makes no network call at all: the pool tracks it from inbound `NewPeakWallet`
+        /// messages.
+        ///
+        /// `None` is UNKNOWN, never height zero. The pool spells an unobserved peak `0`
+        /// internally, and every block is trivially above zero, so returning it would silently
+        /// satisfy any "is this buried yet" comparison a caller makes.
+        pub async fn peer_peak_height(&self) -> Option<u32> {
+            observed_peak(self.router.peer.peak_height())
+        }
+
         /// The Unix timestamp of the block at `height` (`Ok(None)` when absent), `Err` on failure.
         pub async fn block_timestamp_opt(
             &self,
@@ -553,6 +585,32 @@ mod native_client {
 
                 tokio::time::sleep(poll_interval).await;
             }
+        }
+    }
+
+    /// The pool's peak sentinel as an honest optional height.
+    ///
+    /// Kept as a named pure function rather than inlined, because the rule it encodes — an
+    /// unobserved peak is UNKNOWN and not height zero — is the whole reason
+    /// [`ChiaQuery::peer_peak_height`] returns an `Option`, and inline it is unreachable from a
+    /// test on a machine with no peers.
+    fn observed_peak(raw: u32) -> Option<u32> {
+        (raw != 0).then_some(raw)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::observed_peak;
+
+        /// **An unobserved peak is unknown, never zero.** The pool spells "no peer has told me a
+        /// peak" as `0`, and every block is trivially above zero — so a caller asking "is this
+        /// coin buried yet" against a leaked `0` gets a confident yes about a chain nobody has
+        /// looked at.
+        #[test]
+        fn an_unobserved_peak_is_unknown_and_a_real_height_survives() {
+            assert_eq!(observed_peak(0), None);
+            assert_eq!(observed_peak(1), Some(1));
+            assert_eq!(observed_peak(9_139_211), Some(9_139_211));
         }
     }
 } // mod native_client
