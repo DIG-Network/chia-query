@@ -198,6 +198,8 @@ async fn parity_all() {
         NetworkType::Mainnet,
         tls,
         5,
+        // No trusted peers: this suite must exercise the real network, not a co-resident node.
+        Vec::new(),
         chia_query::peer::PeerRequirement::Required,
         Duration::from_secs(15),
         Duration::from_secs(60),

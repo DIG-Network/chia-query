@@ -107,6 +107,8 @@ async fn generated_identity_is_accepted_by_real_peers() {
         chia_query::NetworkType::Mainnet,
         tls,
         3,
+        // No trusted peers: the point is that a stock install reaches the real network.
+        Vec::new(),
         chia_query::peer::PeerRequirement::Required,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_secs(30),

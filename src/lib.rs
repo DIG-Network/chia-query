@@ -101,6 +101,13 @@ mod native_client {
     pub struct ChiaQueryConfig {
         pub network: NetworkType,
         pub max_peers: usize,
+        /// Peer addresses the OPERATOR trusts, dialled ahead of anything discovered.
+        ///
+        /// Empty by default, and that emptiness is the point: a local full node is reached only
+        /// when somebody named it here (or via `TRUSTED_FULLNODE`), never because a process
+        /// happened to be listening on the peer port (dig_ecosystem#2648). Because pool
+        /// admission is address-distinct, an address listed here occupies AT MOST ONE slot.
+        pub trusted_peers: Vec<std::net::SocketAddr>,
         pub coinset_base_url: String,
         pub coinset_fallback_enabled: bool,
         pub tls_identity: TlsIdentity,
@@ -114,6 +121,7 @@ mod native_client {
             Self {
                 network: NetworkType::Mainnet,
                 max_peers: 5,
+                trusted_peers: Vec::new(),
                 coinset_base_url: "https://api.coinset.org".into(),
                 coinset_fallback_enabled: true,
                 tls_identity: TlsIdentity::Generated,
@@ -163,6 +171,7 @@ mod native_client {
                 cfg.network,
                 tls,
                 cfg.max_peers,
+                cfg.trusted_peers.clone(),
                 peer_requirement,
                 cfg.peer_connect_timeout,
                 cfg.peer_request_timeout,

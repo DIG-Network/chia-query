@@ -20,7 +20,7 @@ use tokio_tungstenite::Connector;
 use crate::types::*;
 use crate::NetworkType;
 use pool::PeerPool;
-pub use pool::PeerRequirement;
+pub use pool::{PeakClaim, PeerDialer, PeerMember, PeerRequirement};
 
 // ---------------------------------------------------------------------------
 // PeerBackend
@@ -37,11 +37,20 @@ impl PeerBackend {
         network: crate::NetworkType,
         tls: Connector,
         max_peers: usize,
+        trusted_peers: Vec<SocketAddr>,
         requirement: PeerRequirement,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ChiaQueryError> {
-        let pool = PeerPool::new(network, tls, max_peers, requirement, connect_timeout).await?;
+        let pool = PeerPool::new(
+            network,
+            tls,
+            max_peers,
+            trusted_peers,
+            requirement,
+            connect_timeout,
+        )
+        .await?;
         Ok(Self {
             pool,
             network,
@@ -468,8 +477,45 @@ impl PeerBackend {
 
     // -- peak height (from tracked NewPeakWallet messages) ------------------
 
+    /// Highest peak height claimed by any pool member.
+    ///
+    /// A maximum over UNVERIFIED claims. Use [`peer_members`](Self::peer_members) to see who
+    /// claimed what before treating it as agreed.
     pub fn peak_height(&self) -> u32 {
         self.pool.peak_height()
+    }
+
+    /// Every held peer and its own peak claim. Members are address-distinct, so these are
+    /// independent claims rather than one peer counted repeatedly (dig_ecosystem#2648).
+    pub async fn peer_members(&self) -> Vec<PeerMember<Peer>> {
+        self.pool.peer_members().await
+    }
+
+    /// Ask ONE member for the header hash it serves at `height`.
+    ///
+    /// The hash is COMPUTED from the returned header block, never read from a peer-supplied
+    /// field, so a peer cannot name a hash for a block it did not actually serve. Returns `None`
+    /// when that peer will not or cannot answer; a caller comparing members treats a `None` as
+    /// an abstention, not as agreement.
+    ///
+    /// Lives on the backend rather than on [`PeerMember`] because the request timeout and the
+    /// network constants are the backend's, and threading them into every member would copy that
+    /// configuration into each connection.
+    pub async fn header_hash_at(&self, member: &PeerMember<Peer>, height: u32) -> Option<Bytes32> {
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            member
+                .peer
+                .request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(
+                    RequestBlockHeader { height },
+                ),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .ok()?;
+
+        Some(response.header_block.header_hash())
     }
 
     // =======================================================================

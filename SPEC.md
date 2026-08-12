@@ -47,6 +47,8 @@ use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 let client = ChiaQuery::new(ChiaQueryConfig {
     network: NetworkType::Mainnet,
     max_peers: 5,
+    // Empty by default: a local node is dialled only when an operator names it here.
+    trusted_peers: vec![],
     coinset_base_url: "https://api.coinset.org".to_string(),
     coinset_fallback_enabled: true,
     tls_identity: TlsIdentity::Generated,
@@ -187,32 +189,80 @@ server-internal detail (stack frames) and is deliberately ignored.
 
 ### PeerPool
 
-Maintains a pool of exactly 5 (configurable) active peer connections.
+Holds up to `max_peers` (default 5) peer connections at **DISTINCT addresses**.
+
+#### Admission
+
+The pool MUST admit each address **at most once**. Two members at one address are two sockets to
+one process, and a pool that permits them can be wholly occupied by a single co-resident process
+while reporting itself full.
+
+The pool MUST resolve its candidate address list **itself**, once, and dial from it. It MUST NOT
+fill its slots by repeatedly invoking a helper that selects a peer on its behalf: a helper that
+chooses cannot also guarantee the choices are distinct.
+
+#### Candidate list
+
+The candidate list is `trusted_peers` (in the order given), then `TRUSTED_FULLNODE` if set to a
+valid IP, then addresses discovered from the DNS introducers in shuffled order — de-duplicated,
+preserving that order.
+
+- Discovery MUST contribute introducer-resolved addresses only. No loopback address and no other
+  hardcoded address may be inserted.
+- `127.0.0.1` is a candidate **only when an operator named it**, via `trusted_peers` or
+  `TRUSTED_FULLNODE`. It MUST NOT be dialled merely because something is listening there.
+- Because admission is address-distinct, a configured address occupies **at most one slot**.
+- The list is resolved once and then fixed for the pool's life. Re-resolving per fill would let a
+  resolver that is fast or always available reappear at the head of every subsequent list.
 
 #### State
 
 ```rust
-struct PeerPool {
-    peers: Vec<PeerEntry>,
-    max_peers: usize,
-    tls: Connector,
-    network: NetworkType,
+struct PeerPoolInner<P> {
+    members: RwLock<Vec<PeerMember<P>>>,
+    target: usize,                              // `max_peers`
+    trusted: Vec<SocketAddr>,
+    addresses: RwLock<Option<Vec<SocketAddr>>>, // resolved once
+    ejected: RwLock<HashSet<SocketAddr>>,
+    dialer: Arc<dyn PeerDialer<P>>,
+    peak_height: Arc<AtomicU32>,
 }
 
-struct PeerEntry {
-    peer: Peer,
-    address: SocketAddr,
-    connected_at: Instant,
+struct PeerMember<P> {
+    addr: SocketAddr,   // the member's identity
+    peer: P,
+    peak: Arc<RwLock<Option<PeakClaim>>>,  // THIS peer's own claim
 }
 ```
 
 #### Lifecycle
 
-1. **Initialization**: On `ChiaQuery::new()`, discover peers via DNS introducers and connect to `max_peers` peers concurrently
-2. **Peer Selection**: Round-robin across healthy peers for request distribution
-3. **Ejection**: When a peer request fails or a connection drops, immediately remove the peer from the pool
-4. **Replacement**: After ejection, spawn a background task to connect a new random peer to maintain pool size
-5. **Shutdown**: On `ChiaQuery::drop()`, close all peer connections
+1. **Initialization**: `ChiaQuery::new()` resolves the candidate list and calls `fill()`.
+2. **Fill**: candidates are walked in order — fresh addresses before previously-ejected ones —
+   skipping any address already held and stopping at `target`. After a successful dial the pool
+   re-checks under the write lock and REJECTS the connection if the address is now held or the
+   pool is now at target. A rejected connection MUST be dropped WITHOUT spawning a receiver
+   handler, or a refused duplicate would go on feeding `peak_height`. `fill()` returns the number
+   of members held; falling short of `target` is ordinary and is not an error.
+3. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
+   NOT be used to draw a quorum sample — over N members it returns the same N peers in a cycle.
+   Use `peer_members()`.
+4. **Ejection**: a failed request removes the member and records its address, which the next fill
+   deprioritises so a peer that just failed cannot immediately reclaim its slot. It is never
+   permanently banned: once untried candidates are exhausted it is reconsidered.
+5. **Replacement**: `try_refill()` fills toward `target` when under it.
+6. **Shutdown**: on `ChiaQuery::drop()`, all peer connections close.
+
+#### Peak claims
+
+Each member records its own `PeakClaim { height, header_hash, weight }` exactly as that peer
+announced it in `NewPeakWallet`. A claim is **unverified** — a peer may assert any height.
+
+`peak_height()` is the maximum height claimed by any member. It is a maximum over unverified
+claims, so with a single member it is that member's word alone; corroborate across
+`peer_members()` before treating it as agreed. `PeerBackend::header_hash_at` asks one member for
+the header hash at a height and COMPUTES it from the returned header block, never reading a
+peer-supplied hash field.
 
 #### DNS Introducers
 
@@ -731,3 +781,4 @@ custody still fails closed with `NoProvider`. For `resolve_singleton_lineage`, c
 agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
 authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
 all-errors fails closed.
+
