@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    # A maintenance line lives on `release/X.Y`, and a PR into one must face the SAME gates a PR
+    # into main does. Without this the backport PR reported "no checks reported" -- an ungated
+    # merge that looks identical to a passing one.
+    branches: [main, 'release/**']
   workflow_dispatch:
 
 env:
