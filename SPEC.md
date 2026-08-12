@@ -244,7 +244,8 @@ struct PeerPoolInner<P> {
     addresses: RwLock<Option<Vec<SocketAddr>>>, // resolved once, on SUCCESS
     ejected: RwLock<HashSet<SocketAddr>>,
     refilling: Mutex<()>,                       // single-flight over `try_refill`
-    last_short_fill: RwLock<Option<Instant>>,   // arms the refill cooldown
+    last_short_fill: RwLock<Option<Instant>>,   // arms the SHORT-pool cooldown
+    empty_backoff: RwLock<Option<(Instant, Duration)>>,  // the EMPTY-pool retry interval
     dialer: Arc<dyn PeerDialer<P>>,
     peak_height: Arc<AtomicU32>,
 }
@@ -291,16 +292,36 @@ struct PeerMember<P> {
    sweep — and MUST NOT start a new sweep within the cooldown (60s) of one that fell SHORT. A
    fill that fell short has just demonstrated the network cannot currently supply `target`.
 
-   An EMPTY pool MUST be exempt from the cooldown, however it became empty. Short is a diversity
-   problem and can wait; empty means every read is served by the single centralized HTTP fallback
-   the peer tier exists to avoid depending on, and waiting cannot improve it.
+   An EMPTY pool MUST NOT be blacked out by the short-pool cooldown; it MUST be permitted to
+   retry within one second of becoming empty. Repeated fills that admit nothing MUST back off
+   exponentially from that one-second floor, capped at the short-pool cooldown, and the floor
+   MUST reset on the first admission. A pool that is empty MUST NOT generate more than 120
+   outbound dials in its first minute of continuous emptiness, nor more than 20 per minute
+   thereafter.
 
    `fill()` itself is NOT gated, and it — not `try_refill()` — decides whether there is room:
    that question is answered under concurrency, from the member set.
+5a. **Dial-cost bounds**: the gating above, the fill budget and the dial window together hold four
+   bounds, which an implementation MUST satisfy in every state:
+
+   - **DP-1, per fill**: one fill considers at most 20 candidates, dials each at most once, and
+     holds at most 10 dials open at a time.
+   - **DP-2, single-flight**: at most one fill is in flight per pool, in every state including
+     empty.
+   - **DP-3, per address**: at steady state no candidate is dialled more than once per
+     cooldown (60s).
+   - **DP-4, aggregate**: sustained outbound dials stay at or under 20 per minute per pool. A
+     continuously-empty pool MAY burst to at most 120 dials in its first minute and MUST then
+     decay to the sustained rate; a pool at `target` dials nothing.
 6. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
-   member, and MUST run ahead of it when the pool is empty. With a member in hand a sweep buys
-   diversity, which the waiting request does not need; with nothing to serve it buys availability
-   and is the only thing that can help. `PeerPoolInner::select_refilling()` owns this decision.
+   member. With a member in hand a sweep buys diversity, which the waiting request does not need.
+
+   A read MUST NOT wait on a refill when a fallback source is configured; the refill runs detached
+   and the read is served by the fallback. Where no fallback is configured, the read MAY wait on
+   one refill. `PeerPoolInner::select_refilling()` owns the with-a-member decision and waits on
+   the fill when the pool is empty; the caller that HAS a fallback — `QueryRouter` — MUST instead
+   short-circuit to it and start the refill through `PeerPoolInner::try_refill_detached()`,
+   because the pool cannot see whether its caller has one.
 7. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
    NOT be used to draw a quorum sample — over N members it returns the same N peers in a cycle.
    Use `peer_members()`.
@@ -522,7 +543,7 @@ struct ChiaQueryConfig {
 
 ## Behavioral Rules
 
-1. **Peers first**: Every request that has a peer protocol equivalent goes to `PeerBackend` first
+1. **Peers first, unless the pool is EMPTY**: Every request that has a peer protocol equivalent goes to `PeerBackend` first. When the pool holds no peers AND coinset fallback is enabled, the request MUST skip BOTH peer attempts and go straight to coinset.org, starting a detached refill so the next request is peer-served. With fallback disabled the request still waits on the peer tier
 2. **Single retry on peer failure**: If a peer request fails, eject that peer, try one more peer. If that also fails, fall back to coinset.org
 3. **Immediate ejection**: Any peer that fails a request or whose connection drops is removed from the pool immediately
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
