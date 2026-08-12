@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.9.0] - 2026-08-12
+
+### Features
+- **peer:** Report peers held and the peak this client's own peers reported (#21)
+
 ## [0.8.1] - 2026-08-10
 
 ### Documentation
