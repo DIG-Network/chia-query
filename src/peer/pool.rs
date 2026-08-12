@@ -165,14 +165,22 @@ const DIAL_BATCH: usize = 10;
 /// Without a cap a host that cannot reach `target` distinct peers re-walks the entire candidate
 /// list on every fill forever, because the pool is permanently under target — the very condition
 /// address-distinct admission creates. Two batches bound the worst case at roughly twice the
-/// connect timeout, and a shortfall is then retried later rather than harder.
+/// connect timeout.
+///
+/// The budget bounds ONE fill's cost; it must never bound which addresses are reachable at all.
+/// That distinction is what [`PeerPoolInner::dial_cursor`] exists for: successive fills advance
+/// through the candidate list rather than re-dialling its first twenty forever.
 const MAX_DIALS_PER_FILL: usize = 2 * DIAL_BATCH;
 
-/// How long after a fill that fell short before another sweep is worth attempting.
+/// How long after a fill that fell SHORT before another sweep is worth attempting.
 ///
 /// A fill that could not reach `target` just proved the network cannot currently supply it.
 /// Repeating it per request turns every read into a dial sweep and points up to a hundred
 /// outbound handshakes per read at real full nodes, which is behaviour worth being banned for.
+///
+/// It gates a SHORT pool only, never an EMPTY one. Short is a diversity problem and can wait a
+/// minute; empty means every read is served by the one centralized HTTP endpoint the peer tier
+/// exists to avoid depending on, and waiting cannot improve it.
 const REFILL_COOLDOWN: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
@@ -252,6 +260,15 @@ pub struct PeerPoolInner<P: Clone> {
     /// banned: once the untried candidates are exhausted a second pass reconsiders them, because
     /// a peer that failed earlier may be the only one left.
     ejected: RwLock<HashSet<SocketAddr>>,
+    /// Where the NEXT fill starts in the candidate list.
+    ///
+    /// The candidate list is fixed for the pool's life and one fill dials at most
+    /// `MAX_DIALS_PER_FILL` of it, so without a cursor every fill considers the same prefix — and
+    /// on a host that cannot reach any of those twenty, the other hundred are never dialled again
+    /// for the process's life while each read re-dials the identical twenty that just failed.
+    /// Advancing by the window makes every candidate reachable across successive fills without
+    /// widening what one fill costs.
+    dial_cursor: AtomicUsize,
     /// Held for the duration of a [`try_refill`](PeerPoolInner::try_refill) sweep.
     ///
     /// Single-flight, not mutual exclusion: a caller that cannot take it returns at once rather
@@ -284,6 +301,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             discovery,
             addresses: RwLock::new(None),
             ejected: RwLock::new(HashSet::new()),
+            dial_cursor: AtomicUsize::new(0),
             refilling: Mutex::new(()),
             last_short_fill: RwLock::new(None),
             dialer,
@@ -331,6 +349,29 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         Some((member.peer.clone(), member.addr))
     }
 
+    /// A peer to serve a request with, refilling the pool around the answer.
+    ///
+    /// A fill is a bounded but real sweep of outbound TLS dials, so where it sits relative to
+    /// selection decides what a read costs. With a usable member in hand the sweep buys
+    /// DIVERSITY, which the caller waiting on a read does not need right now — so it runs BEHIND
+    /// the answer, detached. With nothing to serve it buys AVAILABILITY and is the only thing
+    /// that can help, so it runs IN FRONT and the caller waits for it.
+    ///
+    /// The decision lives here rather than at the call site because it is a property of the
+    /// pool's own cost model, and because a caller cannot be asked to rediscover it.
+    /// [`try_refill`](Self::try_refill) is single-flight either way, which is what keeps the
+    /// detached case from accumulating sweeps.
+    pub async fn select_refilling(self: &Arc<Self>) -> Option<(P, SocketAddr)> {
+        if let Some(picked) = self.select_peer().await {
+            let pool = Arc::clone(self);
+            tokio::spawn(async move { pool.try_refill().await });
+            return Some(picked);
+        }
+
+        self.try_refill().await;
+        self.select_peer().await
+    }
+
     /// Drop the member at `addr`. The freed slot refills on the next
     /// [`try_refill`](Self::try_refill).
     pub async fn eject_peer(&self, addr: SocketAddr) {
@@ -357,25 +398,32 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         self.members.read().await.is_empty()
     }
 
-    /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time, and at most
-    /// one per `REFILL_COOLDOWN` (60s) after a sweep that fell short.
+    /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time, and, for a
+    /// pool that is merely SHORT, at most one per `REFILL_COOLDOWN` (60s).
     ///
     /// This is the entry point every request path uses, and both bounds are about the request
     /// path rather than about correctness. A pool that cannot reach `target` distinct peers is
-    /// under target PERMANENTLY, so an ungated refill re-walks the whole candidate list on every
-    /// read, once per concurrent read. [`fill`](Self::fill) itself stays unguarded: it is the
-    /// bare operation, and its own guarantees must hold under concurrency rather than because
-    /// something upstream serialized it.
+    /// under target PERMANENTLY, so an ungated refill re-walks the candidate list on every read,
+    /// once per concurrent read.
+    ///
+    /// An EMPTY pool is exempt from the cooldown. Between "short" and "empty" the cooldown is
+    /// trading diversity for handshake volume in the first case and the entire peer tier for one
+    /// centralized HTTP endpoint in the second — and a pool that fell short at construction, or
+    /// that was drained to zero by ejections, would otherwise be blacked out for a minute at
+    /// exactly the moment it has nothing to serve with.
+    ///
+    /// Whether there is ROOM is not decided here: [`fill`](Self::fill) decides it, from the
+    /// member set, under concurrency. Repeating that check here would put the same policy in two
+    /// places where either alone would satisfy any test of it.
     pub async fn try_refill(&self) {
-        if self.len().await >= self.target {
-            return;
-        }
         let Ok(_in_flight) = self.refilling.try_lock() else {
             return;
         };
-        if let Some(last_short) = *self.last_short_fill.read().await {
-            if last_short.elapsed() < REFILL_COOLDOWN {
-                return;
+        if !self.is_empty().await {
+            if let Some(last_short) = *self.last_short_fill.read().await {
+                if last_short.elapsed() < REFILL_COOLDOWN {
+                    return;
+                }
             }
         }
 
@@ -388,48 +436,44 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
     ///
     /// Dials in CONCURRENT batches of `DIAL_BATCH` (10) and considers at most
     /// `MAX_DIALS_PER_FILL` (20) candidates, so a long list costs a bounded amount of time and a
-    /// bounded number of handshakes. Batching does not relax distinctness: a batch is drawn only
-    /// from addresses the
-    /// pool does not already hold, and every admission still passes the re-check under the
-    /// members write lock, which is what makes two batches — or two whole fills — safe to
-    /// overlap.
+    /// bounded number of handshakes; the next fill resumes where this one stopped, so the bound
+    /// on one fill never becomes a bound on which candidates are ever tried.
+    ///
+    /// Occupancy is re-read from the member set at the top of every batch, and that ONE reading
+    /// serves both jobs: whether there is still room, and which addresses must not be dialled
+    /// again. Deriving it from this fill's own admissions instead would make a sibling fill's
+    /// progress invisible — two concurrent fills would each dial a full second batch at real
+    /// full nodes while the pool was already at target.
     ///
     /// Returns the number of members held afterwards. Falling short is ordinary and is reported
     /// by that number rather than by an error: a pool with three members is degraded, not
     /// broken, and the caller decides what a shortfall means.
     pub async fn fill(&self) -> usize {
-        let mut held: HashSet<SocketAddr> =
-            self.members.read().await.iter().map(|m| m.addr).collect();
-        if held.len() >= self.target {
-            // Resolving a candidate list the pool has no room for would spend a DNS round trip
-            // to learn nothing.
-            return held.len();
-        }
+        let mut window: Option<Vec<SocketAddr>> = None;
+        let mut batch_start = 0;
 
-        let candidates = self.candidate_addresses().await;
-        let ejected = self.ejected.read().await.clone();
-
-        // Fresh candidates first, then previously-ejected ones — a peer that just failed a
-        // request must not immediately reclaim the slot it was ejected from while an untried
-        // address is available.
-        let (fresh, retry): (Vec<_>, Vec<_>) = candidates
-            .iter()
-            .copied()
-            .partition(|a| !ejected.contains(a));
-        // The dial budget is applied HERE, by shortening the list, and nowhere else. Expressed
-        // as a loop guard it would have to be repeated alongside the batch width, and either
-        // half alone would then bound the work — leaving two guards no test can tell apart, and
-        // a guard no test can distinguish is a guard no test protects.
-        let order: Vec<SocketAddr> = fresh
-            .into_iter()
-            .chain(retry)
-            .take(MAX_DIALS_PER_FILL)
-            .collect();
-
-        for chunk in order.chunks(DIAL_BATCH) {
+        loop {
+            let held: HashSet<SocketAddr> =
+                self.members.read().await.iter().map(|m| m.addr).collect();
             if held.len() >= self.target {
                 break;
             }
+            // Resolved lazily, so a pool with no room never spends a DNS round trip to learn
+            // that. The window is fixed on the first pass: re-deriving it mid-fill would let
+            // this fill's own admissions shift the addresses it has yet to try.
+            let window = match &window {
+                Some(w) => w,
+                None => window.insert(self.dial_window().await),
+            };
+            let Some(chunk) = window.get(batch_start..) else {
+                break;
+            };
+            let chunk = &chunk[..chunk.len().min(DIAL_BATCH)];
+            if chunk.is_empty() {
+                break;
+            }
+            batch_start += chunk.len();
+
             let batch: Vec<SocketAddr> = chunk
                 .iter()
                 .copied()
@@ -439,6 +483,10 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
                 continue;
             }
 
+            // Concurrently, not in sequence. A batch of ten unreachable addresses at the default
+            // eight-second connect timeout is eight seconds dialled this way and eighty dialled
+            // serially — and this runs on the request path, so a silent regression to serial is
+            // the difference between a bounded fill and a read that appears to hang.
             let connections = futures_util::future::join_all(
                 batch
                     .iter()
@@ -449,7 +497,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             for (addr, outcome) in connections {
                 match outcome {
                     Ok(connection) => {
-                        if self.try_admit(addr, connection, &mut held).await {
+                        if self.try_admit(addr, connection).await {
                             self.ejected.write().await.remove(&addr);
                         }
                     }
@@ -461,17 +509,42 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         self.len().await
     }
 
+    /// The addresses THIS fill may dial: at most `MAX_DIALS_PER_FILL` of the candidate list,
+    /// starting where the previous fill stopped, previously-ejected addresses last.
+    ///
+    /// Two orderings compose here and they answer different questions. Ejection decides
+    /// PRIORITY: a peer that just failed a request must not reclaim its slot while an untried
+    /// address is available. The cursor decides REACH: the candidate list outlives any one fill's
+    /// budget, so each fill takes the next window and wraps, which is what makes every candidate
+    /// eventually dialable rather than only the first twenty.
+    async fn dial_window(&self) -> Vec<SocketAddr> {
+        let candidates = self.candidate_addresses().await;
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let ejected = self.ejected.read().await.clone();
+        let (fresh, retry): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .copied()
+            .partition(|a| !ejected.contains(a));
+        let order: Vec<SocketAddr> = fresh.into_iter().chain(retry).collect();
+
+        let width = order.len().min(MAX_DIALS_PER_FILL);
+        let start = self.dial_cursor.fetch_add(width, Ordering::Relaxed) % order.len();
+        order.iter().cycle().skip(start).take(width).copied().collect()
+    }
+
     /// Admit an already-open connection to `addr`, unless the pool now holds that address or is
     /// now at target.
     ///
-    /// Returns whether it was admitted, and marks `held` only then: `held` means "members this
-    /// pool holds", so a REFUSED connection must not consume the room the fill loop reads from
-    /// it. What bounds the work instead is the dial count, which is the thing that costs.
+    /// This is the only guard that can be trusted to decide the question, because it is the only
+    /// one that asks it while HOLDING the members write lock. Everything upstream — the fill
+    /// loop's occupancy read, the pre-dial skip — is an optimisation that spares a handshake;
+    /// this one is what makes the answer true.
     async fn try_admit(
         &self,
         addr: SocketAddr,
         (peer, receiver): (P, mpsc::Receiver<Message>),
-        held: &mut HashSet<SocketAddr>,
     ) -> bool {
         let peak = Arc::new(RwLock::new(None));
         {
@@ -491,7 +564,6 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
                 peak: Arc::clone(&peak),
             });
         }
-        held.insert(addr);
         self.spawn_receiver_handler(peak, receiver);
         true
     }
@@ -518,6 +590,15 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         };
 
         let candidates = connect::candidate_list(&self.trusted, discovered);
+        if candidates.len() <= self.trusted.len() {
+            // Discovery answered, but nothing it named survived the routability filter — a
+            // poisoned resolver, or an introducer with nothing but private addresses. That is a
+            // failed resolution wearing a success, and caching it would fix the pool on the
+            // operator's own addresses for the process's life with no retry.
+            log::warn!("peer discovery contributed no routable address, retrying on a later fill");
+            return candidates;
+        }
+
         let mut slot = self.addresses.write().await;
         // A concurrent fill may have resolved first; either list is valid, so keep whichever
         // landed to preserve the resolve-once guarantee.

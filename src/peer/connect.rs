@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -114,55 +114,116 @@ pub fn trusted_fullnode_from_env(network: NetworkType) -> Option<SocketAddr> {
     )
 }
 
+/// The IPv4 address an IPv6 literal carries, for every encoding that carries one.
+///
+/// Three encodings put an IPv4 address inside an IPv6 one, and all three are reachable: a host
+/// dials `::ffff:a.b.c.d` and `::a.b.c.d` straight through its v4 stack, and on an IPv6-only
+/// network running 464XLAT a local CLAT translates `64:ff9b::a.b.c.d` to `a.b.c.d`. So an
+/// address check that unwraps only the first of them can be walked past by using either of the
+/// others — `64:ff9b::7f00:1` is `127.0.0.1` on exactly the deployment this crate's IPv6-first
+/// rule steers toward.
+///
+/// `Ipv6Addr::to_ipv4` is deliberately NOT used: it maps `::1` to `0.0.0.1`, which is not
+/// `Ipv4Addr::is_loopback`, so routing loopback through it would turn a refusal into an
+/// acceptance. `::` and `::1` are excluded here and refused by the v6 checks instead.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    if v6.is_unspecified() || v6.is_loopback() {
+        return None;
+    }
+    let s = v6.segments();
+    let last32 = Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32);
+    // ::/96 (IPv4-compatible) and 64:ff9b::/96 (RFC6052 well-known NAT64 prefix).
+    let is_v4_compatible = s[0..6] == [0, 0, 0, 0, 0, 0];
+    let is_nat64_wellknown = s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0];
+    (is_v4_compatible || is_nat64_wellknown).then_some(last32)
+}
+
+/// Whether `v4` is in a range no peer on the public internet can be reached at.
+fn is_non_global_ipv4(v4: Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || a == 0                                    // 0.0.0.0/8, "this network"
+        || (a == 100 && (64..128).contains(&b))      // 100.64.0.0/10, carrier-grade NAT
+        || (a == 192 && b == 0 && c == 2)            // 192.0.2.0/24, TEST-NET-1
+        || (a == 198 && (18..20).contains(&b))       // 198.18.0.0/15, benchmarking
+        || (a == 198 && b == 51 && c == 100)         // 198.51.100.0/24, TEST-NET-2
+        || (a == 203 && b == 0 && c == 113)          // 203.0.113.0/24, TEST-NET-3
+        || a >= 240 // 240.0.0.0/4, reserved
+}
+
 /// Whether `addr` is an address a DISCOVERED peer could legitimately live at.
 ///
-/// Introducer answers arrive over unauthenticated DNS, so this treats them as untrusted input.
-/// Anything that is not a globally routable unicast address is refused: loopback (the whole of
-/// `127.0.0.0/8` is on `lo`, so one process answers on all of it as distinct addresses),
-/// unspecified, link-local, unique-local, RFC1918, multicast and broadcast. IPv4-mapped IPv6 is
-/// unwrapped first, or `::ffff:127.0.0.1` would walk straight past the v4 checks.
+/// Introducer answers arrive over unauthenticated DNS, so this treats them as untrusted input,
+/// and the rule is positive: an address is dialled only when it is a globally routable unicast
+/// address. Refused, therefore: loopback (the whole of `127.0.0.0/8` is on `lo`, so one process
+/// answers on all of it as distinct addresses), unspecified, link-local, unique-local, RFC1918,
+/// carrier-grade NAT, the documentation/benchmark/reserved ranges, multicast and broadcast — in
+/// both address families, and through every IPv6 encoding that carries an IPv4 address
+/// (see [`embedded_ipv4`]).
 ///
 /// Operator-named addresses are NOT subject to this — a local full node is the legitimate
 /// loopback case, and somebody asked for it.
 fn is_routable_peer(addr: &SocketAddr) -> bool {
     let ip = match addr.ip() {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V6(v6) => embedded_ipv4(v6).map_or(IpAddr::V6(v6), IpAddr::V4),
         v4 => v4,
     };
     match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_unspecified()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast())
-        }
+        IpAddr::V4(v4) => !is_non_global_ipv4(v4),
         IpAddr::V6(v6) => {
+            let s = v6.segments();
             let [first, second, ..] = v6.octets();
             let is_unique_local = first & 0xfe == 0xfc;
             let is_link_local = first == 0xfe && second & 0xc0 == 0x80;
+            // 100::/64 discard-only, 2001:db8::/32 documentation, 2001::/32 Teredo and
+            // 2002::/16 6to4 are all reachable-looking and none of them is a full node.
+            let is_discard = s[0] == 0x0100 && s[1..4] == [0, 0, 0];
+            let is_documentation = s[0] == 0x2001 && s[1] == 0x0db8;
+            let is_teredo = s[0] == 0x2001 && s[1] == 0;
+            let is_6to4 = s[0] == 0x2002;
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || is_unique_local
-                || is_link_local)
+                || is_link_local
+                || is_discard
+                || is_documentation
+                || is_teredo
+                || is_6to4)
         }
     }
-}
-
-/// `discovered`, keeping only the addresses a real internet peer could be at.
-fn routable_only(discovered: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    discovered.into_iter().filter(is_routable_peer).collect()
 }
 
 /// Resolve candidate peer addresses from the network's DNS introducers.
 ///
 /// The returned list is shuffled — so a caller filling several slots does not hammer whichever
-/// introducer answers first — de-duplicated, and filtered to routable unicast
-/// addresses (see `is_routable_peer`). It holds DISCOVERED addresses only: no loopback and no hardcoded
+/// introducer answers first — de-duplicated, and filtered to routable unicast addresses (see
+/// `is_routable_peer`). It holds DISCOVERED addresses only: no loopback and no hardcoded
 /// priority address. An address nobody configured must never reach the head of this list
 /// (dig_ecosystem#2648).
+///
+/// # Two filter applications, on two paths, both required
+///
+/// Routability is enforced here AND in [`candidate_list`], and they are not copies of one guard.
+/// This is the PUBLIC resolver an external consumer building its own pool calls directly, so
+/// removing the filter here hands that consumer an unfiltered list. `candidate_list` is the
+/// composition every dial order in this crate is built by, including one seeded from a
+/// caller-supplied [`AddressSource`](super::pool::AddressSource) that never reaches this
+/// function at all. Each is reachable without the other and each is separately observable; do
+/// not "simplify" them together.
+///
+/// A consumer building its own pool wants this plus [`candidate_list`] plus [`dial_addr`] —
+/// resolve a list, compose the dial order, dial a CHOSEN address — rather than
+/// [`connect_random_peer`], which chooses for you and therefore cannot promise its picks are
+/// distinct.
 ///
 /// Fails with [`ChiaQueryError::PeerDiscoveryFailed`] when nothing usable resolves. That error
 /// is meaningful and MUST NOT be cached as an empty candidate list: a single dropped DNS
@@ -184,14 +245,31 @@ pub async fn discover_addresses(
     Ok(dedup_preserving_order(addrs))
 }
 
-/// The order a caller should dial: operator-trusted addresses first, then discovered ones,
-/// each appearing at most once.
+/// `discovered`, keeping only the addresses a real internet peer could be at.
+fn routable_only(discovered: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    discovered.into_iter().filter(is_routable_peer).collect()
+}
+
+/// The order a caller should dial: operator-trusted addresses first, then the ROUTABLE
+/// discovered ones, each appearing at most once.
+///
+/// Routability is enforced here because this is the function every dial order in this crate is
+/// built by — see [`discover_addresses`] for why the resolver filters as well, and why that is
+/// defence in depth rather than a duplicated guard. The pool composes its candidates through
+/// this function, so an address that arrives from a caller-supplied
+/// [`AddressSource`](super::pool::AddressSource) — a seam that is `pub`, and that never touches
+/// DNS discovery — is filtered on exactly the same terms as an introducer answer. A filter that
+/// sat in discovery alone would leave the whole public path unguarded, which is the shape of the
+/// original collapse (dig_ecosystem#2648).
+///
+/// `trusted` is deliberately exempt: an operator naming their own local full node is the
+/// legitimate loopback case, and somebody asked for it.
 ///
 /// Pure and total, because it is the function the pool's admission order is asserted against.
 /// A second implementation of "who comes first" is how the bias this fixes got in.
 pub fn candidate_list(trusted: &[SocketAddr], discovered: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let mut all = trusted.to_vec();
-    all.extend(discovered);
+    all.extend(discovered.into_iter().filter(is_routable_peer));
     dedup_preserving_order(all)
 }
 
@@ -269,7 +347,6 @@ pub async fn connect_random_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("a valid socket address")
@@ -368,21 +445,99 @@ mod tests {
         }
     }
 
-    /// The filter binds where it matters: on DISCOVERED addresses, never on operator-named ones.
+    /// The two OTHER encodings that carry an IPv4 address into an IPv6 literal.
+    ///
+    /// `::ffff:127.0.0.1` was already unwrapped; its siblings were not, so the same loopback
+    /// address written either of two other ways walked straight past every v4 check. The NAT64
+    /// one is not theoretical: on an IPv6-only network running 464XLAT the host's own CLAT
+    /// translates `64:ff9b::7f00:1` to `127.0.0.1` before the packet leaves, which is precisely
+    /// the deployment this crate's IPv6-first rule steers toward.
+    ///
+    /// The globally-routable member of each family is the control: unwrapping must be a filter
+    /// on what is embedded, not a blanket refusal of the encoding.
+    #[test]
+    fn an_ipv4_address_wearing_an_ipv6_encoding_is_judged_by_the_ipv4_inside_it() {
+        for dropped in [
+            addr("[::7f00:1]:8444"),       // ::/96 IPv4-compatible loopback
+            addr("[::a00:1]:8444"),        // ::/96 IPv4-compatible RFC1918
+            addr("[64:ff9b::7f00:1]:8444"), // NAT64 well-known prefix over loopback
+            addr("[64:ff9b::a00:1]:8444"),  // NAT64 well-known prefix over RFC1918
+        ] {
+            assert!(
+                !is_routable_peer(&dropped),
+                "{dropped} carries a non-routable IPv4 address and must be refused"
+            );
+        }
+
+        assert!(
+            is_routable_peer(&addr("[64:ff9b::102:304]:8444")),
+            "NAT64 over a real internet address is a legitimate peer on an IPv6-only host"
+        );
+        assert!(
+            is_routable_peer(&addr("[::ffff:1.2.3.4]:8444")),
+            "an IPv4-mapped routable address is still a real internet peer"
+        );
+    }
+
+    /// The non-global ranges beyond the obvious ones. Each is reachable-looking, none is a full
+    /// node, and the doc comment claims a POSITIVE rule — only globally routable unicast is
+    /// dialled — which is false while any of these passes.
+    #[test]
+    fn reserved_and_documentation_ranges_are_not_globally_routable() {
+        for dropped in [
+            addr("0.1.2.3:8444"),         // 0.0.0.0/8, "this network"
+            addr("100.64.0.1:8444"),      // carrier-grade NAT
+            addr("192.0.2.1:8444"),       // TEST-NET-1
+            addr("198.18.0.1:8444"),      // benchmarking
+            addr("198.51.100.1:8444"),    // TEST-NET-2
+            addr("203.0.113.1:8444"),     // TEST-NET-3
+            addr("240.0.0.1:8444"),       // reserved
+            addr("[2001:db8::1]:8444"),   // documentation
+            addr("[100::1]:8444"),        // discard-only
+            addr("[2001::1]:8444"),       // Teredo
+            addr("[2002:102:304::1]:8444"), // 6to4
+        ] {
+            assert!(
+                !is_routable_peer(&dropped),
+                "{dropped} is not a globally routable unicast address"
+            );
+        }
+
+        // Controls, so the widened refusal stays a filter: the neighbours of two of those
+        // prefixes are ordinary internet addresses.
+        for kept in [
+            addr("100.63.255.255:8444"),
+            addr("100.128.0.1:8444"),
+            addr("223.255.255.254:8444"), // the last unicast address below multicast
+            addr("[2001:db9::1]:8444"),
+            addr("[2003::1]:8444"),
+        ] {
+            assert!(is_routable_peer(&kept), "{kept} is a real internet peer");
+        }
+    }
+
+    /// The filter binds where it matters: on DISCOVERED addresses, never on operator-named ones,
+    /// and it binds inside `candidate_list` — the one function every dial order is built by.
+    ///
     /// An operator running a local node is the legitimate loopback case and must keep working.
     #[test]
     fn the_filter_applies_to_discovery_and_never_to_operator_configuration() {
         let poisoned = vec![LOOPBACK, addr("10.0.0.1:8444"), addr("1.2.3.4:8444")];
 
         assert_eq!(
-            candidate_list(&[], routable_only(poisoned.clone())),
+            candidate_list(&[], poisoned.clone()),
             vec![addr("1.2.3.4:8444")],
             "only the routable discovered address survives"
         );
         assert_eq!(
-            candidate_list(&[LOOPBACK], routable_only(poisoned)),
+            candidate_list(&[LOOPBACK], poisoned),
             vec![LOOPBACK, addr("1.2.3.4:8444")],
             "an operator-named loopback address is still dialled, and still exactly once"
+        );
+        assert_eq!(
+            candidate_list(&[addr("10.0.0.9:8444")], vec![addr("10.0.0.9:8444")]),
+            vec![addr("10.0.0.9:8444")],
+            "a private address an operator named is kept; the same address discovered is not"
         );
     }
 

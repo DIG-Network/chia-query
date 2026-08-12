@@ -84,22 +84,12 @@ impl PeerBackend {
 
     /// A peer to serve this request with, refilling the pool if it must.
     ///
-    /// A fill is a bounded but real sweep of outbound TLS dials, so where it sits relative to
-    /// selection decides what a read costs. With a usable member in hand the sweep buys
-    /// DIVERSITY, which the caller waiting on a read does not need right now — so it runs behind
-    /// the answer. With nothing to serve it buys AVAILABILITY and is the only thing that can
-    /// help, so it runs in front. `try_refill` is single-flight and cooldown-gated either way,
-    /// which is what keeps the detached case from accumulating sweeps.
+    /// The placement of that refill relative to selection is the pool's decision — see
+    /// [`PeerPoolInner::select_refilling`] — so all this adds is the error a request needs when
+    /// nothing can serve it.
     async fn pick(&self) -> Result<(Peer, SocketAddr), ChiaQueryError> {
-        if let Some(picked) = self.pool.select_peer().await {
-            let pool = Arc::clone(&self.pool);
-            tokio::spawn(async move { pool.try_refill().await });
-            return Ok(picked);
-        }
-
-        self.pool.try_refill().await;
         self.pool
-            .select_peer()
+            .select_refilling()
             .await
             .ok_or_else(|| ChiaQueryError::PeerConnection("no peers available".into()))
     }
