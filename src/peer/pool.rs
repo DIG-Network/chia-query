@@ -434,8 +434,13 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         let Ok(_in_flight) = self.refilling.try_lock() else {
             return;
         };
-        if let Some(last_short) = *self.last_short_fill.read().await {
-            let cooldown = if self.is_empty().await {
+        let (is_empty, last_short) = {
+            let is_empty = self.members.read().await.is_empty();
+            let last_short = *self.last_short_fill.read().await;
+            (is_empty, last_short)
+        };
+        if let Some(last_short) = last_short {
+            let cooldown = if is_empty {
                 EMPTY_REFILL_COOLDOWN
             } else {
                 REFILL_COOLDOWN

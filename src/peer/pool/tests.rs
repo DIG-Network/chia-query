@@ -1093,7 +1093,7 @@ async fn an_empty_pool_may_always_retry() {
     assert_eq!(
         dialer.attempt_count(),
         after_first,
-        "an empty refill retried without waiting out its own cooldown"
+        "an empty pool was re-swept before its own cooldown elapsed"
     );
 
     *pool.last_short_fill.write().await =
