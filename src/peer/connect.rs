@@ -159,8 +159,8 @@ fn routable_only(discovered: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// Resolve candidate peer addresses from the network's DNS introducers.
 ///
 /// The returned list is shuffled — so a caller filling several slots does not hammer whichever
-/// introducer answers first — de-duplicated, and filtered to routable unicast addresses
-/// ([`is_routable_peer`]). It holds DISCOVERED addresses only: no loopback and no hardcoded
+/// introducer answers first — de-duplicated, and filtered to routable unicast
+/// addresses (see `is_routable_peer`). It holds DISCOVERED addresses only: no loopback and no hardcoded
 /// priority address. An address nobody configured must never reach the head of this list
 /// (dig_ecosystem#2648).
 ///

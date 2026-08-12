@@ -18,11 +18,16 @@ A Rust crate for querying the Chia blockchain with automatic load balancing betw
                    (preferred)         (fallback)
                         |                   |
                    PeerPool             HTTP Client
-                  (5 connections)     (api.coinset.org)
+              (up to 5 DISTINCT      (api.coinset.org)
+                  addresses)
                    /  |  |  \  \
-                 Peer Peer Peer Peer Peer
-              (via chia-wallet-sdk)
+                Peer Peer Peer Peer Peer
+             (one per address, via chia-wallet-sdk)
 ```
+
+`max_peers` bounds ADDRESSES, not peers: the pool holds at most one connection per address, and
+holding five means five distinct addresses were reachable, not that five are guaranteed. Fewer is
+ordinary and is not an error.
 
 ### Request Flow
 
@@ -209,11 +214,24 @@ preserving that order.
 
 - Discovery MUST contribute introducer-resolved addresses only. No loopback address and no other
   hardcoded address may be inserted.
+- Discovered addresses MUST be filtered to globally routable unicast addresses. Loopback,
+  unspecified, link-local, unique-local, RFC1918, multicast and broadcast addresses MUST be
+  discarded, and an IPv4-mapped IPv6 address MUST be judged as the IPv4 address it carries.
+  Introducers are reached over unauthenticated DNS, so their answers are untrusted input; on Linux
+  the whole of `127.0.0.0/8` is on the loopback interface, so one process answers on all of it as
+  distinct addresses.
 - `127.0.0.1` is a candidate **only when an operator named it**, via `trusted_peers` or
-  `TRUSTED_FULLNODE`. It MUST NOT be dialled merely because something is listening there.
+  `TRUSTED_FULLNODE`. It MUST NOT be dialled merely because something is listening there. The
+  filter above applies to DISCOVERED addresses only; operator-named addresses are exempt, because
+  a local full node is the legitimate case.
 - Because admission is address-distinct, a configured address occupies **at most one slot**.
-- The list is resolved once and then fixed for the pool's life. Re-resolving per fill would let a
-  resolver that is fast or always available reappear at the head of every subsequent list.
+- A SUCCESSFUL resolution is fixed for the pool's life. Re-resolving per fill would let a resolver
+  that is fast or always available reappear at the head of every subsequent list.
+- A FAILED resolution MUST NOT be cached, in any form — including as an empty candidate list.
+  Discovery failing is a transient network condition; remembering it would leave the pool with no
+  candidates for the process's life, with no TTL and no retry, having permanently traded the peer
+  tier for a single centralized HTTP endpoint. Operator-named addresses remain candidates while
+  discovery is failing, since they need no resolver.
 
 #### State
 
@@ -222,8 +240,11 @@ struct PeerPoolInner<P> {
     members: RwLock<Vec<PeerMember<P>>>,
     target: usize,                              // `max_peers`
     trusted: Vec<SocketAddr>,
-    addresses: RwLock<Option<Vec<SocketAddr>>>, // resolved once
+    discovery: Arc<dyn AddressSource>,
+    addresses: RwLock<Option<Vec<SocketAddr>>>, // resolved once, on SUCCESS
     ejected: RwLock<HashSet<SocketAddr>>,
+    refilling: Mutex<()>,                       // single-flight over `try_refill`
+    last_short_fill: RwLock<Option<Instant>>,   // arms the refill cooldown
     dialer: Arc<dyn PeerDialer<P>>,
     peak_height: Arc<AtomicU32>,
 }
@@ -237,21 +258,42 @@ struct PeerMember<P> {
 
 #### Lifecycle
 
-1. **Initialization**: `ChiaQuery::new()` resolves the candidate list and calls `fill()`.
+1. **Initialization**: `ChiaQuery::new()` resolves the candidate list and refills once.
 2. **Fill**: candidates are walked in order — fresh addresses before previously-ejected ones —
    skipping any address already held and stopping at `target`. After a successful dial the pool
    re-checks under the write lock and REJECTS the connection if the address is now held or the
    pool is now at target. A rejected connection MUST be dropped WITHOUT spawning a receiver
-   handler, or a refused duplicate would go on feeding `peak_height`. `fill()` returns the number
-   of members held; falling short of `target` is ordinary and is not an error.
-3. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
+   handler, or a refused duplicate would go on feeding `peak_height`. A rejected connection MUST
+   NOT be counted as held. `fill()` returns the number of members held; falling short of `target`
+   is ordinary and is not an error.
+3. **Fill cost**: one fill MUST dial in CONCURRENT batches (10) and MUST consider at most a
+   bounded number of candidates (20), however long the list is. Neither bound may weaken
+   distinctness: a batch is drawn only from addresses not already held, and every admission still
+   passes the write-lock re-check.
+
+   Both bounds are required rather than advisory, and address-distinct admission is why. A pool
+   that cannot reach `target` DISTINCT peers is under target permanently, so an unbounded fill
+   re-walks the whole candidate list on every request forever — at the 8-second default connect
+   timeout over the ~124 addresses the mainnet introducers currently answer with, that is minutes
+   per read and hundreds of outbound handshakes at real full nodes.
+4. **Refill gating**: `try_refill()` MUST be single-flight — a caller that finds a sweep already
+   running returns immediately rather than starting its own, so K concurrent requests cost one
+   sweep — and MUST NOT start a new sweep within the cooldown (60s) of one that fell short. A
+   fill that fell short has just demonstrated the network cannot currently supply `target`.
+   `fill()` itself is NOT gated: its guarantees must hold under concurrency rather than because
+   a caller serialized it.
+5. **Placement**: a fill MUST NOT run ahead of selection when the pool already has a usable
+   member. With a member in hand a sweep buys diversity, which the waiting request does not need;
+   with nothing to serve it buys availability and is the only thing that can help.
+6. **Selection**: `select_peer()` round-robins across the member set for load balancing. It MUST
    NOT be used to draw a quorum sample — over N members it returns the same N peers in a cycle.
    Use `peer_members()`.
-4. **Ejection**: a failed request removes the member and records its address, which the next fill
+7. **Ejection**: a failed request removes the member and records its address, which the next fill
    deprioritises so a peer that just failed cannot immediately reclaim its slot. It is never
    permanently banned: once untried candidates are exhausted it is reconsidered.
-5. **Replacement**: `try_refill()` fills toward `target` when under it.
-6. **Shutdown**: on `ChiaQuery::drop()`, all peer connections close.
+8. **Replacement**: `try_refill()` fills toward `target` when under it, subject to the gating
+   above.
+9. **Shutdown**: on `ChiaQuery::drop()`, all peer connections close.
 
 #### Peak claims
 
@@ -260,9 +302,19 @@ announced it in `NewPeakWallet`. A claim is **unverified** — a peer may assert
 
 `peak_height()` is the maximum height claimed by any member. It is a maximum over unverified
 claims, so with a single member it is that member's word alone; corroborate across
-`peer_members()` before treating it as agreed. `PeerBackend::header_hash_at` asks one member for
-the header hash at a height and COMPUTES it from the returned header block, never reading a
-peer-supplied hash field.
+`peer_members()` before treating it as agreed.
+
+Members are address-distinct, which is NECESSARY for their claims to be independent and is NOT
+SUFFICIENT. Several addresses may be one process or one operator, and seeders list any node that
+answers; the guarantee also assumes an honest dialer, since admission keys on the address the pool
+REQUESTED. A caller MUST weigh independence rather than infer it from the member count.
+
+`PeerBackend::header_hash_at` asks one member for the header hash at a height, COMPUTES it from
+the returned header block — never reading a peer-supplied hash field — and returns `None` unless
+the returned block is AT the requested height. A peer may answer a request for height H with a
+real block at H'; its hash is equally genuine and answers a different question, and two peers each
+serving one frozen header would otherwise compare EQUAL at every height. `None` is an abstention
+and MUST NOT be read as agreement.
 
 #### DNS Introducers
 

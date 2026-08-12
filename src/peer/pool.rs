@@ -257,7 +257,7 @@ pub struct PeerPoolInner<P: Clone> {
     /// Single-flight, not mutual exclusion: a caller that cannot take it returns at once rather
     /// than queueing, so K concurrent reads over a short pool cost ONE sweep and not K.
     refilling: Mutex<()>,
-    /// When a fill last ended under `target`, gating the next sweep by [`REFILL_COOLDOWN`].
+    /// When a fill last ended under `target`, gating the next sweep by `REFILL_COOLDOWN`.
     last_short_fill: RwLock<Option<Instant>>,
     dialer: Arc<dyn PeerDialer<P>>,
     /// Highest peak height claimed by ANY member. Kept as a shared `AtomicU32` updated with
@@ -358,7 +358,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
     }
 
     /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time, and at most
-    /// one per [`REFILL_COOLDOWN`] after a sweep that fell short.
+    /// one per `REFILL_COOLDOWN` (60s) after a sweep that fell short.
     ///
     /// This is the entry point every request path uses, and both bounds are about the request
     /// path rather than about correctness. A pool that cannot reach `target` distinct peers is
@@ -386,8 +386,8 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
 
     /// Dial toward `target`, admitting each address AT MOST ONCE.
     ///
-    /// Dials in CONCURRENT batches of [`DIAL_BATCH`] and considers at most
-    /// [`MAX_DIALS_PER_FILL`] candidates, so a long list costs a bounded amount of time and a
+    /// Dials in CONCURRENT batches of `DIAL_BATCH` (10) and considers at most
+    /// `MAX_DIALS_PER_FILL` (20) candidates, so a long list costs a bounded amount of time and a
     /// bounded number of handshakes. Batching does not relax distinctness: a batch is drawn only
     /// from addresses the
     /// pool does not already hold, and every admission still passes the re-check under the
