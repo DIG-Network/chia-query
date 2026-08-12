@@ -114,14 +114,27 @@ pub fn trusted_fullnode_from_env(network: NetworkType) -> Option<SocketAddr> {
     )
 }
 
-/// The IPv4 address an IPv6 literal carries, for every encoding that carries one.
+/// The IPv4 address an IPv6 literal carries, for THE ENCODINGS LISTED BELOW.
 ///
-/// Three encodings put an IPv4 address inside an IPv6 one, and all three are reachable: a host
-/// dials `::ffff:a.b.c.d` and `::a.b.c.d` straight through its v4 stack, and on an IPv6-only
-/// network running 464XLAT a local CLAT translates `64:ff9b::a.b.c.d` to `a.b.c.d`. So an
-/// address check that unwraps only the first of them can be walked past by using either of the
-/// others — `64:ff9b::7f00:1` is `127.0.0.1` on exactly the deployment this crate's IPv6-first
-/// rule steers toward.
+/// Four encodings are unwrapped here: IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible `::a.b.c.d`,
+/// IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765/6052), and the well-known NAT64 prefix
+/// `64:ff9b::a.b.c.d` (RFC 6052 §2.1). Each puts a real IPv4 destination inside a literal that
+/// reads as IPv6, so a check that unwraps only the first can be walked past by using any of the
+/// others: `64:ff9b::7f00:1` and `::ffff:0:7f00:1` are `127.0.0.1` wearing a v6 literal, and a
+/// check that reads them as ordinary global unicast admits as many of them as an introducer cares
+/// to name. Whether a given host's stack translates them locally, hands them to a NAT64 gateway,
+/// or fails to route them at all, none of them is an address a public full node can be reached
+/// at — which is the only thing this filter needs to be right about.
+///
+/// It is NOT "every encoding", and that claim cannot be made honestly. RFC 6052 also permits
+/// NETWORK-SPECIFIC prefixes at /32, /40, /48, /56 and /64 — any prefix a local operator chooses
+/// — and those are unenumerable from an address literal alone: the same 128 bits are a network's
+/// own translation prefix on one host and an ordinary global unicast address on another. They are
+/// out of scope here and are refused, where they can be refused at all, by the positive
+/// global-unicast rule in [`is_routable_peer`] rather than by unwrapping. The one such prefix that
+/// IS fixed by an RFC — the local-use `64:ff9b:1::/48` of RFC 8215 — is refused outright there,
+/// because its embedded-IPv4 offset depends on the deployed prefix length and so cannot be
+/// unwrapped, and because it can never be a public full node.
 ///
 /// `Ipv6Addr::to_ipv4` is deliberately NOT used, because it maps `::1` to `0.0.0.1` — an address
 /// that is not `Ipv4Addr::is_loopback`, so unwrapping loopback through it discards the very fact
@@ -138,10 +151,14 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
     let s = v6.segments();
     let last32 = Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32);
-    // ::/96 (IPv4-compatible) and 64:ff9b::/96 (RFC6052 well-known NAT64 prefix).
+    // ::/96 (IPv4-compatible), ::ffff:0:0:0/96 (IPv4-translated, RFC 2765) and 64:ff9b::/96
+    // (RFC 6052 well-known NAT64 prefix). IPv4-mapped ::ffff:0:0/96 was already taken above.
     let is_v4_compatible = s[0..6] == [0, 0, 0, 0, 0, 0];
+    // `::ffff:0:a.b.c.d` puts the `ffff` one group EARLIER than IPv4-mapped `::ffff:a.b.c.d`
+    // does; the two prefixes differ by exactly that shift, which is why one is not the other.
+    let is_v4_translated = s[0..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0;
     let is_nat64_wellknown = s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0];
-    (is_v4_compatible || is_nat64_wellknown).then_some(last32)
+    (is_v4_compatible || is_v4_translated || is_nat64_wellknown).then_some(last32)
 }
 
 /// Whether `v4` is in a range no peer on the public internet can be reached at.
@@ -169,8 +186,9 @@ fn is_non_global_ipv4(v4: Ipv4Addr) -> bool {
 /// address. Refused, therefore: loopback (the whole of `127.0.0.0/8` is on `lo`, so one process
 /// answers on all of it as distinct addresses), unspecified, link-local, unique-local, RFC1918,
 /// carrier-grade NAT, the documentation/benchmark/reserved ranges, multicast and broadcast — in
-/// both address families, and through every IPv6 encoding that carries an IPv4 address
-/// (see [`embedded_ipv4`]).
+/// both address families, and through each of the IPv6 encodings [`embedded_ipv4`] lists as
+/// carrying an IPv4 address. Encodings outside that list are not unwrapped and are refused, when
+/// they can be, only by the positive rule itself; [`embedded_ipv4`] says which and why.
 ///
 /// Operator-named addresses are NOT subject to this — a local full node is the legitimate
 /// loopback case, and somebody asked for it.
@@ -192,15 +210,32 @@ fn is_routable_peer(addr: &SocketAddr) -> bool {
             let is_documentation = s[0] == 0x2001 && s[1] == 0x0db8;
             let is_teredo = s[0] == 0x2001 && s[1] == 0;
             let is_6to4 = s[0] == 0x2002;
+            // fec0::/10, the deprecated site-local range: still routed inside many networks, and
+            // an introducer naming one is naming somebody's LAN.
+            let is_site_local = first == 0xfe && second & 0xc0 == 0xc0;
+            // 3ffe::/16, the returned 6bone allocation, and 2001:20::/28, ORCHIDv2 — neither is
+            // an address any full node can be reached at.
+            let is_6bone = s[0] == 0x3ffe;
+            let is_orchid = s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020;
+            // 64:ff9b:1::/48, RFC 8215's LOCAL-USE NAT64 prefix. Refused whole rather than
+            // unwrapped: the embedded IPv4 sits at an offset that depends on the deployed prefix
+            // length, so there is no fixed place to look, and a local-use translation prefix is
+            // never where a public full node lives. Measured filling every slot in a five-peer
+            // pool, because `embedded_ipv4` declines it and the generic unicast rule allowed it.
+            let is_nat64_local_use = s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001;
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || is_unique_local
                 || is_link_local
+                || is_site_local
                 || is_discard
                 || is_documentation
                 || is_teredo
-                || is_6to4)
+                || is_6to4
+                || is_6bone
+                || is_orchid
+                || is_nat64_local_use)
         }
     }
 }
@@ -458,13 +493,14 @@ mod tests {
         }
     }
 
-    /// The two OTHER encodings that carry an IPv4 address into an IPv6 literal.
+    /// The OTHER encodings that carry an IPv4 address into an IPv6 literal.
     ///
     /// `::ffff:127.0.0.1` was already unwrapped; its siblings were not, so the same loopback
-    /// address written either of two other ways walked straight past every v4 check. The NAT64
-    /// one is not theoretical: on an IPv6-only network running 464XLAT the host's own CLAT
-    /// translates `64:ff9b::7f00:1` to `127.0.0.1` before the packet leaves, which is precisely
-    /// the deployment this crate's IPv6-first rule steers toward.
+    /// address written three other ways walked straight past every v4 check. The rationale is
+    /// not about how any one host routes them — a locally-originated translated packet lands on
+    /// the TRANSLATOR's loopback, not on yours. It is simply that none of these literals can be a
+    /// public full node, while an introducer can name as many of them as it likes and the pool
+    /// will count each as a distinct peer.
     ///
     /// The globally-routable member of each family is the control: unwrapping must be a filter
     /// on what is embedded, not a blanket refusal of the encoding.
@@ -475,6 +511,8 @@ mod tests {
             addr("[::a00:1]:8444"),         // ::/96 IPv4-compatible RFC1918
             addr("[64:ff9b::7f00:1]:8444"), // NAT64 well-known prefix over loopback
             addr("[64:ff9b::a00:1]:8444"),  // NAT64 well-known prefix over RFC1918
+            addr("[::ffff:0:7f00:1]:8444"), // IPv4-translated (RFC 2765) over loopback
+            addr("[::ffff:0:a00:1]:8444"),  // IPv4-translated over RFC1918
         ] {
             assert!(
                 !is_routable_peer(&dropped),
@@ -490,6 +528,49 @@ mod tests {
             is_routable_peer(&addr("[::ffff:1.2.3.4]:8444")),
             "an IPv4-mapped routable address is still a real internet peer"
         );
+        assert!(
+            is_routable_peer(&addr("[::ffff:0:102:304]:8444")),
+            "IPv4-translated over a real internet address is still a real internet peer"
+        );
+    }
+
+    /// The ranges an introducer can name that are neither loopback nor an IPv4 in disguise, and
+    /// that the generic global-unicast rule let through.
+    ///
+    /// `64:ff9b:1::/48` is the sharp one and was MEASURED filling all five slots of a five-peer
+    /// pool: `embedded_ipv4` declines it, because RFC 8215 leaves the embedded IPv4's offset up
+    /// to the deployed prefix length, and every remaining v6 check passed it. Refusing the whole
+    /// /48 is the only answer available, and it is the right one — a local-use translation prefix
+    /// is not where a public full node lives.
+    ///
+    /// `64:ff9b::102:304` is the control on the very next prefix: refusing the local-use /48 must
+    /// not take the well-known /96 with it.
+    #[test]
+    fn local_use_and_retired_ipv6_ranges_are_not_globally_routable() {
+        for dropped in [
+            addr("[64:ff9b:1::7f00:1]:8444"), // RFC 8215 local-use NAT64, over loopback
+            addr("[64:ff9b:1::1]:8444"),      // RFC 8215 local-use NAT64, no readable v4
+            addr("[64:ff9b:1:ffff::2]:8444"), // elsewhere in the same /48
+            addr("[fec0::1]:8444"),           // deprecated site-local
+            addr("[feff::1]:8444"),           // the top of fec0::/10
+            addr("[3ffe::1]:8444"),           // returned 6bone allocation
+            addr("[2001:20::1]:8444"),        // ORCHIDv2
+            addr("[2001:2f:ffff::1]:8444"),   // the top of 2001:20::/28
+        ] {
+            assert!(
+                !is_routable_peer(&dropped),
+                "{dropped} is not an address a public full node can be reached at"
+            );
+        }
+
+        for kept in [
+            addr("[64:ff9b::102:304]:8444"), // well-known NAT64 over a real internet address
+            addr("[2001:30::1]:8444"),       // just past ORCHIDv2
+            addr("[3ffd::1]:8444"),          // adjacent to the 6bone range, and unaffected
+            addr("[2606:4700::1]:8444"),     // an ordinary global unicast address
+        ] {
+            assert!(is_routable_peer(&kept), "{kept} is a real internet peer");
+        }
     }
 
     /// The non-global ranges beyond the obvious ones. Each is reachable-looking, none is a full

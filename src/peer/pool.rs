@@ -28,11 +28,15 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chia_protocol::{Bytes32, Message, NewPeakWallet, ProtocolMessageTypes};
 use chia_traits::Streamable;
 use tokio::sync::{mpsc, Mutex, RwLock};
+// `tokio`'s clock, not `std`'s, and the difference is testability: the two throttles below are
+// TIME policies, and `std::time::Instant` does not respond to `tokio::time::pause`. Outside a
+// paused runtime it reads the same real clock `std` does, so nothing about production changes.
+use tokio::time::Instant;
 
 use chia_wallet_sdk::client::Peer;
 use tokio_tungstenite::Connector;
@@ -153,6 +157,30 @@ impl AddressSource for IntroducerAddresses {
 // Fill cost
 // ---------------------------------------------------------------------------
 
+// # The pool's dial-cost policy, in one place
+//
+// Everything below is one policy expressed as four bounds. They were previously emergent from
+// five separate knobs across three files, which is how three successive rounds of locally-correct
+// fixes each severed a neighbour: no reader could see what the loop as a whole was allowed to
+// cost. The bounds are named here, asserted by name in `pool::tests`, and restated in SPEC.
+//
+// - **DP-1, per fill.** One [`PeerPoolInner::fill`] considers at most `MAX_DIALS_PER_FILL`
+//   candidates, dials each at most once, and holds at most `DIAL_BATCH` open at a time.
+// - **DP-2, single-flight.** At most one fill is in flight per pool, in EVERY state including
+//   empty. Enforced by [`PeerPoolInner::refilling`].
+// - **DP-3, per address.** No candidate is dialled more than once per `REFILL_COOLDOWN` at steady
+//   state. This holds by construction once fills are further apart than the time it takes
+//   `dial_cursor` to wrap, and is a consequence of DP-1 and DP-4 rather than a separate check.
+// - **DP-4, aggregate.** Sustained outbound dials stay at or under `MAX_DIALS_PER_FILL` per
+//   minute per pool in every state. A CONTINUOUSLY EMPTY pool may burst to at most six fills —
+//   120 dials — in its first minute, then decays to that steady rate. At target it dials nothing;
+//   short, it is bounded by `REFILL_COOLDOWN`.
+//
+// There is deliberately no rate limiter here. A token bucket would be a second independent policy
+// surface consulted before `fill`, and duplicating a decision across two places that each satisfy
+// any test of it is the exact shape that produced this PR's earlier defects (see the note on
+// [`PeerPoolInner::try_refill`]). Both throttles below gate the SAME call site.
+
 /// How many addresses one fill dials AT ONCE.
 ///
 /// Ten, because that is the batch width introducer resolution already uses
@@ -180,16 +208,24 @@ const MAX_DIALS_PER_FILL: usize = 2 * DIAL_BATCH;
 ///
 /// It gates a SHORT pool only, never an EMPTY one. Short is a diversity problem and can wait a
 /// minute; empty means every read is served by the one centralized HTTP endpoint the peer tier
-/// exists to avoid depending on, and waiting cannot improve it.
+/// exists to avoid depending on, and waiting cannot improve it. An empty pool is instead gated by
+/// [`EMPTY_RETRY_FLOOR`], which starts far shorter and grows toward this value.
 const REFILL_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// How long an EMPTY pool waits before trying another in-front refill sweep.
+/// The shortest interval between two fills of an EMPTY pool, and the value that interval starts
+/// at and resets to.
 ///
-/// Empty must stay exempt from the one-minute short-pool cooldown, or construction that starts
-/// with zero peers and ejection that drains to zero both black out the peer tier. But ungated
-/// empty retries put a full dial budget in front of every read. A short backoff keeps retries
-/// frequent without paying that full sweep cost twice per read.
-const EMPTY_REFILL_COOLDOWN: Duration = Duration::from_secs(5);
+/// One second, because the common empty pool is TRANSIENT — a boot before the network is up, a
+/// DHCP or VPN race, the last member ejected by a failed request — and it recovers on the very
+/// next dial. Blacking that out for `REFILL_COOLDOWN` trades the whole peer tier for one
+/// centralized HTTP endpoint over a condition that would have cleared in a second.
+///
+/// The PERMANENTLY empty pool is the other half, and it is the expensive one: a host that can
+/// reach no full node at all would, at a flat one-second floor, sustain 1200 outbound TLS
+/// handshakes a minute at real mainnet nodes forever. So the interval doubles after every fill
+/// that admits nothing — 1, 2, 4, 8, 16, 32, then capped at `REFILL_COOLDOWN` — and the FIRST
+/// admission resets it. Six fills land in the first minute, twenty dials a minute thereafter.
+const EMPTY_RETRY_FLOOR: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Members
@@ -284,6 +320,15 @@ pub struct PeerPoolInner<P: Clone> {
     refilling: Mutex<()>,
     /// When a fill last ended under `target`, gating the next sweep by `REFILL_COOLDOWN`.
     last_short_fill: RwLock<Option<Instant>>,
+    /// When a fill of an EMPTY pool last admitted nothing, and how long the next one must wait.
+    ///
+    /// `None` means no such fill has happened since the last admission, so the next fill is
+    /// permitted at once. The interval doubles per empty fill and is capped at `REFILL_COOLDOWN`;
+    /// see [`EMPTY_RETRY_FLOOR`] for why it is a backoff rather than a flat floor.
+    ///
+    /// One field in one place: the alternative — a floor here and a counter somewhere else — is
+    /// the split-policy shape this pool has already been bitten by.
+    empty_backoff: RwLock<Option<(Instant, Duration)>>,
     dialer: Arc<dyn PeerDialer<P>>,
     /// Highest peak height claimed by ANY member. Kept as a shared `AtomicU32` updated with
     /// `fetch_max` because `router::get_blockchain_state` reads it directly.
@@ -312,6 +357,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             dial_cursor: AtomicUsize::new(0),
             refilling: Mutex::new(()),
             last_short_fill: RwLock::new(None),
+            empty_backoff: RwLock::new(None),
             dialer,
             peak_height: Arc::new(AtomicU32::new(0)),
         }
@@ -357,22 +403,36 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         Some((member.peer.clone(), member.addr))
     }
 
+    /// Start a refill WITHOUT waiting for it, for a caller that has somewhere else to get its
+    /// answer.
+    ///
+    /// [`try_refill`](Self::try_refill) is single-flight, so calling this on every read of an
+    /// empty pool costs one sweep and not one per read; the spawned task returns immediately when
+    /// a sweep is already running or the state's interval has not elapsed.
+    pub fn try_refill_detached(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move { pool.try_refill().await });
+    }
+
     /// A peer to serve a request with, refilling the pool around the answer.
     ///
     /// A fill is a bounded but real sweep of outbound TLS dials, so where it sits relative to
     /// selection decides what a read costs. With a usable member in hand the sweep buys
     /// DIVERSITY, which the caller waiting on a read does not need right now — so it runs BEHIND
-    /// the answer, detached. With nothing to serve it buys AVAILABILITY and is the only thing
-    /// that can help, so it runs IN FRONT and the caller waits for it.
+    /// the answer, detached. With nothing to serve it buys AVAILABILITY, so it runs IN FRONT and
+    /// the caller waits for it.
     ///
-    /// The decision lives here rather than at the call site because it is a property of the
-    /// pool's own cost model, and because a caller cannot be asked to rediscover it.
-    /// [`try_refill`](Self::try_refill) is single-flight either way, which is what keeps the
-    /// detached case from accumulating sweeps.
+    /// That second case is the pool's answer for a caller that has NO other source. A caller that
+    /// does have one must not reach this function while empty: waiting here buys a
+    /// low-probability decentralized answer on precisely the read whose fill is least likely to
+    /// succeed, at up to two connect-timeout sweeps, when the fallback would have answered in
+    /// milliseconds — and the detached fill makes the NEXT read peer-served anyway. The pool
+    /// cannot see whether its caller has a fallback, so that decision is `router`'s: it
+    /// short-circuits to the fallback and calls
+    /// [`try_refill_detached`](Self::try_refill_detached) instead.
     pub async fn select_refilling(self: &Arc<Self>) -> Option<(P, SocketAddr)> {
         if let Some(picked) = self.select_peer().await {
-            let pool = Arc::clone(self);
-            tokio::spawn(async move { pool.try_refill().await });
+            self.try_refill_detached();
             return Some(picked);
         }
 
@@ -390,6 +450,9 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         };
         self.ejected.write().await.insert(addr);
         if became_empty {
+            // A clock started while the pool was merely SHORT says nothing about a pool that now
+            // holds nothing, so it is discarded rather than carried into the empty state — where
+            // `empty_backoff` is the interval that applies.
             *self.last_short_fill.write().await = None;
         }
         log::debug!(
@@ -413,46 +476,61 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         self.members.read().await.is_empty()
     }
 
-    /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time, and, for a
-    /// pool that is merely SHORT, at most one per `REFILL_COOLDOWN` (60s).
+    /// Dial toward `target` if the pool is under it — AT MOST ONE sweep at a time (DP-2), and no
+    /// more often than the state's own interval allows.
     ///
-    /// This is the entry point every request path uses, and both bounds are about the request
-    /// path rather than about correctness. A pool that cannot reach `target` distinct peers is
-    /// under target PERMANENTLY, so an ungated refill re-walks the candidate list on every read,
-    /// once per concurrent read.
+    /// Two intervals, because the two states are different problems. A pool that is merely SHORT
+    /// has something to serve with and is short of DIVERSITY, so it waits the full
+    /// `REFILL_COOLDOWN`. A pool that is EMPTY has nothing to serve with and is short of
+    /// AVAILABILITY, so it retries from `EMPTY_RETRY_FLOOR` — one second — and backs off from
+    /// there only as repeated fills go on admitting nothing. Between them they hold DP-4: at most
+    /// 120 dials in a continuously-empty pool's first minute, and 20 a minute after that.
     ///
-    /// An EMPTY pool is exempt from the cooldown. Between "short" and "empty" the cooldown is
-    /// trading diversity for handshake volume in the first case and the entire peer tier for one
-    /// centralized HTTP endpoint in the second — and a pool that fell short at construction, or
-    /// that was drained to zero by ejections, would otherwise be blacked out for a minute at
-    /// exactly the moment it has nothing to serve with.
-    ///
-    /// Whether there is ROOM is not decided here: [`fill`](Self::fill) decides it, from the
-    /// member set, under concurrency. Repeating that check here would put the same policy in two
-    /// places where either alone would satisfy any test of it.
+    /// Both intervals gate THIS call site and nothing else. Whether there is ROOM is likewise not
+    /// decided here: [`fill`](Self::fill) decides it, from the member set, under concurrency.
+    /// Repeating either check elsewhere would put one policy in two places where either alone
+    /// would satisfy any test of it.
     pub async fn try_refill(&self) {
         let Ok(_in_flight) = self.refilling.try_lock() else {
             return;
         };
-        let (is_empty, last_short) = {
-            let is_empty = self.members.read().await.is_empty();
-            let last_short = *self.last_short_fill.read().await;
-            (is_empty, last_short)
-        };
-        if let Some(last_short) = last_short {
-            let cooldown = if is_empty {
-                EMPTY_REFILL_COOLDOWN
-            } else {
-                REFILL_COOLDOWN
-            };
-            if last_short.elapsed() < cooldown {
+        if self.is_empty().await {
+            if let Some((last_empty, floor)) = *self.empty_backoff.read().await {
+                if last_empty.elapsed() < floor {
+                    return;
+                }
+            }
+        } else if let Some(last_short) = *self.last_short_fill.read().await {
+            if last_short.elapsed() < REFILL_COOLDOWN {
                 return;
             }
         }
 
-        if self.fill().await < self.target {
+        let held = self.fill().await;
+        if held < self.target {
             *self.last_short_fill.write().await = Some(Instant::now());
         }
+        self.record_empty_outcome(held).await;
+    }
+
+    /// Advance or clear the empty-pool backoff, given how many members the fill left behind.
+    ///
+    /// Recorded AFTER the fill rather than before it, so the interval is measured from the end of
+    /// one sweep to the start of the next and a slow sweep cannot overlap the following one.
+    async fn record_empty_outcome(&self, held: usize) {
+        let mut backoff = self.empty_backoff.write().await;
+        if held > 0 {
+            // Any admission at all means the network can supply a peer, so the evidence the
+            // backoff was accumulating is stale. Reset rather than decay: a pool that flaps
+            // between one member and none must not degrade to a minute's silence.
+            *backoff = None;
+            return;
+        }
+        let next = match *backoff {
+            Some((_, current)) => (current * 2).min(REFILL_COOLDOWN),
+            None => EMPTY_RETRY_FLOOR,
+        };
+        *backoff = Some((Instant::now(), next));
     }
 
     /// Dial toward `target`, admitting each address AT MOST ONCE.
@@ -520,9 +598,7 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             for (addr, outcome) in connections {
                 match outcome {
                     Ok(connection) => {
-                        if self.try_admit(addr, connection).await {
-                            self.ejected.write().await.remove(&addr);
-                        }
+                        self.try_admit(addr, connection).await;
                     }
                     Err(e) => log::debug!("connect to {addr} failed: {e}"),
                 }
@@ -592,6 +668,11 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
                 peer,
                 peak: Arc::clone(&peak),
             });
+            // Cleared while the members write lock is still held, so "admitted" and "no longer
+            // deprioritised" become true together. Done after the guard dropped, a concurrent
+            // `dial_window` could read the member as admitted and the ejection as still standing,
+            // and deprioritise an address the pool is currently holding for one whole fill.
+            self.ejected.write().await.remove(&addr);
         }
         self.spawn_receiver_handler(peak, receiver);
         true
@@ -619,7 +700,11 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
         };
 
         let candidates = connect::candidate_list(&self.trusted, discovered);
-        if candidates.len() <= self.trusted.len() {
+        // Against the trusted list AS THE COMPOSER SEES IT, not `self.trusted.len()`:
+        // `candidate_list` de-duplicates, so an operator who named the same node twice would make
+        // a genuinely useful discovery answer look like it contributed nothing.
+        let trusted_only = connect::candidate_list(&self.trusted, Vec::new()).len();
+        if candidates.len() <= trusted_only {
             // Discovery answered, but nothing it named survived the routability filter — a
             // poisoned resolver, or an introducer with nothing but private addresses. That is a
             // failed resolution wearing a success, and caching it would fix the pool on the
@@ -692,7 +777,8 @@ impl PeerPool {
         let discovery = Arc::new(IntroducerAddresses::new(network, connect_timeout));
         let pool = Self::with_dialer(dialer, discovery, max_peers, trusted, network);
         // Through `try_refill` rather than `fill` so a construction that falls short arms the
-        // cooldown, and the first request does not immediately repeat the sweep that just failed.
+        // matching interval — the short cooldown, or the empty-pool backoff at its one-second
+        // floor — instead of leaving the first request free to repeat the sweep that just failed.
         pool.try_refill().await;
 
         if pool.is_empty().await {

@@ -104,6 +104,9 @@ dig-chainsource-interface = { version = "0.3", features = ["testing"] }
 # tests build GENUINE singleton-family spends to exercise the singleton-shape gate
 # (pinned to the same 0.20.3 `chia-wallet-sdk` 0.34 resolves).
 chia-puzzles = "0.20.3"
+# `test-util` is NOT part of tokio's `full` feature, and the pool's empty-pool backoff is a
+# time-based policy: without a pausable clock its tests would have to sleep in real seconds.
+tokio = { version = "1", features = ["test-util"] }
 
 [[bin]]
 name = "coinset_drift"

@@ -72,7 +72,11 @@ impl AddressSource for FixedAddresses {
 /// handed out — including the ones the pool went on to reject.
 struct FakeDialer {
     /// Addresses that answer. Anything else fails to connect.
-    reachable: HashSet<SocketAddr>,
+    ///
+    /// Mutable so a test can make the network COME BACK part-way through. A policy that reacts to
+    /// admission — the empty-pool backoff reset — cannot be observed by a dialer whose answers are
+    /// fixed for the run, because such a dialer can never produce the admission.
+    reachable: Mutex<HashSet<SocketAddr>>,
     /// EVERY dial the pool asked for, in order, reachable or not.
     ///
     /// Attempts rather than successes, because what needs bounding is the work a fill does:
@@ -94,6 +98,11 @@ struct FakeDialer {
     /// meant to observe overlap observes none. Yielding is the smallest thing that makes the
     /// interleaving real without introducing a timing dependency.
     stalls: bool,
+    /// Whether a dial to a REACHABLE address never resolves.
+    ///
+    /// The only way to tell a refill that was started from one that was waited on: an awaited
+    /// fill over a hanging dialer cannot return, so a caller that does return proves it detached.
+    hangs: bool,
     /// Dials currently in flight, and the most that were ever in flight at once.
     ///
     /// The high-water mark is the only thing that can tell a CONCURRENT batch from a serial
@@ -107,14 +116,30 @@ struct FakeDialer {
 impl FakeDialer {
     fn new(addrs: &[SocketAddr], stalls: bool, contended: Option<SocketAddr>) -> Arc<Self> {
         Arc::new(Self {
-            reachable: addrs.iter().copied().collect(),
+            reachable: Mutex::new(addrs.iter().copied().collect()),
             attempted: Mutex::new(Vec::new()),
             handed_out: Mutex::new(Vec::new()),
             contended: contended.map(|a| (a, Arc::new(tokio::sync::Barrier::new(2)))),
             stalls,
+            hangs: false,
             in_flight: Arc::new(AtomicUsize::new(0)),
             max_in_flight: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// A dialer whose dials to `addrs` never resolve, standing in for a connect timeout.
+    fn hanging_on(addrs: &[SocketAddr]) -> Arc<Self> {
+        let mut dialer = Self::new(addrs, false, None);
+        Arc::get_mut(&mut dialer).expect("sole owner").hangs = true;
+        dialer
+    }
+
+    /// Make `addrs` — and only `addrs` — answer from now on.
+    fn set_reachable(&self, addrs: &[SocketAddr]) {
+        *self
+            .reachable
+            .lock()
+            .expect("reachable set is not poisoned") = addrs.iter().copied().collect();
     }
 
     fn reaching(addrs: &[SocketAddr]) -> Arc<Self> {
@@ -188,7 +213,12 @@ impl PeerDialer<FakePeer> for FakeDialer {
             max_in_flight.fetch_max(open, Ordering::Relaxed);
             InFlight(Arc::clone(&in_flight))
         };
-        if !self.reachable.contains(&addr) {
+        let reachable = self
+            .reachable
+            .lock()
+            .expect("reachable set is not poisoned")
+            .contains(&addr);
+        if !reachable {
             return Box::pin(async move {
                 let _open = enter();
                 if stalls {
@@ -205,6 +235,7 @@ impl PeerDialer<FakePeer> for FakeDialer {
             .expect("dial log is not poisoned")
             .push((addr, tx));
         let peer = FakePeer { addr };
+        let hangs = self.hangs;
         let barrier = self
             .contended
             .as_ref()
@@ -214,6 +245,9 @@ impl PeerDialer<FakePeer> for FakeDialer {
             let _open = enter();
             if stalls {
                 tokio::task::yield_now().await;
+            }
+            if hangs {
+                std::future::pending::<()>().await;
             }
             if let Some(barrier) = barrier {
                 barrier.wait().await;
@@ -1033,9 +1067,18 @@ async fn two_concurrent_fills_do_not_exceed_one_fills_dial_budget() {
     assert_eq!(pool.len().await, 3);
     assert!(
         dialer.attempt_count() <= MAX_DIALS_PER_FILL,
-        "two fills dialled {} addresses; a fill blind to its sibling dials {} here",
+        "DP-1: two fills dialled {} addresses; a fill blind to its sibling dials {} here",
         dialer.attempt_count(),
         3 * DIAL_BATCH
+    );
+    // The budget above is exactly saturated by this fixture, so it has no headroom: the very
+    // next dial added anywhere turns it from a failure into an intermittent one. Pinning the
+    // relationship between the two constants separately is what makes a change to either fail
+    // loudly here instead of quietly eating the margin.
+    assert_eq!(
+        MAX_DIALS_PER_FILL,
+        2 * DIAL_BATCH,
+        "DP-1's per-fill budget is defined as two batches; the assertion above assumes it"
     );
 }
 
@@ -1046,7 +1089,7 @@ async fn two_concurrent_fills_do_not_exceed_one_fills_dial_budget() {
 ///
 /// The pool holds ONE member on purpose. That is the whole distinction the cooldown is allowed to
 /// draw: it may throttle a SHORT pool, which has something to serve with, and never an EMPTY one
-/// — see [`an_empty_pool_may_always_retry`].
+/// — see [`an_empty_pool_retries_within_one_second`].
 #[tokio::test]
 async fn a_refill_that_fell_short_is_not_immediately_repeated() {
     let reachable = book(1);
@@ -1065,25 +1108,64 @@ async fn a_refill_that_fell_short_is_not_immediately_repeated() {
     );
 }
 
-/// An EMPTY pool retries far sooner than `REFILL_COOLDOWN`.
-///
-/// Empty must not inherit the one-minute short-pool cooldown: a pool that fell short at
-/// construction would otherwise sit at zero peers for a minute. This test names that property
-/// directly: once the empty cooldown has elapsed — while still far short of
-/// `REFILL_COOLDOWN` — another sweep is allowed.
-#[tokio::test]
-async fn an_empty_pool_may_always_retry() {
+// ---------------------------------------------------------------------------
+// DP-4: what an EMPTY pool is allowed to cost
+// ---------------------------------------------------------------------------
+
+/// A pool with no peers, dialling a book that answers nothing, on a clock the test drives.
+fn empty_pool_over_a_dead_network() -> (Arc<PeerPoolInner<FakePeer>>, Arc<FakeDialer>) {
     let dialer = FakeDialer::reaching(&[]);
-    let pool = pool_with(
+    let pool = Arc::new(pool_with(
         Arc::clone(&dialer),
         FixedAddresses::always(&book(60)),
         5,
         Vec::new(),
-    );
+    ));
+    (pool, dialer)
+}
+
+/// Drive `pool` for `window` of PAUSED time, offering it a refill every 100ms, and report how
+/// many dials it chose to make.
+///
+/// Small steps rather than one jump, because the question is how often the pool ACCEPTS an
+/// offered refill; a test that only offers one per interval measures its own step size.
+async fn dials_over(
+    pool: &Arc<PeerPoolInner<FakePeer>>,
+    dialer: &FakeDialer,
+    window: Duration,
+) -> usize {
+    let before = dialer.attempt_count();
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < window {
+        pool.try_refill().await;
+        tokio::time::advance(step).await;
+        elapsed += step;
+    }
+    dialer.attempt_count() - before
+}
+
+/// An EMPTY pool retries within ONE SECOND, and not sooner.
+///
+/// Two failures are equally real and this pins both. Blacking an empty pool out for the short
+/// pool's full minute trades the entire peer tier for one centralized HTTP endpoint over a
+/// condition — a boot before the network is up, a DHCP or VPN race, the last member ejected —
+/// that clears on the next dial. Exempting it from any interval at all is how one read on an
+/// empty pool came to cost 40 dials and ten reads 400.
+///
+/// The second call is IMMEDIATE and the third is one second later, so the test fails from either
+/// side: too permissive and the immediate retry sweeps, too strict and the one-second retry does
+/// not.
+#[tokio::test(start_paused = true)]
+async fn an_empty_pool_retries_within_one_second() {
+    let (pool, dialer) = empty_pool_over_a_dead_network();
 
     pool.try_refill().await;
-    let after_first = dialer.attempt_count();
-    assert_eq!(after_first, MAX_DIALS_PER_FILL, "the first refill swept");
+    assert_eq!(
+        dialer.attempt_count(),
+        MAX_DIALS_PER_FILL,
+        "the first refill swept"
+    );
     assert!(
         pool.is_empty().await,
         "and the pool is empty, not merely short"
@@ -1092,40 +1174,142 @@ async fn an_empty_pool_may_always_retry() {
     pool.try_refill().await;
     assert_eq!(
         dialer.attempt_count(),
-        after_first,
-        "an empty pool was re-swept before its own cooldown elapsed"
+        MAX_DIALS_PER_FILL,
+        "an empty pool re-swept immediately; nothing can have changed in zero time"
     );
 
-    *pool.last_short_fill.write().await =
-        Some(Instant::now() - EMPTY_REFILL_COOLDOWN - Duration::from_millis(1));
+    tokio::time::advance(EMPTY_RETRY_FLOOR).await;
     pool.try_refill().await;
     assert_eq!(
         dialer.attempt_count(),
         2 * MAX_DIALS_PER_FILL,
-        "an empty pool inherited the one-minute short-pool cooldown"
+        "an empty pool was still blacked out one second after it emptied"
     );
 }
 
-/// Two immediate empty-pool refill attempts spend one fill budget, not two.
+/// DP-4's burst half: a continuously-empty pool makes at most 120 dials in its first minute.
 ///
-/// This is the read-path cost bound: an empty pool is filled in front of the answer, and a
-/// host that can reach no peer must not pay a full sweep on both peer attempts of every read.
-#[tokio::test]
-async fn back_to_back_empty_refills_do_not_each_spend_a_full_sweep() {
-    let dialer = FakeDialer::reaching(&[]);
-    let pool = pool_with(
-        Arc::clone(&dialer),
-        FixedAddresses::always(&book(60)),
-        5,
-        Vec::new(),
+/// The lower bound is the control and it is the half that matters most here. An upper bound alone
+/// is satisfied by a pool that gave up entirely — which is precisely the over-correction a
+/// previous round shipped, a flat sixty-second floor that left a transiently-empty pool silent.
+/// 1+2+4+8+16+32 puts six fills inside the minute; anything longer than the one-second floor, or
+/// any blanket cooldown, drops below five.
+#[tokio::test(start_paused = true)]
+async fn empty_pool_first_minute_dial_ceiling() {
+    let (pool, dialer) = empty_pool_over_a_dead_network();
+
+    let dials = dials_over(&pool, &dialer, Duration::from_secs(60)).await;
+
+    assert!(
+        dials <= 6 * MAX_DIALS_PER_FILL,
+        "DP-4: {dials} dials in the first minute of emptiness, ceiling {}",
+        6 * MAX_DIALS_PER_FILL
+    );
+    assert!(
+        dials >= 5 * MAX_DIALS_PER_FILL,
+        "DP-4: only {dials} dials in the first minute; an empty pool must keep trying, not go \
+         quiet — the backoff has been lengthened or a blanket cooldown reinstated"
+    );
+}
+
+/// DP-4's steady half: past the ramp, an empty pool settles at one fill per `REFILL_COOLDOWN`.
+///
+/// A backoff that doubles without a cap would put roughly one fill in these four minutes; one
+/// that never grew at all would put two hundred and forty. The assertion is the shape of the
+/// cap, so it fails in both directions.
+#[tokio::test(start_paused = true)]
+async fn empty_pool_sustained_rate_after_ramp() {
+    let (pool, dialer) = empty_pool_over_a_dead_network();
+
+    dials_over(&pool, &dialer, Duration::from_secs(60)).await;
+    let sustained = dials_over(&pool, &dialer, Duration::from_secs(240)).await;
+
+    let expected_fills = 240 / REFILL_COOLDOWN.as_secs() as usize;
+    assert!(
+        sustained <= (expected_fills + 1) * MAX_DIALS_PER_FILL,
+        "DP-4: {sustained} dials over four sustained minutes; the backoff never reached its cap"
+    );
+    assert!(
+        sustained >= (expected_fills - 1) * MAX_DIALS_PER_FILL,
+        "DP-4: only {sustained} dials over four sustained minutes; the cap has been raised past \
+         the short pool's own cooldown and an empty pool is quieter than a short one"
+    );
+}
+
+/// The first admission resets the backoff — a flapping pool must not degrade to a minute's
+/// silence.
+///
+/// Without the reset the interval is monotonic, so a pool that loses its last member after a bad
+/// hour waits sixty seconds to try again even though the network has just demonstrably answered.
+/// Ramping to the cap first is what makes the reset observable: at a floor still near one second,
+/// a monotonic backoff and a reset one are indistinguishable.
+#[tokio::test(start_paused = true)]
+async fn admission_resets_the_empty_backoff() {
+    let (pool, dialer) = empty_pool_over_a_dead_network();
+
+    dials_over(&pool, &dialer, Duration::from_secs(180)).await;
+
+    // The whole book, because by now the cursor has walked well past its start and which slice
+    // the next fill takes is not this test's subject — that an ADMISSION happens is.
+    dialer.set_reachable(&book(60));
+    tokio::time::advance(REFILL_COOLDOWN).await;
+    pool.try_refill().await;
+    assert!(
+        !pool.is_empty().await,
+        "the network came back and the pool admitted a peer"
     );
 
+    for member in pool.peer_members().await {
+        pool.eject_peer(member.addr).await;
+    }
+    assert!(pool.is_empty().await, "and is then drained back to nothing");
+    let after_admission = dialer.attempt_count();
+    dialer.set_reachable(&[]);
+
     pool.try_refill().await;
+    assert!(
+        dialer.attempt_count() > after_admission,
+        "a pool emptied right after an admission must retry at once, not serve out a backoff \
+         accumulated before the network came back"
+    );
+
+    // And the reset is to the FLOOR, not merely one free pass: the interval that follows is one
+    // second again. A backoff that resumed at its capped value would still be silent here.
+    let after_retry = dialer.attempt_count();
+    tokio::time::advance(EMPTY_RETRY_FLOOR).await;
     pool.try_refill().await;
-    assert_eq!(
-        dialer.attempt_count(),
-        MAX_DIALS_PER_FILL,
-        "two immediate empty-pool refills each spent a full dial budget"
+    assert!(
+        dialer.attempt_count() > after_retry,
+        "the backoff resumed at its capped interval instead of resetting to the one-second floor"
+    );
+}
+
+/// A detached refill does not make its caller wait, even when every dial hangs.
+///
+/// The dialer never resolves, so an awaited fill could not return at all. Returning at all is
+/// therefore the whole observation — and the dials still start, which is what makes the NEXT
+/// read peer-served.
+#[tokio::test]
+async fn a_detached_refill_returns_before_its_dials_do() {
+    let reachable = book(3);
+    let dialer = FakeDialer::hanging_on(&reachable);
+    let pool = Arc::new(pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&reachable),
+        3,
+        Vec::new(),
+    ));
+
+    pool.try_refill_detached();
+
+    wait_until("the detached refill to start dialling", || {
+        let dialer = Arc::clone(&dialer);
+        async move { dialer.attempt_count() > 0 }
+    })
+    .await;
+    assert!(
+        pool.is_empty().await,
+        "no dial can have completed; this proves the caller was not waiting on one"
     );
 }
 

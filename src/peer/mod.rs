@@ -78,6 +78,15 @@ impl PeerBackend {
         self.pool.has_peers().await
     }
 
+    /// Start a pool refill without waiting for it.
+    ///
+    /// For a caller that found the pool empty and has another source to answer from: the read is
+    /// served by that source now, and the sweep this starts is what makes the next one
+    /// peer-served. Single-flight in the pool, so calling it per read costs one sweep.
+    pub fn try_refill_detached(&self) {
+        self.pool.try_refill_detached();
+    }
+
     // -----------------------------------------------------------------------
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------

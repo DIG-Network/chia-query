@@ -61,7 +61,75 @@ pub struct QueryRouter {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Dispatch one read across the peer tier and the coinset fallback.
+///
+/// A free function, and generic over the whole result type, because it is the one place the
+/// order of sources is decided and both [`QueryRouter::peer_then_coinset`] and its absence-aware
+/// sibling are that same decision — the `Option` variant differs only in what `T` is. Written as
+/// a method it would need a router, which needs a live `PeerBackend`, which needs a socket; as a
+/// free function over plain flags the ordering itself is directly testable.
+///
+/// `peer_reachable` is false when the pool holds nothing AND there is somewhere else to ask. In
+/// that case NEITHER peer future is awaited: they are dropped un-polled, so no peer is selected
+/// and no refill is waited on. Every other case is the historical behaviour — one peer attempt,
+/// one retry on a different peer, then the fallback.
+async fn dispatch_read<T>(
+    peer_reachable: bool,
+    coinset_fallback_enabled: bool,
+    peer_fn: impl std::future::Future<Output = Result<T, ChiaQueryError>>,
+    peer_retry: impl std::future::Future<Output = Result<T, ChiaQueryError>>,
+    coinset_fn: impl std::future::Future<Output = Result<T, ChiaQueryError>>,
+) -> Result<T, ChiaQueryError> {
+    if !peer_reachable {
+        // No peer error to report: no peer was asked. Reporting the coinset error alone is the
+        // honest account of what was attempted.
+        return coinset_fn.await;
+    }
+
+    // First peer attempt
+    match peer_fn.await {
+        Ok(v) => return Ok(v),
+        Err(e) => log::debug!("peer attempt 1 failed: {e}"),
+    }
+
+    // Retry on a different peer
+    match peer_retry.await {
+        Ok(v) => Ok(v),
+        Err(peer_err) => {
+            if !coinset_fallback_enabled {
+                return Err(peer_err);
+            }
+            // Fall back to coinset
+            coinset_fn
+                .await
+                .map_err(|ce| ChiaQueryError::AllSourcesFailed {
+                    peer_error: Box::new(peer_err),
+                    coinset_error: Some(Box::new(ce)),
+                })
+        }
+    }
+}
+
 impl QueryRouter {
+    /// Whether this read should consult the peer tier at all, starting a detached refill if not.
+    ///
+    /// An EMPTY pool refills IN FRONT of the read that found it empty, which costs that read up
+    /// to two connect-timeout sweeps for a decentralized answer the coinset tier would have given
+    /// in milliseconds — and on the one read whose fill is least likely to succeed. Frictionless
+    /// consumption settles it: when a fallback is configured the refill is detached and the read
+    /// goes straight to the fallback, and because the fill still happens the NEXT read is
+    /// peer-served.
+    ///
+    /// With NO fallback configured there is nothing to be fast with, so the read keeps waiting on
+    /// the fill — an answer late beats no answer.
+    async fn peer_tier_is_worth_waiting_for(&self) -> bool {
+        if !self.coinset_fallback_enabled || self.peer.has_peers().await {
+            return true;
+        }
+        self.peer.try_refill_detached();
+        false
+    }
+
     /// Try `peer_fn` twice (each call will select a different peer because the
     /// first failure ejects the peer).  If both fail, fall back to `coinset_fn`.
     async fn peer_then_coinset<T>(
@@ -70,28 +138,14 @@ impl QueryRouter {
         peer_retry: impl std::future::Future<Output = Result<T, ChiaQueryError>>,
         coinset_fn: impl std::future::Future<Output = Result<T, ChiaQueryError>>,
     ) -> Result<T, ChiaQueryError> {
-        // First peer attempt
-        match peer_fn.await {
-            Ok(v) => return Ok(v),
-            Err(e) => log::debug!("peer attempt 1 failed: {e}"),
-        }
-
-        // Retry on a different peer
-        match peer_retry.await {
-            Ok(v) => Ok(v),
-            Err(peer_err) => {
-                if !self.coinset_fallback_enabled {
-                    return Err(peer_err);
-                }
-                // Fall back to coinset
-                coinset_fn
-                    .await
-                    .map_err(|ce| ChiaQueryError::AllSourcesFailed {
-                        peer_error: Box::new(peer_err),
-                        coinset_error: Some(Box::new(ce)),
-                    })
-            }
-        }
+        dispatch_read(
+            self.peer_tier_is_worth_waiting_for().await,
+            self.coinset_fallback_enabled,
+            peer_fn,
+            peer_retry,
+            coinset_fn,
+        )
+        .await
     }
 
     /// Absence-aware variant of [`peer_then_coinset`](Self::peer_then_coinset).
@@ -106,24 +160,14 @@ impl QueryRouter {
         peer_retry: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
         coinset_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     ) -> Result<Option<T>, ChiaQueryError> {
-        match peer_fn.await {
-            Ok(v) => return Ok(v),
-            Err(e) => log::debug!("peer opt attempt 1 failed: {e}"),
-        }
-        match peer_retry.await {
-            Ok(v) => Ok(v),
-            Err(peer_err) => {
-                if !self.coinset_fallback_enabled {
-                    return Err(peer_err);
-                }
-                coinset_fn
-                    .await
-                    .map_err(|ce| ChiaQueryError::AllSourcesFailed {
-                        peer_error: Box::new(peer_err),
-                        coinset_error: Some(Box::new(ce)),
-                    })
-            }
-        }
+        dispatch_read(
+            self.peer_tier_is_worth_waiting_for().await,
+            self.coinset_fallback_enabled,
+            peer_fn,
+            peer_retry,
+            coinset_fn,
+        )
+        .await
     }
 
     /// For endpoints that have no peer protocol equivalent.
@@ -783,5 +827,119 @@ impl QueryRouter {
         self.coinset
             .get_mempool_items_by_coin_name(coin_name, include_spent_coins)
             .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source-order tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A source that records that it was ASKED, distinct from what it answered.
+    ///
+    /// The property under test is which sources a read consults, and a source that only reports
+    /// its answer cannot express "never asked" — the exact state the short-circuit creates.
+    /// Rust futures are lazy, so a future that is built and dropped un-awaited never increments.
+    #[derive(Default)]
+    struct Calls(AtomicUsize);
+
+    impl Calls {
+        async fn answering(&self, value: u8) -> Result<u8, ChiaQueryError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(value)
+        }
+
+        async fn failing(&self) -> Result<u8, ChiaQueryError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(ChiaQueryError::PeerConnection("no peers available".into()))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    /// With nothing in the pool and a fallback configured, the peer tier is not consulted AT ALL.
+    ///
+    /// Not merely "the answer came from coinset": both peer futures had to go un-awaited. Awaiting
+    /// them selects a peer, which on an empty pool runs a refill IN FRONT of the read — up to two
+    /// connect-timeout sweeps, twice over, for an answer the fallback gives in milliseconds. The
+    /// zero is what distinguishes the short-circuit from a peer attempt that merely failed fast.
+    #[tokio::test]
+    async fn an_empty_pool_does_not_delay_a_fallback_read() {
+        let (peer, retry, coinset) = (Calls::default(), Calls::default(), Calls::default());
+
+        let answer = dispatch_read(
+            false,
+            true,
+            peer.failing(),
+            retry.failing(),
+            coinset.answering(7),
+        )
+        .await;
+
+        assert_eq!(answer.expect("the fallback answered"), 7);
+        assert_eq!(
+            peer.count(),
+            0,
+            "the peer tier was consulted on an empty pool"
+        );
+        assert_eq!(retry.count(), 0, "and retried on it");
+        assert_eq!(coinset.count(), 1, "the fallback answered exactly once");
+    }
+
+    /// The control: with a peer available, both peer attempts run before the fallback does.
+    ///
+    /// Without this the short-circuit above is satisfied by a router that never asks a peer
+    /// anything, which would delete the peer tier rather than reorder it.
+    #[tokio::test]
+    async fn a_reachable_peer_tier_is_still_tried_first_and_twice() {
+        let (peer, retry, coinset) = (Calls::default(), Calls::default(), Calls::default());
+
+        let answer = dispatch_read(
+            true,
+            true,
+            peer.failing(),
+            retry.failing(),
+            coinset.answering(7),
+        )
+        .await;
+
+        assert_eq!(answer.expect("the fallback answered"), 7);
+        assert_eq!(peer.count(), 1, "the first peer attempt did not run");
+        assert_eq!(retry.count(), 1, "the retry did not run");
+        assert_eq!(coinset.count(), 1, "and the fallback ran after both");
+    }
+
+    /// The other control: with NO fallback configured there is nothing to be fast with, so the
+    /// read keeps waiting on the peer tier however empty the pool is.
+    ///
+    /// `QueryRouter::peer_tier_is_worth_waiting_for` never reports the tier unreachable in that
+    /// configuration; this pins the behaviour `dispatch_read` must have when it does not.
+    #[tokio::test]
+    async fn without_a_fallback_the_peer_tier_is_always_waited_on() {
+        let (peer, retry, coinset) = (Calls::default(), Calls::default(), Calls::default());
+
+        let answer = dispatch_read(
+            true,
+            false,
+            peer.failing(),
+            retry.answering(9),
+            coinset.answering(7),
+        )
+        .await;
+
+        assert_eq!(answer.expect("the retry answered"), 9);
+        assert_eq!(peer.count(), 1, "the first peer attempt did not run");
+        assert_eq!(
+            coinset.count(),
+            0,
+            "the fallback answered a read it was not needed for"
+        );
     }
 }
