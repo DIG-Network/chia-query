@@ -386,8 +386,10 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
 
     /// Dial toward `target`, admitting each address AT MOST ONCE.
     ///
-    /// Dials in CONCURRENT batches of [`DIAL_BATCH`] and stops after [`MAX_DIALS_PER_FILL`]
-    /// attempts. Batching does not relax distinctness: a batch is drawn only from addresses the
+    /// Dials in CONCURRENT batches of [`DIAL_BATCH`] and considers at most
+    /// [`MAX_DIALS_PER_FILL`] candidates, so a long list costs a bounded amount of time and a
+    /// bounded number of handshakes. Batching does not relax distinctness: a batch is drawn only
+    /// from addresses the
     /// pool does not already hold, and every admission still passes the re-check under the
     /// members write lock, which is what makes two batches — or two whole fills — safe to
     /// overlap.
@@ -414,23 +416,28 @@ impl<P: Clone + Send + Sync + 'static> PeerPoolInner<P> {
             .iter()
             .copied()
             .partition(|a| !ejected.contains(a));
-        let order: Vec<SocketAddr> = fresh.into_iter().chain(retry).collect();
+        // The dial budget is applied HERE, by shortening the list, and nowhere else. Expressed
+        // as a loop guard it would have to be repeated alongside the batch width, and either
+        // half alone would then bound the work — leaving two guards no test can tell apart, and
+        // a guard no test can distinguish is a guard no test protects.
+        let order: Vec<SocketAddr> = fresh
+            .into_iter()
+            .chain(retry)
+            .take(MAX_DIALS_PER_FILL)
+            .collect();
 
-        let mut dialled = 0usize;
         for chunk in order.chunks(DIAL_BATCH) {
-            if held.len() >= self.target || dialled >= MAX_DIALS_PER_FILL {
+            if held.len() >= self.target {
                 break;
             }
             let batch: Vec<SocketAddr> = chunk
                 .iter()
                 .copied()
                 .filter(|addr| !held.contains(addr))
-                .take(MAX_DIALS_PER_FILL - dialled)
                 .collect();
             if batch.is_empty() {
                 continue;
             }
-            dialled += batch.len();
 
             let connections = futures_util::future::join_all(
                 batch

@@ -87,6 +87,13 @@ struct FakeDialer {
     /// connection is ever opened is two fills dialling concurrently and one losing the
     /// write-lock re-check. That race is what this makes deterministic.
     contended: Option<(SocketAddr, Arc<tokio::sync::Barrier>)>,
+    /// Whether every dial yields before answering.
+    ///
+    /// A dialer that answers on its first poll lets one whole fill run to completion inside a
+    /// single poll of a joined future, so concurrent fills never actually overlap and a test
+    /// meant to observe overlap observes none. Yielding is the smallest thing that makes the
+    /// interleaving real without introducing a timing dependency.
+    stalls: bool,
 }
 
 impl FakeDialer {
@@ -96,6 +103,19 @@ impl FakeDialer {
             attempted: Mutex::new(Vec::new()),
             handed_out: Mutex::new(Vec::new()),
             contended: None,
+            stalls: false,
+        })
+    }
+
+    /// As [`reaching`](Self::reaching), but every dial yields before answering, so concurrent
+    /// fills genuinely interleave.
+    fn reaching_slowly(addrs: &[SocketAddr]) -> Arc<Self> {
+        Arc::new(Self {
+            reachable: addrs.iter().copied().collect(),
+            attempted: Mutex::new(Vec::new()),
+            handed_out: Mutex::new(Vec::new()),
+            contended: None,
+            stalls: true,
         })
     }
 
@@ -106,6 +126,7 @@ impl FakeDialer {
             attempted: Mutex::new(Vec::new()),
             handed_out: Mutex::new(Vec::new()),
             contended: Some((addr, Arc::new(tokio::sync::Barrier::new(2)))),
+            stalls: false,
         })
     }
 
@@ -150,8 +171,12 @@ impl PeerDialer<FakePeer> for FakeDialer {
             .lock()
             .expect("dial log is not poisoned")
             .push(addr);
+        let stalls = self.stalls;
         if !self.reachable.contains(&addr) {
             return Box::pin(async move {
+                if stalls {
+                    tokio::task::yield_now().await;
+                }
                 Err(ChiaQueryError::PeerConnection(format!(
                     "{addr} unreachable"
                 )))
@@ -169,6 +194,9 @@ impl PeerDialer<FakePeer> for FakeDialer {
             .filter(|(contended, _)| *contended == addr)
             .map(|(_, barrier)| Arc::clone(barrier));
         Box::pin(async move {
+            if stalls {
+                tokio::task::yield_now().await;
+            }
             if let Some(barrier) = barrier {
                 barrier.wait().await;
             }
@@ -337,22 +365,32 @@ async fn an_address_the_pool_already_holds_is_never_dialled_again() {
     );
 }
 
-/// A fill stops at `target` and does not overshoot it, even when more addresses answer.
+/// A fill stops at `target`: it admits no more members than that, and it stops DIALLING once it
+/// has them.
 ///
-/// Anchors the count ceiling on its own. Distinctness is satisfied by an overshooting pool
-/// too — six distinct members is still six distinct addresses — so only the size can see this.
+/// Two guards, and the fixture has to see both. Distinctness is satisfied by an overshooting
+/// pool too — six distinct members is still six distinct addresses — so only the member count
+/// can see the ceiling. And the write-lock ceiling alone would produce the same member count
+/// while the loop went on dialling every remaining candidate, so only the dial count can see the
+/// loop's own break. The candidate list is deliberately three batches long, and everything in it
+/// answers, so a fill that failed to stop would be plainly visible.
 #[tokio::test]
 async fn a_fill_admits_no_more_members_than_the_target() {
-    let reachable = book(10);
+    let reachable = book(30);
     let (pool, dialer) = pool_over(reachable.clone(), &reachable, 3);
 
     assert_eq!(pool.fill().await, 3);
     assert_eq!(held_addresses(&pool).await.len(), 3);
-    // Dialling happens a batch at a time, so more connections may be opened than there is room
-    // for; what must not happen is admitting them. The surplus is refused and dropped.
+    // Dialling happens a batch at a time, so the first batch opens more connections than there
+    // is room for; what must not happen is admitting them, or dialling a batch beyond it.
     assert!(
-        dialer.connected_count() >= 3,
+        dialer.connected_count() > 3,
         "the fixture must produce surplus connections for the ceiling to refuse"
+    );
+    assert_eq!(
+        dialer.attempt_count(),
+        DIAL_BATCH,
+        "the fill dialled past the batch that already reached target"
     );
 }
 
@@ -561,9 +599,13 @@ async fn a_successful_resolution_is_not_repeated_on_a_later_fill() {
 /// silently gets zero peers would not have been caught.
 #[tokio::test]
 async fn a_trusted_address_is_dialled_first_and_occupies_one_slot() {
-    let configured = addr(1);
-    let discovered = vec![configured, addr(2), addr(3)];
-    let dialer = FakeDialer::reaching(&discovered);
+    // The configured address is deliberately ABSENT from what discovery returns. A pool that
+    // discarded its trusted list entirely would still dial a configured address that discovery
+    // also happened to name, and would still name it first — so a fixture where the two overlap
+    // cannot tell "honoured" from "ignored".
+    let configured = addr(9);
+    let discovered = book(3);
+    let dialer = FakeDialer::reaching(&[&discovered[..], &[configured][..]].concat());
     let pool = pool_with(
         Arc::clone(&dialer),
         FixedAddresses::always(&discovered),
@@ -577,6 +619,27 @@ async fn a_trusted_address_is_dialled_first_and_occupies_one_slot() {
         Some(&configured),
         "the operator's address is dialled before anything discovered"
     );
+    assert!(
+        held_addresses(&pool).await.contains(&configured),
+        "an operator who configures a node must not silently get only discovered peers"
+    );
+}
+
+/// An address named by BOTH configuration and discovery occupies at most one slot — the claim
+/// this crate makes about a configured local node crowding out the pool.
+#[tokio::test]
+async fn an_address_both_configured_and_discovered_is_dialled_once() {
+    let configured = addr(1);
+    let discovered = book(3);
+    let dialer = FakeDialer::reaching(&discovered);
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&discovered),
+        3,
+        vec![configured],
+    );
+
+    assert_eq!(pool.fill().await, 3);
     assert_eq!(
         dialer
             .attempts()
@@ -584,7 +647,7 @@ async fn a_trusted_address_is_dialled_first_and_occupies_one_slot() {
             .filter(|a| **a == configured)
             .count(),
         1,
-        "and offered twice - by configuration and by discovery - it is still dialled once"
+        "offered twice - by configuration and by discovery - and still dialled once"
     );
     assert_eq!(
         held_addresses(&pool)
@@ -593,7 +656,7 @@ async fn a_trusted_address_is_dialled_first_and_occupies_one_slot() {
             .filter(|a| **a == configured)
             .count(),
         1,
-        "and occupies exactly one slot"
+        "and occupying exactly one slot"
     );
 }
 
@@ -656,20 +719,31 @@ async fn one_fill_dials_a_bounded_number_of_addresses() {
 ///
 /// Without single-flight, K concurrent reads run K independent sweeps — up to K times the dial
 /// cap in outbound handshakes from one client, which real full nodes rate-limit and ban source
-/// IPs for. The two-address book keeps the pool permanently short so every caller qualifies to
-/// sweep, which is the condition under which this goes wrong.
+/// IPs for. Nothing is reachable, so the pool stays short and every caller qualifies to sweep,
+/// which is the condition under which this goes wrong.
+///
+/// The dialer must STALL. With a dialer that answers on its first poll, the first refill runs
+/// start to finish inside one poll and arms the cooldown before any sibling is polled at all —
+/// so the COOLDOWN carries the test and it passes with single-flight removed entirely. Yielding
+/// gets all eight past the cooldown check before any of them finishes, which is what leaves
+/// single-flight as the only thing that can hold the count down.
 #[tokio::test]
 async fn concurrent_refills_over_a_short_pool_sweep_once() {
-    let candidates = book(30);
-    let (pool, dialer) = pool_over(candidates, &[], 5);
+    let dialer = FakeDialer::reaching_slowly(&[]);
+    let pool = pool_with(
+        Arc::clone(&dialer),
+        FixedAddresses::always(&book(30)),
+        5,
+        Vec::new(),
+    );
 
     let refills = (0..8).map(|_| pool.try_refill());
     futures_util::future::join_all(refills).await;
 
-    assert!(
-        dialer.attempt_count() <= MAX_DIALS_PER_FILL,
-        "eight concurrent refills ran more than one sweep: {} dials",
-        dialer.attempt_count()
+    assert_eq!(
+        dialer.attempt_count(),
+        MAX_DIALS_PER_FILL,
+        "eight concurrent refills must cost one sweep, not eight"
     );
 }
 
