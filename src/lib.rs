@@ -297,6 +297,21 @@ mod native_client {
             self.router.peak_height_opt().await
         }
 
+        /// How many Chia full-node peers this client HOLDS right now.
+        ///
+        /// Exposed because a consumer that presents itself as a light client has to be able to
+        /// SAY how many peers it is a client of, and until now the pool's size was observable
+        /// only as the boolean [`has_peers`](peer::PeerBackend::has_peers). A count is not
+        /// derivable from that, and a consumer with no way to read it is left either silent or
+        /// quoting [`ChiaQueryConfig::max_peers`] — an intention presented as a measurement.
+        ///
+        /// It is the LIVE count, never the target: a filling pool reports the smaller number.
+        /// See [`peer::pool::PeerPool::peer_count`] for what "held" means with respect to a peer
+        /// that has died without being used since.
+        pub async fn peer_count(&self) -> usize {
+            self.router.peer.peer_count().await
+        }
+
         /// The Unix timestamp of the block at `height` (`Ok(None)` when absent), `Err` on failure.
         pub async fn block_timestamp_opt(
             &self,
