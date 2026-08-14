@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-08-14
+
+### Bug Fixes
+- **pool:** Admit each peer address at most once, deciding under the write lock (#22)
+
 ## [0.9.0] - 2026-08-12
 
 ### Features
