@@ -312,6 +312,20 @@ mod native_client {
             self.router.peer.peer_count().await
         }
 
+        /// How many held peers count as INDEPENDENT opinions about the chain.
+        ///
+        /// Never larger than [`peer_count`](Self::peer_count), and smaller by the peers reached
+        /// from a preferred address — an operator's `TRUSTED_FULLNODE`, or a full node on this
+        /// machine. Those are the fastest peers to read from and the worst possible witnesses to
+        /// each other: a local process is a source a local attacker can supply, so a count of
+        /// agreeing sources that includes one is not a count of independent sources.
+        ///
+        /// Use this, not `peer_count`, for any decision of the form "do enough separate sources
+        /// agree" (dig_ecosystem#2648). Use `peer_count` to tell a user how many peers are held.
+        pub async fn independent_peer_count(&self) -> usize {
+            self.router.peer.independent_peer_count().await
+        }
+
         /// The peak height this client's OWN peers have reported, or `None` when they have
         /// reported none yet.
         ///

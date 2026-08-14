@@ -73,6 +73,11 @@ impl PeerBackend {
         self.pool.peer_count().await
     }
 
+    /// How many held peers are INDEPENDENT opinions — see [`PeerPool::independent_peer_count`].
+    pub async fn independent_peer_count(&self) -> usize {
+        self.pool.independent_peer_count().await
+    }
+
     // -----------------------------------------------------------------------
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------
