@@ -111,6 +111,7 @@ All methods are `async` and return `Result<Response, ChiaQueryError>`.
 | Method | Request Fields | Response |
 |--------|---------------|----------|
 | `peer_count()` | none | `usize` |
+| `independent_peer_count()` | none | `usize` |
 | `peer_peak_height()` | none | `Option<u32>` |
 
 `peer_count()` MUST report the number of peer connections the pool HOLDS at the moment of the
@@ -118,6 +119,10 @@ call. It MUST NOT report `max_peers`: a client that is still filling reports the
 and reaches the target only when the target is met. A consumer surfacing this to a user is
 stating a fact about that machine, so a configured intention must never substitute for the
 measurement.
+
+`independent_peer_count()` MUST report only the held peers reached through DNS discovery — see
+[Origin: preferred is not independent](#origin-preferred-is-not-independent). It MUST be used in
+place of `peer_count()` by any consumer that treats a peer as a corroborating opinion.
 
 A peer leaves the count via `eject_peer`, which runs when a request to that peer fails. The count
 is therefore of peers held and believed usable, on the same liveness standard `has_peers()` has
@@ -225,6 +230,7 @@ struct PeerPool {
 struct PeerEntry {
     peer: Peer,
     address: SocketAddr,
+    origin: PeerOrigin,
     connected_at: Instant,
 }
 ```
@@ -236,6 +242,40 @@ struct PeerEntry {
 3. **Ejection**: When a peer request fails or a connection drops, immediately remove the peer from the pool
 4. **Replacement**: After ejection, spawn a background task to connect a new random peer to maintain pool size
 5. **Shutdown**: On `ChiaQuery::drop()`, close all peer connections
+
+#### Distinct admission
+
+A `SocketAddr` MUST be held by the pool **at most once**. A connection whose address is already
+held MUST be rejected, and no receiver handler may be spawned for a rejected connection.
+
+The address check and the insertion MUST occur in the **same critical section**, holding the
+write lock. Checking before acquiring the write lock is a time-of-check/time-of-use gap:
+initialization races `max_peers` dials concurrently, so two fills of one address can each observe
+it absent and each insert. `max_peers` MUST be enforced in that same critical section.
+
+An **ejected** address becomes admissible again; distinctness is a property of the held set, never
+a ban.
+
+`priority_addresses` (the `TRUSTED_FULLNODE` address, then `127.0.0.1`) is recomputed on every
+dial, so a caller filling a pool MUST pass the addresses it already holds as `exclude`. Without
+that, the preference for a local node becomes a monopoly: any process able to bind the port — which
+on an unprivileged local account requires no privilege at all — can occupy every slot while the
+pool reports itself full.
+
+#### Origin: preferred is not independent
+
+Each held peer records `PeerOrigin`:
+
+| Origin | Reached from |
+|---|---|
+| `Priority` | `TRUSTED_FULLNODE`, or `127.0.0.1` |
+| `Discovered` | a DNS introducer's address set |
+
+`peer_count()` counts connections HELD. `independent_peer_count()` counts only `Discovered`
+peers. A caller deciding whether enough separate sources AGREE about the chain MUST use
+`independent_peer_count()`: priority ordering expresses speed and operator control, never
+authority, and a co-resident node is a source a local attacker can supply. A caller reporting how
+many peers a machine holds MUST use `peer_count()`.
 
 #### DNS Introducers
 
@@ -401,6 +441,7 @@ struct ChiaQueryConfig {
 3. **Immediate ejection**: Any peer that fails a request or whose connection drops is removed from the pool immediately
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
 5. **Pool size invariant**: The pool always targets `max_peers` connections. If below target, background tasks work to replenish
+5a. **Distinct-address invariant**: At most one connection per `SocketAddr` is held, decided under the write lock — see [Distinct admission](#distinct-admission). `max_peers` connections therefore mean `max_peers` distinct addresses, which is what makes the count meaningful as a measure of redundancy
 6. **Coinset-only endpoints**: Endpoints with no peer protocol equivalent (mempool queries, block count metrics, block spends with conditions, unfinished block headers) always go directly to `CoinsetBackend`. If coinset fallback is disabled, these return `ChiaQueryError::UnsupportedWithoutCoinset`
 7. **Thread safety**: `ChiaQuery` is `Send + Sync` -- all internal state is behind `Arc<Mutex<_>>` or `Arc<RwLock<_>>` as appropriate
 
@@ -722,5 +763,3 @@ custody still fails closed with `NoProvider`. For `resolve_singleton_lineage`, c
 agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
 authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
 all-errors fails closed.
-
-<!-- backport lane: 2648 -> 0.6 line -->
