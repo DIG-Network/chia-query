@@ -722,3 +722,5 @@ custody still fails closed with `NoProvider`. For `resolve_singleton_lineage`, c
 agreement compares the full lineage; consumers still apply the `SingletonLineage::contains` MEMBERSHIP
 authority test to the result, never tip/puzzle-hash equality. Disagreement, too few groups, or
 all-errors fails closed.
+
+<!-- backport lane: 2648 -> 0.6 line -->
