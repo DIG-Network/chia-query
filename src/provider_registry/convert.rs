@@ -112,6 +112,14 @@ pub(crate) fn map_query_error(error: ChiaQueryError) -> ChainSourceError {
         ChiaQueryError::UnsupportedWithoutCoinset(_) => {
             ChainSourceError::Unsupported("operation requires the coinset fallback")
         }
+        // Neither of these is an answer about the chain: one says the sources could not be brought
+        // to agree that something is absent, the other that they actively contradict each other.
+        // Both are Transport for the same reason every other variant here is — the consumer must
+        // fail closed and retry, never read "unknown" as "not there" (dig_ecosystem#2456).
+        ChiaQueryError::UncorroboratedAbsence(msg) => ChainSourceError::Transport(msg),
+        ChiaQueryError::SourcesDisagree(msg) => {
+            ChainSourceError::Transport(format!("sources disagree: {msg}"))
+        }
     }
 }
 

@@ -3,6 +3,11 @@ pub mod connect;
 pub mod pool;
 pub mod translate;
 
+#[cfg(test)]
+mod corroboration_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -21,6 +26,35 @@ use crate::types::*;
 use crate::NetworkType;
 use pool::PeerPool;
 pub use pool::PeerRequirement;
+
+// ---------------------------------------------------------------------------
+// OptAnswer
+// ---------------------------------------------------------------------------
+
+/// What the peer tier was able to establish about a thing that may or may not exist.
+///
+/// [`Option`] cannot express this, and that is precisely how dig_ecosystem#2456 stayed invisible:
+/// `None` was read as *"the chain does not have this"* while it meant *"one anonymous peer sent an
+/// empty list"*. The two are different facts and a caller needs to tell them apart, so the peer
+/// tier reports which one it has and lets the router decide what to do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptAnswer<T> {
+    /// The thing exists, and here it is.
+    ///
+    /// A positive answer carries its own proof — a record can be checked against its own fields —
+    /// so it is returned from the FIRST peer that gives one and is never held up for a second
+    /// opinion. Making presence slower in order to help absence would cost the common path for no
+    /// gain in what is actually known.
+    Found(T),
+    /// Two independent peers, at different addresses, both report it absent.
+    CorroboratedAbsent,
+    /// One peer reports it absent and no second independent peer could say so too.
+    ///
+    /// The peer tier has no basis to call this absence. Whether it can become one depends on
+    /// sources the peer tier does not own, so it hands the undecided fact up rather than deciding
+    /// it (see [`QueryRouter`](crate::router::QueryRouter), which may corroborate against coinset).
+    UncorroboratedAbsent,
+}
 
 // ---------------------------------------------------------------------------
 // PeerBackend
@@ -111,36 +145,95 @@ impl PeerBackend {
 
     /// Absence-aware sibling of [`try_get_coin_record_by_name`](Self::try_get_coin_record_by_name).
     ///
-    /// A successful `RespondCoinState` with an EMPTY coin-state list is PROVABLE absence -> `Ok(None)`;
-    /// a rejected/timed-out request is a failure -> `Err`. This split is what lets the aggregating
-    /// provider report a genuinely-absent coin as `Ok(None)` rather than a spurious error (SPEC §3).
+    /// A rejected/timed-out request is a failure -> `Err`. An EMPTY coin-state list from a
+    /// successful `RespondCoinState` is one peer's WORD that the coin does not exist, which is not
+    /// the same thing as it not existing, so the answer is graded by [`OptAnswer`] rather than
+    /// flattened into `Ok(None)` -- see
+    /// [`read_opt_corroborated`](Self::read_opt_corroborated) (SPEC §3).
     pub async fn try_get_coin_record_by_name_opt(
         &self,
         name: &str,
-    ) -> Result<Option<CoinRecord>, ChiaQueryError> {
+    ) -> Result<OptAnswer<CoinRecord>, ChiaQueryError> {
+        self.read_opt_corroborated(|peer| async move {
+            self.do_get_coin_record_by_name_opt(&peer, name).await
+        })
+        .await
+    }
+
+    /// Read something that may be absent, and CORROBORATE the absence before reporting one.
+    ///
+    /// `read` is run against one selected peer. What happens next depends on what came back, and
+    /// the asymmetry is the point:
+    ///
+    /// - **Present** — returned immediately from that one peer. The answer certifies itself.
+    /// - **Absent** — the peer's word and nothing else, so a second peer at a DIFFERENT address,
+    ///   [discovered](pool::PeerPool::select_corroborating_peer) rather than preferred, is asked
+    ///   the same question. Both absent is [`CorroboratedAbsent`](OptAnswer::CorroboratedAbsent).
+    /// - **Absent, then present** — the two peers CONTRADICT each other. Refused as
+    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) rather than resolved: nothing in the
+    ///   answers themselves says which peer to believe, so choosing one would invent a fact.
+    /// - **Absent, with nobody to ask** — a pool of one, or one whose only other members are
+    ///   preferred peers — is [`UncorroboratedAbsent`](OptAnswer::UncorroboratedAbsent).
+    ///
+    /// Corroboration is sought from ONE further peer, not from all of them. It is a confidence
+    /// floor — a single source is never corroboration — and not an N-of-N barrier, because
+    /// requiring the whole pool would let one slow peer stall every read (NC-12).
+    async fn read_opt_corroborated<T, F, Fut>(
+        &self,
+        read: F,
+    ) -> Result<OptAnswer<T>, ChiaQueryError>
+    where
+        F: Fn(Peer) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+    {
         let (peer, addr) = self.pick().await?;
-        let res = self.do_get_coin_record_by_name_opt(&peer, name).await;
-        if res.is_err() {
-            self.pool.eject_peer(addr).await;
+        let first = match read(peer).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.pool.eject_peer(addr).await;
+                return Err(e);
+            }
+        };
+        if let Some(found) = first {
+            return Ok(OptAnswer::Found(found));
         }
-        res
+
+        let Some((other, other_addr)) = self.pool.select_corroborating_peer(addr).await else {
+            log::debug!("absence reported by {addr} has no independent corroborator available");
+            return Ok(OptAnswer::UncorroboratedAbsent);
+        };
+
+        match read(other).await {
+            Ok(None) => Ok(OptAnswer::CorroboratedAbsent),
+            Ok(Some(_)) => Err(ChiaQueryError::SourcesDisagree(format!(
+                "peer {addr} reports absent, peer {other_addr} reports present"
+            ))),
+            Err(e) => {
+                // The corroborator could not answer, so nothing was corroborated. Eject it — a
+                // peer that fails a read is ejected everywhere else in this backend — and report
+                // the absence as the undecided fact it still is, rather than letting a failed
+                // second opinion read as a confirmed first one.
+                self.pool.eject_peer(other_addr).await;
+                log::debug!("corroborator {other_addr} failed: {e}");
+                Ok(OptAnswer::UncorroboratedAbsent)
+            }
+        }
     }
 
     /// Absence-aware read of the spend that spent `coin_id`.
     ///
-    /// Returns `Ok(None)` when the coin is provably unknown (no coin-state) or unspent (no spent
-    /// height) — both genuine "there is no such spend" answers — and `Err` only when the peer read
-    /// itself fails.
+    /// A coin that is unknown (no coin-state) and one that is unspent (no spent height) are both
+    /// "there is no such spend", and both rest on a peer's word alone, so both are graded by
+    /// [`OptAnswer`] through [`read_opt_corroborated`](Self::read_opt_corroborated). `Err` only
+    /// when the peer read itself fails.
     pub async fn try_get_coin_spend_opt(
         &self,
         coin_id: &str,
-    ) -> Result<Option<CoinSpend>, ChiaQueryError> {
-        let (peer, addr) = self.pick().await?;
-        let res = self.do_get_coin_spend_opt(&peer, coin_id).await;
-        if res.is_err() {
-            self.pool.eject_peer(addr).await;
-        }
-        res
+    ) -> Result<OptAnswer<CoinSpend>, ChiaQueryError> {
+        self.read_opt_corroborated(|peer| async move {
+            self.do_get_coin_spend_opt(&peer, coin_id).await
+        })
+        .await
     }
 
     pub async fn try_get_coin_records_by_puzzle_hash(
@@ -525,7 +618,10 @@ impl PeerBackend {
         .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?
         .map_err(|_| ChiaQueryError::PeerRejection("coin state request rejected".into()))?;
 
-        // An empty coin-state list from a SUCCESSFUL response is provable absence.
+        // An empty coin-state list from a SUCCESSFUL response is this peer's word that the coin
+        // does not exist. It carries no proof -- a peer a block behind, mid-reorg, pruning, or
+        // lying produces the identical bytes -- so it is reported as this ONE peer's answer and
+        // corroborated a layer up (dig_ecosystem#2456).
         Ok(response
             .coin_states
             .first()
