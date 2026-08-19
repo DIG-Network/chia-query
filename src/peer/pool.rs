@@ -143,6 +143,33 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
+    /// Select a peer that could CORROBORATE an answer already given by the peer at `asked`.
+    ///
+    /// A corroborating peer must be two things at once, and neither alone is enough:
+    ///
+    /// - **A different address than `asked`.** Asking the same connection twice returns the same
+    ///   opinion twice, which reads as agreement while being one voice.
+    /// - **[`PeerOrigin::Discovered`](connect::PeerOrigin).** A peer reached from a preferred
+    ///   address — an operator's node, or one on this machine — is an excellent peer to READ from
+    ///   and is not evidence about the chain independent of this host, exactly as
+    ///   [`independent_peer_count`](Self::independent_peer_count) records.
+    ///
+    /// Returns `None` when the pool holds no such peer, which is the honest answer that there is
+    /// nobody to corroborate with — never a substitute peer that would manufacture agreement.
+    pub async fn select_corroborating_peer(&self, asked: SocketAddr) -> Option<(Peer, SocketAddr)> {
+        let entries = self.entries.read().await;
+        let candidates: Vec<&PeerEntry> = entries
+            .iter()
+            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let entry = candidates[idx];
+        Some((entry.peer.clone(), entry.address))
+    }
+
     /// Remove a peer from the pool and asynchronously connect a replacement.
     pub async fn eject_peer(&self, addr: SocketAddr) {
         {
@@ -282,71 +309,44 @@ impl PeerPool {
     }
 }
 
+/// Construction and admission reachable from OTHER modules' tests.
+///
+/// [`PeerPool::new`] dials the network, so a test of anything built ON the pool — the backend's
+/// absence corroboration, for one — cannot use it. These wrap the private internals rather than
+/// widening them, so production code keeps exactly one admission path.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::peer::connect::{create_generated_tls, PeerOrigin};
-
-    /// A pool holding nothing, with a realistic `max_peers`, ready to be filled by hand.
-    ///
-    /// Built directly rather than through [`PeerPool::new`] because the constructor dials the
-    /// network; admission is what these tests are about, and it is reachable without one.
-    fn empty_pool(max_peers: usize) -> PeerPool {
-        PeerPool {
+impl PeerPool {
+    pub(crate) fn for_tests(max_peers: usize) -> Self {
+        Self {
             entries: RwLock::new(Vec::new()),
             next_idx: AtomicUsize::new(0),
             max_peers,
-            tls: create_generated_tls().expect("generate a TLS identity"),
+            tls: connect::create_generated_tls().expect("generate a TLS identity"),
             network: NetworkType::Mainnet,
             connect_timeout: Duration::from_millis(1),
             peak_height: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    /// A real [`Peer`], built over a genuine loopback websocket rather than mocked.
-    ///
-    /// `Peer::from_websocket` reads the socket's own `peer_addr`, so there is no way to construct
-    /// one without a live socket. The returned peer is CLONEABLE (`Peer` is an `Arc` inside), which
-    /// is what lets a test offer the *same* connection under several addresses — the shape a
-    /// duplicate actually takes.
-    async fn loopback_peer() -> Peer {
-        use tokio::net::{TcpListener, TcpStream};
-        use tokio_tungstenite::MaybeTlsStream;
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a loopback listener");
-        let addr = listener.local_addr().expect("read the listener address");
-
-        // Hold the server side open for the life of the test; dropping it would close the
-        // connection under the peer being tested.
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-                    let _keep_open = ws;
-                    std::future::pending::<()>().await;
-                }
-            }
-        });
-
-        let stream = TcpStream::connect(addr).await.expect("dial the listener");
-        let (ws, _) = tokio_tungstenite::client_async(
-            format!("ws://{addr}/ws"),
-            MaybeTlsStream::Plain(stream),
-        )
-        .await
-        .expect("complete the websocket handshake");
-
-        let (peer, _receiver) =
-            Peer::from_websocket(ws, Default::default()).expect("build a peer from the websocket");
-        peer
+    pub(crate) async fn admit_for_tests(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        origin: connect::PeerOrigin,
+    ) -> bool {
+        self.admit(peer, address, origin).await
     }
+}
 
-    fn address(last_octet: u8) -> SocketAddr {
-        SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last_octet)),
-            8444,
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::connect::{create_generated_tls, PeerOrigin};
+    use crate::peer::test_support::{address, loopback_peer};
+
+    use super::PeerPool as _Pool;
+    fn empty_pool(max_peers: usize) -> PeerPool {
+        _Pool::for_tests(max_peers)
     }
 
     /// **The defect, and the one shape that separates a locked re-check from a TOCTOU dedupe.**

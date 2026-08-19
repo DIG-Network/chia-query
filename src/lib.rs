@@ -272,10 +272,19 @@ mod native_client {
             self.router.get_coin_record_by_name(name).await
         }
 
-        /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name): `Ok(None)` when
-        /// the coin provably does not exist, `Err` when the read could not be completed. Used by the
-        /// [`ChainSource`](dig_chainsource_interface::ChainSource) facade to honour the fail-closed
-        /// `Ok(None)`-vs-`Err` contract.
+        /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name).
+        ///
+        /// `Ok(None)` means **corroborated absence**: two independent sources were asked and both
+        /// reported no such coin. Absence that only one source will vouch for is
+        /// [`UncorroboratedAbsence`](ChiaQueryError::UncorroboratedAbsence), and two sources that
+        /// contradict each other are [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) — both
+        /// errors, because neither is a fact about the chain (dig_ecosystem#2456).
+        ///
+        /// Presence is unaffected and needs no quorum: a returned record is checkable against its
+        /// own fields, so it is returned from the first peer that has it.
+        ///
+        /// Used by the [`ChainSource`](dig_chainsource_interface::ChainSource) facade to honour the
+        /// fail-closed `Ok(None)`-vs-`Err` contract.
         pub async fn get_coin_record_by_name_opt(
             &self,
             name: &str,
@@ -283,8 +292,11 @@ mod native_client {
             self.router.get_coin_record_by_name_opt(name).await
         }
 
-        /// Absence-aware read of the spend that spent `coin_id`: `Ok(None)` when the coin is
-        /// provably unspent/unknown, `Err` on failure.
+        /// Absence-aware read of the spend that spent `coin_id`.
+        ///
+        /// `Ok(None)` when two independent sources agree the coin is unspent or unknown; `Err` on
+        /// failure, and on an absence only one source will vouch for — see
+        /// [`get_coin_record_by_name_opt`](Self::get_coin_record_by_name_opt).
         pub async fn get_coin_spend_opt(
             &self,
             coin_id: &str,

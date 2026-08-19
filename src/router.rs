@@ -9,8 +9,11 @@ use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
 use serde_json::Value;
 
 use crate::coinset::CoinsetClient;
-use crate::peer::PeerBackend;
+use crate::peer::{OptAnswer, PeerBackend};
 use crate::types::*;
+
+#[cfg(test)]
+mod absence_tests;
 
 // ---------------------------------------------------------------------------
 // Puzzle condition extraction helper
@@ -48,6 +51,34 @@ fn run_puzzle_conditions(spend: &CoinSpend, constants: &ConsensusConstants) -> V
             crate::peer::block::parse_conditions_public(&allocator, output)
         }
         Err(_) => Vec::new(),
+    }
+}
+
+/// Decide what one peer's uncorroborated absence becomes, given whatever the coinset tier said.
+///
+/// `coinset` is `None` when the coinset tier was not consulted at all because the fallback is
+/// disabled — the distinction matters, since "nobody else was asked" and "somebody else was asked
+/// and agreed" are the two facts this whole change exists to keep apart.
+///
+/// Absence is only ever reported when a SECOND source says it too. Everything else is an error,
+/// and a contradiction is surfaced rather than broken in favour of either source: nothing in two
+/// contradictory answers says which one to believe.
+fn settle_uncorroborated_absence<T>(
+    coinset: Option<Result<Option<T>, ChiaQueryError>>,
+) -> Result<Option<T>, ChiaQueryError> {
+    match coinset {
+        None => Err(ChiaQueryError::UncorroboratedAbsence(
+            "one peer reported absence, no second peer was available, and the coinset fallback is \
+             disabled"
+                .into(),
+        )),
+        Some(Ok(None)) => Ok(None),
+        Some(Ok(Some(_))) => Err(ChiaQueryError::SourcesDisagree(
+            "a peer reports absent, the coinset API reports present".into(),
+        )),
+        Some(Err(e)) => Err(ChiaQueryError::UncorroboratedAbsence(format!(
+            "one peer reported absence and the coinset API could not corroborate it: {e}"
+        ))),
     }
 }
 
@@ -96,22 +127,50 @@ impl QueryRouter {
 
     /// Absence-aware variant of [`peer_then_coinset`](Self::peer_then_coinset).
     ///
-    /// A successful peer response — whether `Some` (found) or `None` (provable absence) — is
-    /// authoritative and returned immediately. Only a peer FAILURE falls through to the retry and
-    /// then the coinset fallback, so a genuine absence is never masked by a fallback and a failure
-    /// is never collapsed into `Ok(None)` (SPEC §3).
+    /// `Ok(None)` from this router means **corroborated absence**: two independent sources were
+    /// asked and both said the thing does not exist. Absence that only one source will vouch for
+    /// is [`UncorroboratedAbsence`](ChiaQueryError::UncorroboratedAbsence) — an error, because a
+    /// caller reading `None` as "the chain provably does not have this" would otherwise be told a
+    /// falsehood by one anonymous peer's empty list (dig_ecosystem#2456).
+    ///
+    /// The peer tier grades its own answer (see
+    /// [`PeerBackend::read_opt_corroborated`](crate::peer::PeerBackend)); this method decides what
+    /// an ungraded absence becomes once the coinset tier is available to be a second voice:
+    ///
+    /// | peer tier | coinset | result |
+    /// |---|---|---|
+    /// | found | not asked | `Ok(Some)` — presence is self-verifying |
+    /// | both peers absent | not asked | `Ok(None)` |
+    /// | one peer absent | absent | `Ok(None)` — two independent sources agree |
+    /// | one peer absent | found | [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) |
+    /// | one peer absent | unreachable or disabled | [`UncorroboratedAbsence`](ChiaQueryError::UncorroboratedAbsence) |
+    /// | peer read failed | any | the retry, then the coinset fallback, as before |
+    ///
+    /// **The stated limit.** When no peer answers at all, the coinset tier is the only source
+    /// there is, and its absence is returned as `Ok(None)` on its own — the behaviour a
+    /// coinset-only client has always had. That is one source, so it is one source's word; what
+    /// this method removes is absence resting on an *anonymous, unauthenticated* peer, not the
+    /// weaker claim that a single named HTTPS endpoint is infallible.
     async fn peer_then_coinset_opt<T>(
         &self,
-        peer_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
-        peer_retry: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+        peer_fn: impl std::future::Future<Output = Result<OptAnswer<T>, ChiaQueryError>>,
+        peer_retry: impl std::future::Future<Output = Result<OptAnswer<T>, ChiaQueryError>>,
         coinset_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     ) -> Result<Option<T>, ChiaQueryError> {
-        match peer_fn.await {
-            Ok(v) => return Ok(v),
-            Err(e) => log::debug!("peer opt attempt 1 failed: {e}"),
+        let first = match peer_fn.await {
+            Ok(answer) => Some(answer),
+            Err(e) => {
+                log::debug!("peer opt attempt 1 failed: {e}");
+                None
+            }
+        };
+
+        if let Some(answer) = first {
+            return self.settle_peer_answer(answer, coinset_fn).await;
         }
+
         match peer_retry.await {
-            Ok(v) => Ok(v),
+            Ok(answer) => self.settle_peer_answer(answer, coinset_fn).await,
             Err(peer_err) => {
                 if !self.coinset_fallback_enabled {
                     return Err(peer_err);
@@ -122,6 +181,27 @@ impl QueryRouter {
                         peer_error: Box::new(peer_err),
                         coinset_error: Some(Box::new(ce)),
                     })
+            }
+        }
+    }
+
+    /// Turn the peer tier's graded answer into the router's contract, consulting coinset as a
+    /// second voice when — and only when — the peer tier could not find one itself.
+    async fn settle_peer_answer<T>(
+        &self,
+        answer: OptAnswer<T>,
+        coinset_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+    ) -> Result<Option<T>, ChiaQueryError> {
+        match answer {
+            OptAnswer::Found(v) => Ok(Some(v)),
+            OptAnswer::CorroboratedAbsent => Ok(None),
+            OptAnswer::UncorroboratedAbsent => {
+                let coinset = if self.coinset_fallback_enabled {
+                    Some(coinset_fn.await)
+                } else {
+                    None
+                };
+                settle_uncorroborated_absence(coinset)
             }
         }
     }

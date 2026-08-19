@@ -639,7 +639,7 @@ Method support -- point-reads served, lineage refused (fail-closed):
 
 | Interface method | Coinset endpoint | Notes |
 |---|---|---|
-| `coin_record(id)` | `get_coin_record_by_name_opt` | provable absence -> `Ok(None)`; failure -> `Err` |
+| `coin_record(id)` | `get_coin_record_by_name_opt` | corroborated absence -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
 | `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` | list bounded by `MAX_COIN_RECORDS` (100_000) -> oversized is `TooManyRecords` |
 | `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], .., true)` | list bounded by `MAX_COIN_RECORDS` |
 | `coin_spend(id)` | `get_puzzle_and_solution_opt` | unspent/unknown -> `Ok(None)`; failure -> `Err` |
@@ -660,10 +660,10 @@ transport/timeout/parse error is NEVER reported as absence; absence is NEVER rep
 
 | Interface method | Router method | Absence handling |
 |---|---|---|
-| `coin_record(id)` | `get_coin_record_by_name_opt` | provable absence -> `Ok(None)`; failure -> `Err` |
+| `coin_record(id)` | `get_coin_record_by_name_opt` | corroborated absence -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
 | `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` (start=end=None) | successful empty query -> `Ok(vec![])`; failure -> `Err` |
 | `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], None, None, true)` | successful empty query -> `Ok(vec![])`; failure -> `Err` |
-| `coin_spend(id)` | `get_coin_spend_opt` | unspent/unknown -> `Ok(None)`; failure -> `Err` |
+| `coin_spend(id)` | `get_coin_spend_opt` | corroborated unspent/unknown -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
 | `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | gap mid-walk -> `Ok(None)`; failure -> `Err` |
 | `resolve_singleton_lineage(launcher)` | forward walk over `get_coin_spend_opt` | never launched / fully melted -> `Ok(None)`; failure -> `Err` |
 | `peak_height()` | `peak_height_opt` (from `get_blockchain_state`) | no peak -> `Ok(None)`; failure -> `Err` |
@@ -678,15 +678,33 @@ walk requires to find the tip:
 - **coinset** -- `post_extract_opt` / `optional_field`: a `success:true` envelope with a `null` (or
   absent) data field is provable absence -> `Ok(None)`; a present-but-unparseable field is `Err`
   (never `Ok(None)`); `success:false` (via `post`) is `Err`.
-- **peer** -- `try_get_coin_record_by_name_opt` / `try_get_coin_spend_opt`: a successful
-  `RespondCoinState` with an EMPTY coin-state list (or an unspent coin, for spends) is provable
-  absence -> `Ok(None)`; a rejected/timed-out request is `Err`. The `wait_for_confirmation`
-  "not-found-yet" polling heuristic (which treats `PeerRejection`/`CoinsetApiError` as not-found) is
-  NEVER reused for these reads.
-- **router** -- `peer_then_coinset_opt`: a SUCCESSFUL peer response (`Some` or `None`) is
-  authoritative and returned immediately; only a peer FAILURE falls through to the retry then the
-  coinset `_opt` fallback, so absence is never masked by a fallback and a failure is never collapsed
-  into `Ok(None)`.
+- **peer** -- `try_get_coin_record_by_name_opt` / `try_get_coin_spend_opt`: a rejected/timed-out
+  request is `Err`. A successful `RespondCoinState` with an EMPTY coin-state list (or an unspent
+  coin, for spends) is ONE peer's word, NOT provable absence, and the read reports which of the two
+  it has via `OptAnswer`:
+  - `Found(v)` -- the peer returned the thing. Returned from the FIRST peer that does; a positive
+    answer is checkable against its own fields, so it MUST NOT be held for a second opinion.
+  - `CorroboratedAbsent` -- a SECOND peer, at a different address and with
+    `PeerOrigin::Discovered`, was asked the same question and also answered empty.
+  - `UncorroboratedAbsent` -- only one peer answered empty and no independent peer was available to
+    corroborate it.
+  A corroborator that CONTRADICTS the first peer (absent, then present) MUST fail the read with
+  `SourcesDisagree`; the implementation MUST NOT choose between the two answers. A corroborator that
+  fails to answer MUST leave the absence `UncorroboratedAbsent` -- silence is not agreement.
+  Corroboration is sought from exactly ONE further peer, never from the whole pool: a single slow
+  peer MUST NOT be able to stall a read.
+  The `wait_for_confirmation` "not-found-yet" polling heuristic (which treats
+  `PeerRejection`/`CoinsetApiError` as not-found) is NEVER reused for these reads.
+- **router** -- `peer_then_coinset_opt`: `Ok(None)` means CORROBORATED absence -- two independent
+  sources were asked and both reported the thing missing. A `Found` answer is returned immediately;
+  a `CorroboratedAbsent` answer becomes `Ok(None)`; an `UncorroboratedAbsent` answer is put to the
+  coinset tier, which either corroborates it (`Ok(None)`), contradicts it (`SourcesDisagree`), or
+  cannot answer (`UncorroboratedAbsence`). Absence that only one source will vouch for MUST NOT be
+  reported as `Ok(None)`. Only a peer FAILURE falls through to the retry, so absence is never masked
+  by a fallback and a failure is never collapsed into `Ok(None)`.
+  **Stated limit:** when NO peer answers at all, the coinset tier is the only source there is and
+  its absence is returned as `Ok(None)` on its own -- unchanged behaviour for a coinset-only client.
+  What this contract removes is absence resting on an anonymous, unauthenticated peer.
 
 ### `ChiaQueryError` -> `ChainSourceError` mapping
 
@@ -694,6 +712,7 @@ walk requires to find the tip:
 |---|---|
 | `PeerConnection(msg)` naming a timeout | `Timeout` |
 | `PeerConnection` / `PeerRejection` / `PeerDiscoveryFailed` / `TlsError` / `CoinsetHttp` / `CoinsetApiError` / `AllSourcesFailed` | `Transport` |
+| `UncorroboratedAbsence` / `SourcesDisagree` | `Transport` (neither is an answer about the chain; the consumer MUST fail closed and retry, never read "unknown" as "not there") |
 | `InvalidRequest` (bad input, e.g. malformed hex) | `Malformed` |
 | `UnsupportedWithoutCoinset` | `Unsupported` |
 
