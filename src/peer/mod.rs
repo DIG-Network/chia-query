@@ -243,15 +243,12 @@ impl PeerBackend {
         // Every corroborator is asked concurrently and EVERY answer is collected before anything
         // is decided. Grading as the answers arrive would hand the outcome to whichever peer is
         // fastest, which is the property a hostile peer controls.
-        let answers = futures_util::future::join_all(
-            corroborators
-                .into_iter()
-                .map(|(peer, peer_addr)| {
-                    let answer = read(peer);
-                    async move { (peer_addr, answer.await) }
-                }),
-        )
-        .await;
+        let answers =
+            futures_util::future::join_all(corroborators.into_iter().map(|(peer, peer_addr)| {
+                let answer = read(peer);
+                async move { (peer_addr, answer.await) }
+            }))
+            .await;
 
         let claim = found.chain_claim();
         let mut agreed = 0usize;

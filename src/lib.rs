@@ -280,8 +280,12 @@ mod native_client {
         /// contradict each other are [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) — both
         /// errors, because neither is a fact about the chain (dig_ecosystem#2456).
         ///
-        /// Presence is unaffected and needs no quorum: a returned record is checkable against its
-        /// own fields, so it is returned from the first peer that has it.
+        /// `Ok(Some(record))` means **corroborated presence**, and means it for the same reason:
+        /// the coin-id binding authenticates the coin's identity only, so `confirmed_block_index`
+        /// and `spent_block_index` are put to a second independent source before they are
+        /// reported. A record only one source will vouch for is
+        /// [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence)
+        /// (dig_ecosystem#2462).
         ///
         /// Used by the [`ChainSource`](dig_chainsource_interface::ChainSource) facade to honour the
         /// fail-closed `Ok(None)`-vs-`Err` contract.
@@ -294,8 +298,9 @@ mod native_client {
 
         /// Absence-aware read of the spend that spent `coin_id`.
         ///
-        /// `Ok(None)` when two independent sources agree the coin is unspent or unknown; `Err` on
-        /// failure, and on an absence only one source will vouch for — see
+        /// `Ok(None)` when two independent sources agree the coin is unspent or unknown,
+        /// `Ok(Some(spend))` when two agree on the spend; `Err` on failure, and on an answer in
+        /// either direction that only one source will vouch for — see
         /// [`get_coin_record_by_name_opt`](Self::get_coin_record_by_name_opt).
         pub async fn get_coin_spend_opt(
             &self,

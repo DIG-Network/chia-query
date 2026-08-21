@@ -210,7 +210,6 @@ async fn a_corroborator_that_fails_leaves_the_absence_uncorroborated() {
     assert_eq!(asked, 2, "the corroborator was asked and failed");
 }
 
-
 // ---------------------------------------------------------------------------
 // Presence — dig_ecosystem#2462
 //
