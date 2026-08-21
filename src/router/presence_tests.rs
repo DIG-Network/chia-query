@@ -163,10 +163,9 @@ async fn an_uncorroborated_presence_does_not_escape_the_settlement() {
 #[tokio::test]
 async fn an_uncorroborated_presence_is_put_to_the_coinset_tier() {
     let settled = router(true)
-        .settle_peer_answer(
-            OptAnswer::UncorroboratedFound(answer(100)),
-            async { Ok(Some(answer(999))) },
-        )
+        .settle_peer_answer(OptAnswer::UncorroboratedFound(answer(100)), async {
+            Ok(Some(answer(999)))
+        })
         .await;
 
     assert!(

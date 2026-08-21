@@ -86,7 +86,6 @@ impl PeerBackend {
     }
 }
 
-
 pub struct PeerBackend {
     pool: PeerPool,
     network: NetworkType,
