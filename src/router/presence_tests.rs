@@ -95,3 +95,125 @@ fn a_source_reporting_absent_contradicts_the_presence() {
         "present-then-absent is a disagreement, not a tie to break: got {settled:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The graded answer reaching the settlement — placement, not logic
+// ---------------------------------------------------------------------------
+//
+// Everything above tests `settle_uncorroborated_presence` as a function. That proves the rule is
+// right and proves NOTHING about whether it runs: an `UncorroboratedFound` arm returning
+// `Ok(Some(v))` at the call site satisfies every test above, because none of them reach the call
+// site. These drive `QueryRouter::settle_peer_answer`, which is where the fix actually lives.
+//
+// The sibling `UncorroboratedAbsent` arm (from #2456) was in exactly that state and is covered
+// here too, rather than left in the condition this one was found in.
+
+use super::QueryRouter;
+use crate::coinset::CoinsetClient;
+use crate::peer::{OptAnswer, PeerBackend};
+use std::time::Duration;
+
+/// A router that dials nothing: the peer pool is empty and the coinset base URL is unroutable.
+///
+/// Neither tier is ever reached — `settle_peer_answer` is handed the graded answer AND the coinset
+/// future by the caller — so this only has to exist, not work.
+fn router(coinset_fallback_enabled: bool) -> QueryRouter {
+    QueryRouter {
+        peer: PeerBackend::for_tests(),
+        coinset: CoinsetClient::new("http://127.0.0.1:1", Duration::from_millis(1))
+            .expect("build a client that is never called"),
+        coinset_fallback_enabled,
+    }
+}
+
+/// The coinset future used wherever the tier MUST NOT be consulted.
+///
+/// It answers, and it answers differently. A settlement that wrongly awaited it would produce
+/// `SourcesDisagree`, which the assertions below distinguish from the expected verdict — so
+/// "never consulted" is checked, not assumed.
+async fn a_coinset_answer_that_must_not_be_used() -> Result<Option<Answer>, ChiaQueryError> {
+    Ok(Some(answer(999)))
+}
+
+/// **The placement, stated as a test.** An uncorroborated presence must not escape the settlement.
+///
+/// With the fallback disabled there is no second source, so the only correct outcome is the
+/// refusal. An arm that returned the record — the shape this fix replaced — passes every
+/// function-level test in this file and fails here.
+#[tokio::test]
+async fn an_uncorroborated_presence_does_not_escape_the_settlement() {
+    let settled = router(false)
+        .settle_peer_answer(
+            OptAnswer::UncorroboratedFound(answer(100)),
+            a_coinset_answer_that_must_not_be_used(),
+        )
+        .await;
+
+    assert!(
+        matches!(settled, Err(ChiaQueryError::UncorroboratedPresence(_))),
+        "the record must not reach the caller as a fact: got {settled:?}"
+    );
+}
+
+/// The uncorroborated presence really is put to the coinset tier when there is one.
+///
+/// Pins the other half of the placement: the arm must CALL the settlement, not merely refuse. A
+/// disagreeing second source is used because it distinguishes "consulted" from "returned the
+/// record anyway" — an arm returning `Ok(Some(v))` produces `Ok`, not this error.
+#[tokio::test]
+async fn an_uncorroborated_presence_is_put_to_the_coinset_tier() {
+    let settled = router(true)
+        .settle_peer_answer(
+            OptAnswer::UncorroboratedFound(answer(100)),
+            async { Ok(Some(answer(999))) },
+        )
+        .await;
+
+    assert!(
+        matches!(settled, Err(ChiaQueryError::SourcesDisagree(_))),
+        "the second source was consulted and contradicted the first: got {settled:?}"
+    );
+}
+
+/// The sibling arm, in the same shape: an uncorroborated ABSENCE does not escape either.
+///
+/// Pre-existing from #2456 and equally unproven at its call site until now.
+#[tokio::test]
+async fn an_uncorroborated_absence_does_not_escape_the_settlement() {
+    let settled = router(false)
+        .settle_peer_answer(
+            OptAnswer::<Answer>::UncorroboratedAbsent,
+            a_coinset_answer_that_must_not_be_used(),
+        )
+        .await;
+
+    assert!(
+        matches!(settled, Err(ChiaQueryError::UncorroboratedAbsence(_))),
+        "an absence nobody corroborated must not reach the caller as Ok(None): got {settled:?}"
+    );
+}
+
+/// The controls: a corroborated answer in either direction passes straight through.
+///
+/// Without these, the three tests above would pass on a settlement that refused everything.
+#[tokio::test]
+async fn corroborated_answers_pass_through_in_both_directions() {
+    let present = router(false)
+        .settle_peer_answer(
+            OptAnswer::Found(answer(100)),
+            a_coinset_answer_that_must_not_be_used(),
+        )
+        .await;
+    assert_eq!(
+        present.expect("a corroborated presence is an answer"),
+        Some(answer(100))
+    );
+
+    let absent = router(false)
+        .settle_peer_answer(
+            OptAnswer::<Answer>::CorroboratedAbsent,
+            a_coinset_answer_that_must_not_be_used(),
+        )
+        .await;
+    assert_eq!(absent.expect("a corroborated absence is an answer"), None);
+}

@@ -69,6 +69,24 @@ pub enum OptAnswer<T> {
 // PeerBackend
 // ---------------------------------------------------------------------------
 
+/// A backend over an EMPTY pool, dialling nothing.
+///
+/// Exists so a test of something built on the backend — the router's settlement of a graded
+/// answer, which needs a `QueryRouter` and therefore a `PeerBackend` — can be written without a
+/// network. Every read through it fails for want of a peer, which is correct: such a test must
+/// supply the answer it is settling, never obtain one.
+#[cfg(test)]
+impl PeerBackend {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            pool: pool::PeerPool::for_tests(0),
+            network: NetworkType::Mainnet,
+            request_timeout: Duration::from_millis(1),
+        }
+    }
+}
+
+
 pub struct PeerBackend {
     pool: PeerPool,
     network: NetworkType,
