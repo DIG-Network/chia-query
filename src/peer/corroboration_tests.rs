@@ -18,8 +18,15 @@ use super::connect::PeerOrigin;
 use super::pool::PeerPool;
 use super::test_support::loopback_peer;
 use super::{OptAnswer, PeerBackend};
-use crate::types::ChiaQueryError;
+use crate::types::{ChainClaim, ChiaQueryError};
 use crate::NetworkType;
+
+/// The scripted answers are strings, so a string's own content is the claim it makes.
+impl ChainClaim for &'static str {
+    fn chain_claim(&self) -> String {
+        (*self).to_string()
+    }
+}
 
 /// What a scripted peer says when asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +35,9 @@ enum Says {
     Absent,
     /// A successful response carrying the thing.
     Present,
+    /// A successful response carrying a DIFFERENT thing — the same read, a different claim about
+    /// the chain. This is what a fabricated height looks like from here.
+    PresentOther,
     /// The read itself failed.
     Fails,
 }
@@ -77,6 +87,7 @@ async fn read_scripted(
                 match says {
                     Says::Absent => Ok(None),
                     Says::Present => Ok(Some("the thing")),
+                    Says::PresentOther => Ok(Some("a different thing")),
                     Says::Fails => Err(ChiaQueryError::PeerConnection("scripted failure".into())),
                 }
             }
@@ -199,13 +210,41 @@ async fn a_corroborator_that_fails_leaves_the_absence_uncorroborated() {
     assert_eq!(asked, 2, "the corroborator was asked and failed");
 }
 
-/// Presence must not acquire a quorum.
+// ---------------------------------------------------------------------------
+// Presence — dig_ecosystem#2462
+//
+// The absence tests above exist because an empty answer carries no proof. These exist because a
+// POSITIVE answer carries less proof than it looks like it does: the coin-id binding covers
+// `parent_coin_info ‖ puzzle_hash ‖ amount` and NOT `created_height` / `spent_height`, which are
+// the only reason the read is made. A peer that returns a genuine coin's fields with a fabricated
+// height passes every check the record can perform on itself.
+// ---------------------------------------------------------------------------
+
+/// **The defect, stated as a test.**
 ///
-/// A returned record is checkable against its own fields, so a second opinion adds nothing and
-/// costs a round trip on the common path. Asserting the ASK COUNT is what pins this: an
-/// implementation that quorums presence too would still return the right value here.
+/// One independent peer produces the thing and there is nobody else to ask. The caller must not be
+/// handed a corroborated presence. Before this change the identical fixture produced
+/// `OptAnswer::Found` — indistinguishable, to every consumer, from heights two sources agreed on.
 #[tokio::test]
-async fn presence_is_answered_by_the_first_peer_alone() {
+async fn one_peer_saying_present_is_not_a_corroborated_presence() {
+    let (backend, script) = backend_over(&[(Says::Present, PeerOrigin::Discovered)]).await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("a lone positive answer is not an ERROR, it is an ungraded fact"),
+        OptAnswer::UncorroboratedFound("the thing"),
+        "presence on one peer's word must be reported as uncorroborated"
+    );
+    assert_eq!(asked, 1, "there was only one peer to ask");
+}
+
+/// The control: a second independent peer making the SAME claim corroborates it.
+///
+/// Without this, every presence test here would pass on a backend that had simply stopped
+/// reporting corroborated presence at all.
+#[tokio::test]
+async fn a_second_independent_peer_agreeing_makes_the_presence_corroborated() {
     let (backend, script) = backend_over(&[
         (Says::Present, PeerOrigin::Discovered),
         (Says::Present, PeerOrigin::Discovered),
@@ -219,7 +258,119 @@ async fn presence_is_answered_by_the_first_peer_alone() {
         OptAnswer::Found("the thing")
     );
     assert_eq!(
-        asked, 1,
-        "a positive answer is self-verifying; do not slow it down"
+        asked, 2,
+        "corroboration means a second peer was really asked"
     );
+}
+
+/// Agreement is on the CLAIM, not on the fact that something came back.
+///
+/// Both peers produce a record; they describe different chain state. An implementation that merely
+/// counted positive answers would call this corroborated, which is exactly the fabricated-height
+/// attack succeeding with two peers instead of one.
+#[tokio::test]
+async fn corroborators_that_claim_different_chain_state_disagree() {
+    let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::PresentOther, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, _) = read_scripted(&backend, &script).await;
+
+    assert!(
+        matches!(answer, Err(ChiaQueryError::SourcesDisagree(_))),
+        "two different claims about the same coin is evidence, not a tie to break: got {answer:?}"
+    );
+}
+
+/// **The peer that answers first does not decide.**
+///
+/// The first peer picked is the hostile one, and the two peers behind it agree with each other and
+/// contradict it. The read must fail — not resolve to the first answer, and not resolve to the
+/// majority either, because nothing in the answers says which set to believe.
+///
+/// The ask count is the second half of the assertion and it is what pins the round as CONCURRENT
+/// rather than first-responder-wins: every corroborator is asked, so a hostile peer cannot win by
+/// being fastest, and a sequential implementation that stopped at the first corroborator would
+/// leave the third peer unasked.
+#[tokio::test]
+async fn the_first_peers_answer_does_not_decide_against_the_corroborators() {
+    let (backend, script) = backend_over(&[
+        (Says::PresentOther, PeerOrigin::Discovered),
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Present, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert!(
+        matches!(answer, Err(ChiaQueryError::SourcesDisagree(_))),
+        "a contradicted first answer is refused, in either direction: got {answer:?}"
+    );
+    assert_eq!(asked, 3, "every corroborator is asked, concurrently");
+}
+
+/// A corroborator that reports the thing ABSENT contradicts the presence.
+///
+/// The mirror of `a_contradicting_peer_is_refused_not_broken_in_either_direction`, approached from
+/// the presence side: which peer answered first must not change the outcome.
+#[tokio::test]
+async fn a_corroborator_reporting_absent_contradicts_the_presence() {
+    let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Absent, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, _) = read_scripted(&backend, &script).await;
+
+    assert!(
+        matches!(answer, Err(ChiaQueryError::SourcesDisagree(_))),
+        "present-then-absent is the same contradiction as absent-then-present: got {answer:?}"
+    );
+}
+
+/// A corroborator that cannot answer corroborates nothing.
+///
+/// The nearest wrong implementation reads "I asked and heard no contradiction" as agreement. It
+/// passes every other presence test in this file and fails this one.
+#[tokio::test]
+async fn a_corroborator_that_fails_leaves_the_presence_uncorroborated() {
+    let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Fails, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("the FIRST peer answered, so the read did not fail"),
+        OptAnswer::UncorroboratedFound("the thing"),
+        "silence from the corroborator is not agreement"
+    );
+    assert_eq!(asked, 2, "the corroborator was asked and failed");
+}
+
+/// A host-local peer agreeing is not an independent voice about the chain.
+///
+/// Varies exactly one thing against the passing control: the second peer's origin.
+#[tokio::test]
+async fn a_preferred_peer_agreeing_is_not_corroboration_of_presence() {
+    let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Present, PeerOrigin::Priority),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("no read failed"),
+        OptAnswer::UncorroboratedFound("the thing"),
+        "a preferred peer is not an independent voice, however honestly it agrees"
+    );
+    assert_eq!(asked, 1, "the preferred peer must not even be consulted");
 }

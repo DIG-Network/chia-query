@@ -170,6 +170,27 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
+    /// Every peer that could CORROBORATE an answer already given by the peer at `asked`.
+    ///
+    /// The plural of [`select_corroborating_peer`](Self::select_corroborating_peer), and it holds
+    /// the same two requirements: a different address, and
+    /// [`PeerOrigin::Discovered`](connect::PeerOrigin). A caller corroborating a POSITIVE answer
+    /// wants all of them at once — asking them one at a time lets the first responder settle a
+    /// claim about the chain, which is exactly the power a hostile peer has
+    /// (dig_ecosystem#2462).
+    ///
+    /// Returns an empty vector when the pool holds nobody who qualifies, which is the honest
+    /// answer that there is nobody to corroborate with.
+    pub async fn select_corroborating_peers(&self, asked: SocketAddr) -> Vec<(Peer, SocketAddr)> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
+            .map(|e| (e.peer.clone(), e.address))
+            .collect()
+    }
+
     /// Remove a peer from the pool and asynchronously connect a replacement.
     pub async fn eject_peer(&self, addr: SocketAddr) {
         {

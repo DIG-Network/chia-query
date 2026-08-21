@@ -23,6 +23,7 @@ use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 use tokio_tungstenite::Connector;
 
 use crate::types::*;
+
 use crate::NetworkType;
 use pool::PeerPool;
 pub use pool::PeerRequirement;
@@ -39,13 +40,21 @@ pub use pool::PeerRequirement;
 /// tier reports which one it has and lets the router decide what to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptAnswer<T> {
-    /// The thing exists, and here it is.
+    /// The thing exists, here it is, and an independent peer agreed on what it says about the
+    /// chain.
     ///
-    /// A positive answer carries its own proof — a record can be checked against its own fields —
-    /// so it is returned from the FIRST peer that gives one and is never held up for a second
-    /// opinion. Making presence slower in order to help absence would cost the common path for no
-    /// gain in what is actually known.
+    /// A record is checkable against its own fields only as far as its IDENTITY: a coin id is
+    /// `SHA256(parent_coin_info ‖ puzzle_hash ‖ amount)` and covers nothing else. `created_height`
+    /// and `spent_height` — the entire reason such a read is made — are copied from what the peer
+    /// sent, so a positive answer is corroborated exactly like an absence is
+    /// (dig_ecosystem#2462).
     Found(T),
+    /// The thing exists on ONE peer's word, and no independent peer said the same.
+    ///
+    /// The record is still carried, because it is a real answer and the router may yet find a
+    /// second voice for it; what it is not is evidence about the chain. A consumer handed this
+    /// directly MUST NOT record a height from it.
+    UncorroboratedFound(T),
     /// Two independent peers, at different addresses, both report it absent.
     CorroboratedAbsent,
     /// One peer reports it absent and no second independent peer could say so too.
@@ -59,6 +68,23 @@ pub enum OptAnswer<T> {
 // ---------------------------------------------------------------------------
 // PeerBackend
 // ---------------------------------------------------------------------------
+
+/// A backend over an EMPTY pool, dialling nothing.
+///
+/// Exists so a test of something built on the backend — the router's settlement of a graded
+/// answer, which needs a `QueryRouter` and therefore a `PeerBackend` — can be written without a
+/// network. Every read through it fails for want of a peer, which is correct: such a test must
+/// supply the answer it is settling, never obtain one.
+#[cfg(test)]
+impl PeerBackend {
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            pool: pool::PeerPool::for_tests(0),
+            network: NetworkType::Mainnet,
+            request_timeout: Duration::from_millis(1),
+        }
+    }
+}
 
 pub struct PeerBackend {
     pool: PeerPool,
@@ -160,29 +186,41 @@ impl PeerBackend {
         .await
     }
 
-    /// Read something that may be absent, and CORROBORATE the absence before reporting one.
+    /// Read something that may be absent, and CORROBORATE whichever answer comes back.
     ///
-    /// `read` is run against one selected peer. What happens next depends on what came back, and
-    /// the asymmetry is the point:
+    /// `read` is run against one selected peer, and that peer's answer is then put to independent
+    /// peers — peers at DIFFERENT addresses that were
+    /// [discovered](pool::PeerPool::select_corroborating_peer) rather than preferred. Neither
+    /// direction is taken on one peer's word:
     ///
-    /// - **Present** — returned immediately from that one peer. The answer certifies itself.
-    /// - **Absent** — the peer's word and nothing else, so a second peer at a DIFFERENT address,
-    ///   [discovered](pool::PeerPool::select_corroborating_peer) rather than preferred, is asked
-    ///   the same question. Both absent is [`CorroboratedAbsent`](OptAnswer::CorroboratedAbsent).
-    /// - **Absent, then present** — the two peers CONTRADICT each other. Refused as
-    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) rather than resolved: nothing in the
-    ///   answers themselves says which peer to believe, so choosing one would invent a fact.
-    /// - **Absent, with nobody to ask** — a pool of one, or one whose only other members are
-    ///   preferred peers — is [`UncorroboratedAbsent`](OptAnswer::UncorroboratedAbsent).
+    /// - **Present** — the record's chain claim (see [`ChainClaim`]) is put to every independent
+    ///   peer at once. One that agrees makes it [`Found`](OptAnswer::Found); one that says
+    ///   anything else — a different height, or nothing at all — fails the read with
+    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); nobody able to answer leaves it
+    ///   [`UncorroboratedFound`](OptAnswer::UncorroboratedFound).
+    /// - **Absent** — one further independent peer is asked the same question. Both absent is
+    ///   [`CorroboratedAbsent`](OptAnswer::CorroboratedAbsent); a peer that produces the thing is
+    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); nobody to ask is
+    ///   [`UncorroboratedAbsent`](OptAnswer::UncorroboratedAbsent).
     ///
-    /// Corroboration is sought from ONE further peer, not from all of them. It is a confidence
-    /// floor — a single source is never corroboration — and not an N-of-N barrier, because
-    /// requiring the whole pool would let one slow peer stall every read (NC-12).
+    /// **Why presence asks everyone and absence asks one.** A hostile peer that answers an absence
+    /// wrongly is refuted by any honest peer, so a single corroborator is a sufficient confidence
+    /// floor. A hostile peer that answers a PRESENCE wrongly is claiming a height, and letting the
+    /// first responder settle that would let whichever peer is fastest decide whether money is
+    /// treated as confirmed — so every independent peer is queried CONCURRENTLY and any
+    /// contradiction beats any agreement (NC-12, dig_ecosystem#2462). The cost of that is bounded:
+    /// a hostile corroborator can make a read fail, which the caller retries, but it can never
+    /// make a read return a fact.
+    ///
+    /// Neither direction is an N-of-N barrier — a peer that fails to answer is ejected and does
+    /// not hold the read up — because requiring the whole pool would let one dead peer stall every
+    /// query.
     async fn read_opt_corroborated<T, F, Fut>(
         &self,
         read: F,
     ) -> Result<OptAnswer<T>, ChiaQueryError>
     where
+        T: ChainClaim,
         F: Fn(Peer) -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     {
@@ -194,10 +232,100 @@ impl PeerBackend {
                 return Err(e);
             }
         };
-        if let Some(found) = first {
-            return Ok(OptAnswer::Found(found));
+
+        match first {
+            Some(found) => self.corroborate_presence(found, addr, &read).await,
+            None => self.corroborate_absence(addr, &read).await,
+        }
+    }
+
+    /// Put a positive answer to every independent peer at once, and grade the agreement.
+    async fn corroborate_presence<T, F, Fut>(
+        &self,
+        found: T,
+        addr: SocketAddr,
+        read: &F,
+    ) -> Result<OptAnswer<T>, ChiaQueryError>
+    where
+        T: ChainClaim,
+        F: Fn(Peer) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+    {
+        let corroborators = self.pool.select_corroborating_peers(addr).await;
+        if corroborators.is_empty() {
+            log::debug!("presence reported by {addr} has no independent corroborator available");
+            return Ok(OptAnswer::UncorroboratedFound(found));
         }
 
+        // Every corroborator is asked concurrently and EVERY answer is collected before anything
+        // is decided. Grading as the answers arrive would hand the outcome to whichever peer is
+        // fastest, which is the property a hostile peer controls.
+        let answers =
+            futures_util::future::join_all(corroborators.into_iter().map(|(peer, peer_addr)| {
+                let answer = read(peer);
+                async move { (peer_addr, answer.await) }
+            }))
+            .await;
+
+        let claim = found.chain_claim();
+        let mut agreed = 0usize;
+        let mut disagreement: Option<String> = None;
+        let mut failed: Vec<SocketAddr> = Vec::new();
+
+        for (peer_addr, answer) in answers {
+            match answer {
+                Ok(Some(other)) if other.chain_claim() == claim => agreed += 1,
+                Ok(Some(other)) => {
+                    disagreement.get_or_insert_with(|| {
+                        format!(
+                            "peer {addr} claims `{claim}`, peer {peer_addr} claims `{}`",
+                            other.chain_claim()
+                        )
+                    });
+                }
+                Ok(None) => {
+                    disagreement.get_or_insert_with(|| {
+                        format!("peer {addr} reports present, peer {peer_addr} reports absent")
+                    });
+                }
+                Err(e) => {
+                    log::debug!("corroborator {peer_addr} failed: {e}");
+                    failed.push(peer_addr);
+                }
+            }
+        }
+
+        // Ejection happens whatever the verdict: a peer that failed a read is ejected everywhere
+        // else in this backend, and a disagreement is not a reason to keep a broken connection.
+        for peer_addr in failed {
+            self.pool.eject_peer(peer_addr).await;
+        }
+
+        // A contradiction outranks any amount of agreement. Nothing in the answers says which set
+        // to believe, so counting votes would invent a fact — and would let an attacker holding
+        // two pool slots manufacture one.
+        if let Some(detail) = disagreement {
+            return Err(ChiaQueryError::SourcesDisagree(detail));
+        }
+
+        if agreed == 0 {
+            log::debug!("presence reported by {addr} was corroborated by nobody who could answer");
+            return Ok(OptAnswer::UncorroboratedFound(found));
+        }
+        Ok(OptAnswer::Found(found))
+    }
+
+    /// Put an absence to ONE further independent peer, and grade the agreement.
+    async fn corroborate_absence<T, F, Fut>(
+        &self,
+        addr: SocketAddr,
+        read: &F,
+    ) -> Result<OptAnswer<T>, ChiaQueryError>
+    where
+        T: ChainClaim,
+        F: Fn(Peer) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
+    {
         let Some((other, other_addr)) = self.pool.select_corroborating_peer(addr).await else {
             log::debug!("absence reported by {addr} has no independent corroborator available");
             return Ok(OptAnswer::UncorroboratedAbsent);

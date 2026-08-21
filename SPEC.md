@@ -682,8 +682,10 @@ walk requires to find the tip:
   request is `Err`. A successful `RespondCoinState` with an EMPTY coin-state list (or an unspent
   coin, for spends) is ONE peer's word, NOT provable absence, and the read reports which of the two
   it has via `OptAnswer`:
-  - `Found(v)` -- the peer returned the thing. Returned from the FIRST peer that does; a positive
-    answer is checkable against its own fields, so it MUST NOT be held for a second opinion.
+  - `Found(v)` -- the peer returned the thing AND an independent peer agreed on the chain claim
+    inside it (see below).
+  - `UncorroboratedFound(v)` -- the peer returned the thing and no independent peer could be
+    brought to make the same claim.
   - `CorroboratedAbsent` -- a SECOND peer, at a different address and with
     `PeerOrigin::Discovered`, was asked the same question and also answered empty.
   - `UncorroboratedAbsent` -- only one peer answered empty and no independent peer was available to
@@ -691,8 +693,27 @@ walk requires to find the tip:
   A corroborator that CONTRADICTS the first peer (absent, then present) MUST fail the read with
   `SourcesDisagree`; the implementation MUST NOT choose between the two answers. A corroborator that
   fails to answer MUST leave the absence `UncorroboratedAbsent` -- silence is not agreement.
-  Corroboration is sought from exactly ONE further peer, never from the whole pool: a single slow
-  peer MUST NOT be able to stall a read.
+  Corroboration of an ABSENCE is sought from exactly ONE further peer, never from the whole pool: a
+  single slow peer MUST NOT be able to stall a read.
+
+  **A POSITIVE answer is corroborated too, and differently.** The coin-id binding
+  `SHA256(parent_coin_info || puzzle_hash || amount)` authenticates the coin's IDENTITY and nothing
+  else; `created_height`, `spent_height` and `spent` are copied verbatim from the peer's
+  `CoinState`, and those are the fields a consumer reads as evidence that money is settled. So the
+  positive answer's CHAIN CLAIM -- the projection defined by the `ChainClaim` trait: identity plus
+  the height-bearing fields, excluding tier-local fields (`timestamp`, `coinbase`) the peer
+  protocol cannot supply -- is put to EVERY independent peer, CONCURRENTLY, and every answer is
+  collected before anything is decided:
+  - at least one independent peer making the SAME claim -> `Found(v)`;
+  - any independent peer making a DIFFERENT claim, or reporting the thing absent ->
+    `SourcesDisagree`, whichever peer answered first and however many agreed. A contradiction MUST
+    outrank agreement; vote-counting would let an attacker holding two pool slots manufacture a
+    fact;
+  - nobody available or nobody able to answer -> `UncorroboratedFound(v)`. A corroborator that
+    fails is ejected and MUST NOT be read as agreement.
+  Querying the corroborators concurrently is normative, not an optimisation: asking them in
+  sequence and stopping at the first would let whichever peer is fastest settle a claim about the
+  chain.
   The `wait_for_confirmation` "not-found-yet" polling heuristic (which treats
   `PeerRejection`/`CoinsetApiError` as not-found) is NEVER reused for these reads.
 - **router** -- `peer_then_coinset_opt`: `Ok(None)` means CORROBORATED absence -- two independent
@@ -700,7 +721,11 @@ walk requires to find the tip:
   a `CorroboratedAbsent` answer becomes `Ok(None)`; an `UncorroboratedAbsent` answer is put to the
   coinset tier, which either corroborates it (`Ok(None)`), contradicts it (`SourcesDisagree`), or
   cannot answer (`UncorroboratedAbsence`). Absence that only one source will vouch for MUST NOT be
-  reported as `Ok(None)`. Only a peer FAILURE falls through to the retry, so absence is never masked
+  reported as `Ok(None)`. Symmetrically, an `UncorroboratedFound` answer is put to the coinset
+  tier, which either makes the same chain claim (`Ok(Some(v))`), makes a different one or reports
+  the thing absent (`SourcesDisagree`), or cannot answer (`UncorroboratedPresence`). A presence
+  that only one source will vouch for MUST NOT be reported as `Ok(Some(v))`: a false absence keeps
+  a caller polling, while a false presence makes it stop and record a height. Only a peer FAILURE falls through to the retry, so absence is never masked
   by a fallback and a failure is never collapsed into `Ok(None)`.
   **Stated limit:** when NO peer answers at all, the coinset tier is the only source there is and
   its absence is returned as `Ok(None)` on its own -- unchanged behaviour for a coinset-only client.
@@ -712,7 +737,7 @@ walk requires to find the tip:
 |---|---|
 | `PeerConnection(msg)` naming a timeout | `Timeout` |
 | `PeerConnection` / `PeerRejection` / `PeerDiscoveryFailed` / `TlsError` / `CoinsetHttp` / `CoinsetApiError` / `AllSourcesFailed` | `Transport` |
-| `UncorroboratedAbsence` / `SourcesDisagree` | `Transport` (neither is an answer about the chain; the consumer MUST fail closed and retry, never read "unknown" as "not there") |
+| `UncorroboratedAbsence` / `UncorroboratedPresence` / `SourcesDisagree` | `Transport` (neither is an answer about the chain; the consumer MUST fail closed and retry, never read "unknown" as "not there") |
 | `InvalidRequest` (bad input, e.g. malformed hex) | `Malformed` |
 | `UnsupportedWithoutCoinset` | `Unsupported` |
 

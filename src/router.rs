@@ -14,6 +14,8 @@ use crate::types::*;
 
 #[cfg(test)]
 mod absence_tests;
+#[cfg(test)]
+mod presence_tests;
 
 // ---------------------------------------------------------------------------
 // Puzzle condition extraction helper
@@ -78,6 +80,38 @@ fn settle_uncorroborated_absence<T>(
         )),
         Some(Err(e)) => Err(ChiaQueryError::UncorroboratedAbsence(format!(
             "one peer reported absence and the coinset API could not corroborate it: {e}"
+        ))),
+    }
+}
+
+/// What a positive answer that only ONE source will vouch for becomes.
+///
+/// The mirror of [`settle_uncorroborated_absence`], and the more dangerous of the two: an absence
+/// nobody can confirm leaves a caller polling, while a PRESENCE nobody can confirm makes it stop
+/// and record a height. `coinset` is `Some` only when the fallback tier was consulted — `None`
+/// means it is disabled, and a fact nobody could be brought to agree with is never returned as one
+/// (dig_ecosystem#2462).
+fn settle_uncorroborated_presence<T: ChainClaim>(
+    found: T,
+    coinset: Option<Result<Option<T>, ChiaQueryError>>,
+) -> Result<Option<T>, ChiaQueryError> {
+    match coinset {
+        None => Err(ChiaQueryError::UncorroboratedPresence(
+            "one peer produced a record, no second peer was available, and the coinset fallback \
+             is disabled"
+                .into(),
+        )),
+        Some(Ok(Some(other))) if other.chain_claim() == found.chain_claim() => Ok(Some(found)),
+        Some(Ok(Some(other))) => Err(ChiaQueryError::SourcesDisagree(format!(
+            "a peer claims `{}`, the coinset API claims `{}`",
+            found.chain_claim(),
+            other.chain_claim()
+        ))),
+        Some(Ok(None)) => Err(ChiaQueryError::SourcesDisagree(
+            "a peer reports present, the coinset API reports absent".into(),
+        )),
+        Some(Err(e)) => Err(ChiaQueryError::UncorroboratedPresence(format!(
+            "one peer produced a record and the coinset API could not corroborate it: {e}"
         ))),
     }
 }
@@ -151,7 +185,7 @@ impl QueryRouter {
     /// coinset-only client has always had. That is one source, so it is one source's word; what
     /// this method removes is absence resting on an *anonymous, unauthenticated* peer, not the
     /// weaker claim that a single named HTTPS endpoint is infallible.
-    async fn peer_then_coinset_opt<T>(
+    async fn peer_then_coinset_opt<T: ChainClaim>(
         &self,
         peer_fn: impl std::future::Future<Output = Result<OptAnswer<T>, ChiaQueryError>>,
         peer_retry: impl std::future::Future<Output = Result<OptAnswer<T>, ChiaQueryError>>,
@@ -187,7 +221,7 @@ impl QueryRouter {
 
     /// Turn the peer tier's graded answer into the router's contract, consulting coinset as a
     /// second voice when — and only when — the peer tier could not find one itself.
-    async fn settle_peer_answer<T>(
+    async fn settle_peer_answer<T: ChainClaim>(
         &self,
         answer: OptAnswer<T>,
         coinset_fn: impl std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
@@ -195,6 +229,14 @@ impl QueryRouter {
         match answer {
             OptAnswer::Found(v) => Ok(Some(v)),
             OptAnswer::CorroboratedAbsent => Ok(None),
+            OptAnswer::UncorroboratedFound(v) => {
+                let coinset = if self.coinset_fallback_enabled {
+                    Some(coinset_fn.await)
+                } else {
+                    None
+                };
+                settle_uncorroborated_presence(v, coinset)
+            }
             OptAnswer::UncorroboratedAbsent => {
                 let coinset = if self.coinset_fallback_enabled {
                     Some(coinset_fn.await)
