@@ -117,6 +117,10 @@ pub(crate) fn map_query_error(error: ChiaQueryError) -> ChainSourceError {
         // Both are Transport for the same reason every other variant here is — the consumer must
         // fail closed and retry, never read "unknown" as "not there" (dig_ecosystem#2456).
         ChiaQueryError::UncorroboratedAbsence(msg) => ChainSourceError::Transport(msg),
+        // Same reasoning in the opposite direction: a record whose heights no second source would
+        // vouch for is not a chain fact, and a consumer must retry rather than read it as one
+        // (dig_ecosystem#2462).
+        ChiaQueryError::UncorroboratedPresence(msg) => ChainSourceError::Transport(msg),
         ChiaQueryError::SourcesDisagree(msg) => {
             ChainSourceError::Transport(format!("sources disagree: {msg}"))
         }
