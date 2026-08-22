@@ -18,7 +18,7 @@ use crate::types::ChiaQueryError;
 use crate::NetworkType;
 
 const BATCH_SIZE: usize = 10;
-const MAINNET_PORT: u16 = 8444;
+pub(crate) const MAINNET_PORT: u16 = 8444;
 const TESTNET11_PORT: u16 = 58444;
 
 // ---------------------------------------------------------------------------
@@ -168,8 +168,9 @@ pub async fn connect_random_peer_excluding(
     // carries the fix for the shuffle-then-`dedup` that made deduplication near-vacuous here.
     let mut addrs = ordering::candidate_order(&discovered);
 
-    // Remove any addresses we already tried above, and any the caller already holds.
-    addrs.retain(|a| !priority_addrs.contains(a) && !exclude.contains(a));
+    // Remove any addresses we already tried above, any the caller already holds, and any that
+    // are not reachable from outside this host — see `is_host_local`.
+    addrs.retain(|a| !is_host_local(a) && !priority_addrs.contains(a) && !exclude.contains(a));
 
     if addrs.is_empty() {
         return Err(ChiaQueryError::PeerDiscoveryFailed);
@@ -219,14 +220,28 @@ pub async fn connect_random_peer_excluding(
 /// on every dial, so without it a caller filling N slots is offered the same local address N times
 /// — and any unprivileged local process that binds the port becomes the whole peer set
 /// (dig_ecosystem#2648).
-fn priority_addresses(default_port: u16, exclude: &[SocketAddr]) -> Vec<SocketAddr> {
+pub(crate) fn priority_addresses(default_port: u16, exclude: &[SocketAddr]) -> Vec<SocketAddr> {
+    let trusted = std::env::var("TRUSTED_FULLNODE").ok();
+    priority_addresses_from(trusted.as_deref(), default_port, exclude)
+}
+
+/// [`priority_addresses`] with the operator's `TRUSTED_FULLNODE` passed in rather than read.
+///
+/// Split out so the SIZE of the priority list is measurable. `plurality::PRIORITY_SLOTS` sizes the
+/// pool around how many slots this list can occupy, and a test that restated that number instead
+/// of obtaining it from here would pin the model rather than the code — which is exactly how the
+/// list grew to two entries while the pool was still sized for one.
+pub(crate) fn priority_addresses_from(
+    trusted: Option<&str>,
+    default_port: u16,
+    exclude: &[SocketAddr],
+) -> Vec<SocketAddr> {
     let mut addrs: Vec<SocketAddr> = Vec::new();
 
-    if let Ok(trusted) = std::env::var("TRUSTED_FULLNODE") {
-        if let Ok(ip) = trusted.parse::<std::net::IpAddr>() {
-            addrs.push(SocketAddr::new(ip, default_port));
-        } else {
-            log::debug!("TRUSTED_FULLNODE value is not a valid IP: {trusted}");
+    if let Some(trusted) = trusted {
+        match trusted.parse::<std::net::IpAddr>() {
+            Ok(ip) => addrs.push(SocketAddr::new(ip, default_port)),
+            Err(_) => log::debug!("TRUSTED_FULLNODE value is not a valid IP: {trusted}"),
         }
     }
 
@@ -237,6 +252,58 @@ fn priority_addresses(default_port: u16, exclude: &[SocketAddr]) -> Vec<SocketAd
 
     addrs.retain(|addr| !exclude.contains(addr));
     addrs
+}
+
+/// Whether `addr` names something on this host or its local network rather than a peer on the
+/// internet.
+///
+/// A DISCOVERED address that is local is refused outright, and the reason is what discovery is
+/// counted for. A peer reached from a preferred address is recorded as
+/// [`PeerOrigin::Priority`] and deliberately excluded from
+/// [`independent_peer_count`](super::pool::PeerPool::independent_peer_count); the same node
+/// arriving through the introducer set would be recorded as [`PeerOrigin::Discovered`] and counted
+/// as an INDEPENDENT voice. That is the whole of dig_ecosystem#2648 reachable through the
+/// discovery path: a local process that can influence what an introducer returns — or a hostile
+/// introducer — supplies as many "independent" voices as the pool has slots.
+///
+/// Every local family is covered, not just IPv4 loopback:
+///
+/// - loopback (`127.0.0.0/8`, `::1`), including the IPv4-mapped spelling `::ffff:127.0.0.1`, which
+///   `Ipv6Addr::is_loopback` reports as FALSE and which is therefore the form that would survive a
+///   loopback check written only against the two obvious ones;
+/// - RFC 1918 private IPv4 and IPv6 unique-local (`fc00::/7`);
+/// - link-local (`169.254.0.0/16`, `fe80::/10`), which includes the cloud metadata address;
+/// - unspecified (`0.0.0.0`, `::`).
+///
+/// The priority path is unaffected: it dials the loopback deliberately and records what it reaches
+/// as `Priority`.
+fn is_host_local(addr: &SocketAddr) -> bool {
+    let ip = match addr.ip() {
+        // An IPv4-mapped IPv6 address is the SAME host as its IPv4 form, so it is judged as one.
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local, fc00::/7.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local unicast, fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 async fn try_connect(
@@ -298,5 +365,62 @@ mod tests {
     fn exclusion_is_per_socket_address_not_per_host() {
         let held = [localhost(TESTNET11_PORT)];
         assert!(priority_addresses(MAINNET, &held).contains(&localhost(MAINNET)));
+    }
+
+    fn sock(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("a valid IP literal"), MAINNET)
+    }
+
+    /// **A DISCOVERED local address is refused, in every family it can be spelled in.**
+    ///
+    /// Each case is a distinct way a local address reaches the discovered set, and the list is
+    /// built from the spellings a narrower check would miss rather than from round examples: the
+    /// IPv4-mapped `::ffff:127.0.0.1` is not `is_loopback()` as an IPv6 address, and `fd00::1` and
+    /// `fe80::1` are local without being loopback at all. A filter written against IPv4 loopback
+    /// alone — the behaviour being replaced — passes only the first of these.
+    #[test]
+    fn every_family_of_local_address_is_refused_from_the_discovered_set() {
+        for literal in [
+            "127.0.0.1",
+            "127.13.1.9",
+            "::1",
+            "::ffff:127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.7",
+            "172.16.4.2",
+            "169.254.169.254",
+            "fd00::1",
+            "fe80::1",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(
+                is_host_local(&sock(literal)),
+                "{literal} is reachable only from this host or its LAN and must never be counted \
+                 as an independent voice"
+            );
+        }
+    }
+
+    /// The control, and it is what keeps the filter from being "refuse everything".
+    ///
+    /// Both families are represented, using documentation ranges that are PUBLIC: a check that
+    /// over-matched — treating any IPv6 address as local, say, which `fc00::/7` and `fe80::/10`
+    /// masks make easy to get wrong — would empty the discovered set and take the peer tier with
+    /// it.
+    #[test]
+    fn a_public_address_survives_the_local_filter() {
+        for literal in [
+            "203.0.113.9",
+            "8.8.8.8",
+            "2001:db8::1",
+            "2600::1",
+            "::ffff:203.0.113.9",
+        ] {
+            assert!(
+                !is_host_local(&sock(literal)),
+                "{literal} is an ordinary public peer and must remain dialable"
+            );
+        }
     }
 }

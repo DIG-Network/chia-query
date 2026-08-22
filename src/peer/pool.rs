@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use chia_protocol::{CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes};
@@ -15,8 +15,17 @@ use crate::types::ChiaQueryError;
 use crate::NetworkType;
 
 use super::connect;
-use super::frames::{FrameFanout, FrameSubscription, Generation, PoolFrame};
+use super::frames::{
+    FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
+};
 use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME};
+
+/// How many dial rounds [`PeerPool::fill_toward_capacity`] may spend reaching capacity.
+///
+/// Three: one round that the priority addresses win, one that reaches discovery with them
+/// excluded, and one for the ordinary attrition of a round whose dials did not all land. More
+/// would trade start-up latency for peers the round before it already failed to find.
+const FILL_ROUNDS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Pool entry
@@ -25,6 +34,12 @@ use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME};
 struct PeerEntry {
     peer: Peer,
     address: SocketAddr,
+    /// The session this connection publishes its frames under.
+    ///
+    /// Held so an ejection can name a CONNECTION rather than an address: a peer whose session
+    /// ended is removed only if the entry at that address is still the one that ended, never
+    /// its freshly dialled replacement.
+    session: SessionId,
     /// How this peer was reached. Held so a caller counting independent opinions can tell a
     /// preferred local node from a discovered one — see [`connect::PeerOrigin`].
     origin: connect::PeerOrigin,
@@ -89,6 +104,15 @@ pub struct PeerPool {
     /// is what a consumer following coin states needs and what its absence forced into a second
     /// dialled session (dig_ecosystem#2761).
     fanout: Arc<FrameFanout>,
+    /// Sessions that have STOPPED, waiting to be ejected on the next maintenance pass.
+    ///
+    /// A receiver handler runs in its own task and cannot take the pool's write lock without
+    /// holding a reference to the pool, so it records the death here and lets
+    /// [`maintain`](Self::maintain) act on it. Without this the pool's only removals are
+    /// failure-driven — a dead connection stays in `entries`, counted as a held peer and
+    /// offered to `select_peer`, until a request happens to pick it or `PEER_LIFETIME`
+    /// elapses.
+    dead_sessions: Arc<StdMutex<Vec<FrameSource>>>,
 }
 
 impl PeerPool {
@@ -103,25 +127,6 @@ impl PeerPool {
         requirement: PeerRequirement,
         connect_timeout: Duration,
     ) -> Result<Self, ChiaQueryError> {
-        let peak_height = Arc::new(AtomicU32::new(0));
-
-        // Connect to peers concurrently.
-        let mut futures = FuturesUnordered::new();
-        for _ in 0..max_peers {
-            let t = tls.clone();
-            futures.push(async move {
-                connect::connect_random_peer_excluding(network, &t, connect_timeout, &[]).await
-            });
-        }
-
-        let mut connected = Vec::new();
-        while let Some(result) = futures.next().await {
-            match result {
-                Ok(connection) => connected.push(connection),
-                Err(e) => log::debug!("initial peer connect failed: {e}"),
-            }
-        }
-
         let pool = Self {
             entries: RwLock::new(Vec::new()),
             next_idx: AtomicUsize::new(0),
@@ -129,22 +134,12 @@ impl PeerPool {
             tls,
             network,
             connect_timeout,
-            peak_height,
+            peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
+            dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         };
 
-        // Every connection enters through `admit`, including these, so the distinctness invariant
-        // has exactly ONE enforcement site. The initial fill is where duplicates were most likely:
-        // `max_peers` dials race concurrently with no knowledge of each other, so each one may
-        // return the same priority address. A receiver handler is spawned only for a connection
-        // that was actually admitted — spawning one for a discarded duplicate would keep feeding
-        // peak heights from a connection nothing else can see, and this must happen after pool
-        // construction so the `peak_height` Arc exists.
-        for (peer, addr, receiver, origin) in connected {
-            if pool.admit(peer, addr, origin).await {
-                pool.spawn_receiver_handler(pool.fanout.generation(), receiver);
-            }
-        }
+        pool.fill_toward_capacity().await;
 
         if !pool.has_peers().await {
             if requirement == PeerRequirement::Required {
@@ -154,6 +149,82 @@ impl PeerPool {
         }
 
         Ok(pool)
+    }
+
+    /// Dial toward capacity in ROUNDS, each excluding what the earlier rounds admitted.
+    ///
+    /// One round of `max_peers` concurrent dials is not enough, and the reason is the priority
+    /// path: every dial offers `TRUSTED_FULLNODE` and the loopback ahead of discovery, and
+    /// concurrent dials know nothing of each other, so on a machine running a full node ALL of
+    /// them return the same local address and every one but the first is discarded as a duplicate.
+    /// A single round therefore leaves a pool of ONE peer on exactly the machines most likely to
+    /// have several available — and one peer is a pool that can never corroborate anything.
+    ///
+    /// A later round excludes what the earlier ones admitted, so the priority addresses are no
+    /// longer offered and the dial falls through to discovery. Rounds stop as soon as one admits
+    /// nothing: a round that admitted nothing is evidence that dialling again would not help
+    /// either, and that bound is what keeps a host with no reachable peers from spending
+    /// `FILL_ROUNDS` whole timeouts on the same answer.
+    async fn fill_toward_capacity(&self) {
+        for _ in 0..FILL_ROUNDS {
+            let held: Vec<SocketAddr> = {
+                let entries = self.entries.read().await;
+                entries.iter().map(|e| e.address).collect()
+            };
+            let wanted = self.max_peers.saturating_sub(held.len());
+            if wanted == 0 {
+                return;
+            }
+
+            let mut dials = FuturesUnordered::new();
+            for _ in 0..wanted {
+                let tls = self.tls.clone();
+                let held = held.clone();
+                let network = self.network;
+                let timeout = self.connect_timeout;
+                dials.push(async move {
+                    connect::connect_random_peer_excluding(network, &tls, timeout, &held).await
+                });
+            }
+
+            let mut admitted = 0usize;
+            while let Some(result) = dials.next().await {
+                match result {
+                    Ok((peer, addr, receiver, origin)) => {
+                        if self.admit_and_follow(peer, addr, receiver, origin).await {
+                            admitted += 1;
+                        }
+                    }
+                    Err(e) => log::debug!("peer connect failed: {e}"),
+                }
+            }
+
+            if admitted == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Admit a connection and, if it was admitted, start following its frames.
+    ///
+    /// The ONE path by which a session becomes visible to subscribers, so the ordering it holds
+    /// holds everywhere: the session is identified, then admitted, then ANNOUNCED, and only then
+    /// does its task begin publishing. Announcing before admission would name a session for a
+    /// duplicate that was discarded; announcing after the task started would race its first frame.
+    async fn admit_and_follow(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        receiver: mpsc::Receiver<Message>,
+        origin: connect::PeerOrigin,
+    ) -> bool {
+        let source = self.fanout.allocate_session(address);
+        if !self.admit(peer, address, origin, source.session).await {
+            return false;
+        }
+        self.fanout.open_session(source).await;
+        self.spawn_receiver_handler(source, receiver);
+        true
     }
 
     /// Latest peak height observed across all connected peers.
@@ -174,7 +245,7 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
-    /// Select a peer that could CORROBORATE an answer already given by the peer at `asked`.
+    /// Every peer that could CORROBORATE an answer already given by the peer at `asked`.
     ///
     /// A corroborating peer must be two things at once, and neither alone is enough:
     ///
@@ -185,30 +256,11 @@ impl PeerPool {
     ///   and is not evidence about the chain independent of this host, exactly as
     ///   [`independent_peer_count`](Self::independent_peer_count) records.
     ///
-    /// Returns `None` when the pool holds no such peer, which is the honest answer that there is
-    /// nobody to corroborate with — never a substitute peer that would manufacture agreement.
-    pub async fn select_corroborating_peer(&self, asked: SocketAddr) -> Option<(Peer, SocketAddr)> {
-        let entries = self.entries.read().await;
-        let candidates: Vec<&PeerEntry> = entries
-            .iter()
-            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % candidates.len();
-        let entry = candidates[idx];
-        Some((entry.peer.clone(), entry.address))
-    }
-
-    /// Every peer that could CORROBORATE an answer already given by the peer at `asked`.
-    ///
-    /// The plural of [`select_corroborating_peer`](Self::select_corroborating_peer), and it holds
-    /// the same two requirements: a different address, and
-    /// [`PeerOrigin::Discovered`](connect::PeerOrigin). A caller corroborating a POSITIVE answer
-    /// wants all of them at once — asking them one at a time lets the first responder settle a
-    /// claim about the chain, which is exactly the power a hostile peer has
-    /// (dig_ecosystem#2462).
+    /// They are returned ALL AT ONCE, and there is deliberately no singular form of this. Asking
+    /// corroborators one at a time lets the first responder settle a claim about the chain, which
+    /// is exactly the power a hostile peer has (dig_ecosystem#2462) — and a single corroborator
+    /// cannot reach `CORROBORATION_FLOOR` at all, so a caller that took one would be building an
+    /// answer it is not allowed to report as corroborated.
     ///
     /// Returns an empty vector when the pool holds nobody who qualifies, which is the honest
     /// answer that there is nobody to corroborate with.
@@ -333,8 +385,47 @@ impl PeerPool {
     /// Cycling before refilling is deliberate. Refilling first would find the pool at capacity and
     /// do nothing, so the rotation would leave a permanently smaller pool.
     pub async fn maintain(&self) {
+        self.eject_dead_sessions().await;
         self.cycle_expired_peers().await;
         self.try_refill().await;
+    }
+
+    /// Remove the peers whose sessions have ENDED.
+    ///
+    /// Session death is the pool's third eviction reason and it is neither of the other two: a
+    /// disconnected or protocol-violating peer has not failed a request, so
+    /// [`eject_peer`](Self::eject_peer) never fires for it, and it need not be old, so cycling may
+    /// be minutes away. Until it is removed the pool counts it as held and `select_peer` keeps
+    /// offering it — a peer count that overstates what the pool can actually reach.
+    ///
+    /// Matched on address AND session, so a replacement already dialled to the same address is
+    /// never removed by its predecessor's death.
+    async fn eject_dead_sessions(&self) {
+        let dead = std::mem::take(&mut *self.dead_sessions_guard());
+        if dead.is_empty() {
+            return;
+        }
+
+        let mut entries = self.entries.write().await;
+        entries.retain(|entry| {
+            let died = dead
+                .iter()
+                .any(|d| d.address == entry.address && d.session == entry.session);
+            if died {
+                log::debug!("peer {} ejected: its session ended", entry.address);
+            }
+            !died
+        });
+    }
+
+    /// The dead-session list, recovering from a poisoned lock rather than panicking.
+    ///
+    /// A panic in one handler task must not take the pool's maintenance down with it, and the list
+    /// is a plain `Vec` with no invariant a poisoned lock could have left half-applied.
+    fn dead_sessions_guard(&self) -> std::sync::MutexGuard<'_, Vec<FrameSource>> {
+        self.dead_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Admit a connection, or reject it, deciding under the WRITE lock.
@@ -348,7 +439,13 @@ impl PeerPool {
     /// under the read lock, or by the caller — is a time-of-check/time-of-use gap: two fills of the
     /// same address each observe it absent, then each pushes, and the duplicate is admitted by
     /// exactly the code written to prevent it. The check and the push must be one critical section.
-    async fn admit(&self, peer: Peer, address: SocketAddr, origin: connect::PeerOrigin) -> bool {
+    async fn admit(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        origin: connect::PeerOrigin,
+        session: SessionId,
+    ) -> bool {
         let mut entries = self.entries.write().await;
 
         if entries.len() >= self.max_peers {
@@ -364,6 +461,7 @@ impl PeerPool {
             peer,
             address,
             origin,
+            session,
             admitted_at: Instant::now(),
         });
         log::debug!("peer admitted: {address} ({origin:?})");
@@ -394,12 +492,7 @@ impl PeerPool {
         .await
         {
             Ok((peer, addr, receiver, origin)) => {
-                if self.admit(peer, addr, origin).await {
-                    // A replacement session is a RECONNECT: bump the generation and announce it
-                    // BEFORE the new session can publish anything, so a subscriber never has to
-                    // infer a discontinuity from the frames themselves.
-                    let generation = self.fanout.begin_generation().await;
-                    self.spawn_receiver_handler(generation, receiver);
+                if self.admit_and_follow(peer, addr, receiver, origin).await {
                     log::debug!("replacement peer connected: {addr}");
                 }
             }
@@ -414,48 +507,87 @@ impl PeerPool {
     /// Spawn a background task that reads inbound messages from one peer session, updating the
     /// shared peak height and fanning every recognised frame out to the pool's subscribers.
     ///
-    /// `generation` identifies the session. Every frame this task emits carries it, so a
-    /// subscriber can tell frames of a replaced session from frames of the current one.
+    /// `source` identifies the session. Every frame this task emits carries it, so a subscriber
+    /// can tell one held peer's frames from another's — which is what lets it follow the peer it
+    /// chose and eject one whose frames it rejected.
+    ///
+    /// **The task never ends quietly.** Both ways a session can stop — the transport closing, and
+    /// a message this crate cannot decode — publish a [`PoolFrame::SessionEnded`] and record the
+    /// death for [`eject_dead_sessions`](Self::eject_dead_sessions). Returning silently would
+    /// leave a subscriber unable to distinguish a peer that stopped from a chain that is quiet,
+    /// and would leave the pool holding a connection nothing will ever read from.
     pub fn spawn_receiver_handler(
         &self,
-        generation: Generation,
+        source: FrameSource,
         mut receiver: mpsc::Receiver<Message>,
     ) {
         let peak = Arc::clone(&self.peak_height);
         let fanout = Arc::clone(&self.fanout);
+        let dead_sessions = Arc::clone(&self.dead_sessions);
+
         tokio::spawn(async move {
-            while let Some(msg) = receiver.recv().await {
+            let reason = loop {
+                let Some(msg) = receiver.recv().await else {
+                    break SessionEndReason::Disconnected;
+                };
+
                 match msg.msg_type {
                     ProtocolMessageTypes::NewPeakWallet => {
-                        if let Ok(new_peak) = NewPeakWallet::from_bytes(&msg.data) {
-                            let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
-                            if new_peak.height > prev {
-                                log::debug!("new peak from peer: {}", new_peak.height);
-                            }
-                            fanout
-                                .publish(PoolFrame::Peak {
-                                    generation,
+                        let Ok(new_peak) = NewPeakWallet::from_bytes(&msg.data) else {
+                            log::warn!(
+                                "peer {} sent an undecodable NewPeakWallet; ending the session",
+                                source.address
+                            );
+                            break SessionEndReason::UndecodableFrame;
+                        };
+                        let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
+                        if new_peak.height > prev {
+                            log::debug!(
+                                "new peak from peer {}: {}",
+                                source.address,
+                                new_peak.height
+                            );
+                        }
+                        fanout
+                            .publish(
+                                source,
+                                PoolFrame::Peak {
                                     height: new_peak.height,
                                     header_hash: new_peak.header_hash,
-                                })
-                                .await;
-                        }
+                                },
+                            )
+                            .await;
                     }
                     ProtocolMessageTypes::CoinStateUpdate => {
-                        if let Ok(update) = CoinStateUpdate::from_bytes(&msg.data) {
-                            fanout
-                                .publish(PoolFrame::CoinStates {
-                                    generation,
+                        let Ok(update) = CoinStateUpdate::from_bytes(&msg.data) else {
+                            log::warn!(
+                                "peer {} sent an undecodable CoinStateUpdate; ending the session",
+                                source.address
+                            );
+                            break SessionEndReason::UndecodableFrame;
+                        };
+                        fanout
+                            .publish(
+                                source,
+                                PoolFrame::CoinStates {
                                     height: update.height,
                                     fork_height: update.fork_height,
                                     items: update.items,
-                                })
-                                .await;
-                        }
+                                },
+                            )
+                            .await;
                     }
                     _ => {}
                 }
-            }
+            };
+
+            dead_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(source);
+            fanout
+                .publish(source, PoolFrame::SessionEnded { reason })
+                .await;
         });
     }
 
@@ -465,11 +597,6 @@ impl PeerPool {
     /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
     pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
         self.fanout.subscribe(capacity).await
-    }
-
-    /// The generation frames are currently tagged with.
-    pub fn frame_generation(&self) -> Generation {
-        self.fanout.generation()
     }
 }
 
@@ -490,6 +617,7 @@ impl PeerPool {
             connect_timeout: Duration::from_millis(1),
             peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
+            dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -499,7 +627,38 @@ impl PeerPool {
         address: SocketAddr,
         origin: connect::PeerOrigin,
     ) -> bool {
-        self.admit(peer, address, origin).await
+        self.admitted(peer, address, origin).await
+    }
+
+    /// Admit a connection under a freshly allocated session, reporting only whether it was taken.
+    ///
+    /// Production admits through [`admit_and_follow`](Self::admit_and_follow), which also starts
+    /// the session; a test that only cares about the pool's membership uses this so it does not
+    /// have to invent a receiver it will never feed.
+    pub(crate) async fn admitted(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        origin: connect::PeerOrigin,
+    ) -> bool {
+        let session = self.fanout.allocate_session(address).session;
+        self.admit(peer, address, origin, session).await
+    }
+
+    /// Admit a connection AND follow `receiver`, exactly as a real dial would.
+    pub(crate) async fn admit_and_follow_for_tests(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        receiver: mpsc::Receiver<Message>,
+        origin: connect::PeerOrigin,
+    ) -> bool {
+        self.admit_and_follow(peer, address, receiver, origin).await
+    }
+
+    /// Run only the dead-session half of [`maintain`](Self::maintain), which does not dial.
+    pub(crate) async fn eject_dead_sessions_for_tests(&self) {
+        self.eject_dead_sessions().await;
     }
 
     /// The addresses currently held, in pool order.
@@ -524,7 +683,7 @@ impl PeerPool {
         origin: connect::PeerOrigin,
         admitted_at: Instant,
     ) -> bool {
-        if !self.admit(peer, address, origin).await {
+        if !self.admitted(peer, address, origin).await {
             return false;
         }
         let mut entries = self.entries.write().await;
@@ -569,7 +728,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             let peer = peer.clone();
             fills.push(tokio::spawn(async move {
-                pool.admit(peer, occupied, PeerOrigin::Priority).await
+                pool.admitted(peer, occupied, PeerOrigin::Priority).await
             }));
         }
 
@@ -604,7 +763,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             let peer = peer.clone();
             fills.push(tokio::spawn(async move {
-                pool.admit(peer, address(octet), PeerOrigin::Discovered)
+                pool.admitted(peer, address(octet), PeerOrigin::Discovered)
                     .await
             }));
         }
@@ -628,7 +787,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             let peer = peer.clone();
             fills.push(tokio::spawn(async move {
-                pool.admit(peer, address(octet), PeerOrigin::Discovered)
+                pool.admitted(peer, address(octet), PeerOrigin::Discovered)
                     .await
             }));
         }
@@ -649,14 +808,17 @@ mod tests {
         let peer = loopback_peer().await;
 
         assert!(
-            pool.admit(peer.clone(), address(1), PeerOrigin::Priority)
+            pool.admitted(peer.clone(), address(1), PeerOrigin::Priority)
                 .await
         );
         assert!(
-            pool.admit(peer.clone(), address(2), PeerOrigin::Discovered)
+            pool.admitted(peer.clone(), address(2), PeerOrigin::Discovered)
                 .await
         );
-        assert!(pool.admit(peer, address(3), PeerOrigin::Discovered).await);
+        assert!(
+            pool.admitted(peer, address(3), PeerOrigin::Discovered)
+                .await
+        );
 
         assert_eq!(pool.peer_count().await, 3, "three connections are held");
         assert_eq!(
@@ -673,16 +835,21 @@ mod tests {
         let peer = loopback_peer().await;
         let addr = address(1);
 
-        assert!(pool.admit(peer.clone(), addr, PeerOrigin::Discovered).await);
         assert!(
-            !pool.admit(peer.clone(), addr, PeerOrigin::Discovered).await,
+            pool.admitted(peer.clone(), addr, PeerOrigin::Discovered)
+                .await
+        );
+        assert!(
+            !pool
+                .admitted(peer.clone(), addr, PeerOrigin::Discovered)
+                .await,
             "still held, so still a duplicate"
         );
 
         pool.eject_peer(addr).await;
 
         assert!(
-            pool.admit(peer, addr, PeerOrigin::Discovered).await,
+            pool.admitted(peer, addr, PeerOrigin::Discovered).await,
             "a re-dialled peer must be admissible after ejection"
         );
         assert_eq!(pool.peer_count().await, 1);
@@ -836,12 +1003,12 @@ mod tests {
         let peer = loopback_peer().await;
 
         assert!(
-            pool.admit(peer.clone(), address(1), PeerOrigin::Priority)
+            pool.admitted(peer.clone(), address(1), PeerOrigin::Priority)
                 .await
         );
         for octet in 2..=(default_max_peers() as u8) {
             assert!(
-                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                pool.admitted(peer.clone(), address(octet), PeerOrigin::Discovered)
                     .await
             );
         }
@@ -871,7 +1038,7 @@ mod tests {
 
         for octet in 1..=2u8 {
             assert!(
-                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                pool.admitted(peer.clone(), address(octet), PeerOrigin::Discovered)
                     .await
             );
         }
@@ -896,7 +1063,7 @@ mod tests {
 
         for octet in 1..=(CORROBORATION_FLOOR as u8 + 1) {
             assert!(
-                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                pool.admitted(peer.clone(), address(octet), PeerOrigin::Discovered)
                     .await
             );
         }
@@ -919,12 +1086,12 @@ mod tests {
         let peer = loopback_peer().await;
 
         assert!(
-            pool.admit(peer.clone(), address(1), PeerOrigin::Discovered)
+            pool.admitted(peer.clone(), address(1), PeerOrigin::Discovered)
                 .await
         );
         for octet in 2..=(CORROBORATION_FLOOR as u8 + 1) {
             assert!(
-                pool.admit(peer.clone(), address(octet), PeerOrigin::Priority)
+                pool.admitted(peer.clone(), address(octet), PeerOrigin::Priority)
                     .await
             );
         }
@@ -933,5 +1100,307 @@ mod tests {
             pool.corroboration_readiness().await,
             CorroborationReadiness::Insufficient { .. }
         ));
+    }
+    // -----------------------------------------------------------------------
+    // Session lifecycle: attribution, loud endings, and the ejection they drive
+    // -----------------------------------------------------------------------
+
+    use chia_protocol::Bytes32;
+
+    use super::super::frames::SourcedFrame;
+
+    /// A well-formed `NewPeakWallet` message at `height`.
+    fn peak_message(height: u32) -> Message {
+        let peak = NewPeakWallet::new(Bytes32::new([height as u8; 32]), height, 0, 0);
+        Message {
+            msg_type: ProtocolMessageTypes::NewPeakWallet,
+            id: None,
+            data: peak.to_bytes().expect("encode a peak").into(),
+        }
+    }
+
+    /// A `NewPeakWallet` message whose BODY cannot be decoded.
+    ///
+    /// The type byte is honest and the payload is one byte, far short of the
+    /// `Bytes32 + u32 + u128 + u32` the body requires — which is what any peer can send at will,
+    /// costing it nothing.
+    fn undecodable_peak_message() -> Message {
+        Message {
+            msg_type: ProtocolMessageTypes::NewPeakWallet,
+            id: None,
+            data: vec![0x00].into(),
+        }
+    }
+
+    /// Drain the frames that have arrived, waiting briefly for the handler task to run.
+    ///
+    /// The handler is a separate task, so a bare `try_recv` races it. This yields until the
+    /// expected number of frames has arrived or the budget runs out, and returns whatever it has —
+    /// so a test asserting on the CONTENT fails on its own assertion rather than on a timeout.
+    async fn drain_at_least(
+        subscription: &mut FrameSubscription,
+        wanted: usize,
+    ) -> Vec<SourcedFrame> {
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            while let Ok(frame) = subscription.try_recv() {
+                seen.push(frame);
+            }
+            if seen.len() >= wanted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        seen
+    }
+
+    /// Admit a peer at `addr` and follow a channel the test itself feeds.
+    async fn followed_session(
+        pool: &PeerPool,
+        addr: SocketAddr,
+    ) -> (mpsc::Sender<Message>, FrameSource) {
+        let (sender, receiver) = mpsc::channel(8);
+        let peer = loopback_peer().await;
+        let before = pool.held_addresses_for_tests().await.len();
+        assert!(
+            pool.admit_and_follow_for_tests(peer, addr, receiver, PeerOrigin::Discovered)
+                .await,
+            "the fixture peer must be admitted"
+        );
+        assert_eq!(pool.held_addresses_for_tests().await.len(), before + 1);
+
+        let source = pool
+            .entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == addr)
+            .map(|e| FrameSource {
+                address: e.address,
+                session: e.session,
+            })
+            .expect("the admitted entry");
+        (sender, source)
+    }
+
+    /// **A frame carries the address of the peer that sent it, all the way from the socket.**
+    ///
+    /// TWO sessions are followed and each is fed a peak of its own. A handler that published
+    /// without attribution — or that attributed every frame to one session — gives both frames the
+    /// same source and fails here; a one-session fixture cannot tell those apart from correct
+    /// behaviour.
+    ///
+    /// This is the property whose absence let any held peer's `CoinStateUpdate` reach a subscriber
+    /// as if it came from the peer that subscriber had chosen to follow.
+    #[tokio::test]
+    async fn a_frame_reaching_a_subscriber_names_the_session_it_came_from() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+
+        let (first, first_source) = followed_session(&pool, address(1)).await;
+        let (second, second_source) = followed_session(&pool, address(2)).await;
+
+        first.send(peak_message(100)).await.expect("send");
+        second.send(peak_message(200)).await.expect("send");
+
+        let seen = drain_at_least(&mut subscription, 4).await;
+
+        let peaks: Vec<(SocketAddr, u32)> = seen
+            .iter()
+            .filter_map(|f| match f.frame {
+                PoolFrame::Peak { height, .. } => Some((f.source.address, height)),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            peaks.contains(&(address(1), 100)),
+            "peer 1's peak must arrive under peer 1's address: {peaks:?}"
+        );
+        assert!(
+            peaks.contains(&(address(2), 200)),
+            "peer 2's peak must arrive under peer 2's address: {peaks:?}"
+        );
+        assert_ne!(
+            first_source.session, second_source.session,
+            "two sessions must not share an identity"
+        );
+    }
+
+    /// **An undecodable frame ENDS the session; it is never skipped.**
+    ///
+    /// The fixture is ordered so that skipping is distinguishable from ending: a valid peak, then
+    /// an undecodable one, then a second valid peak. An implementation that ignores what it cannot
+    /// decode — the `if let Ok(..)` this replaces — delivers BOTH peaks and no ending, which is a
+    /// subscriber missing an update it will never learn it missed.
+    #[tokio::test]
+    async fn an_undecodable_frame_ends_the_session_rather_than_being_skipped() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+        let (sender, source) = followed_session(&pool, address(1)).await;
+
+        sender.send(peak_message(100)).await.expect("send");
+        sender.send(undecodable_peak_message()).await.expect("send");
+        sender.send(peak_message(101)).await.expect("send");
+
+        let seen = drain_at_least(&mut subscription, 3).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::Peak { height: 100, .. })),
+            "the frames before the bad one are still delivered: {frames:?}"
+        );
+        assert!(
+            frames.contains(&&PoolFrame::SessionEnded {
+                reason: SessionEndReason::UndecodableFrame
+            }),
+            "an undecodable frame must END the session, loudly: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::Peak { height: 101, .. })),
+            "nothing after the undecodable frame belongs to this session: {frames:?}"
+        );
+    }
+
+    /// The control: a session fed only VALID frames is not ended.
+    ///
+    /// Without it, a handler that ended every session on its first message would satisfy the test
+    /// above.
+    #[tokio::test]
+    async fn a_session_fed_only_valid_frames_stays_open() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+        let (sender, source) = followed_session(&pool, address(1)).await;
+
+        sender.send(peak_message(100)).await.expect("send");
+        sender.send(peak_message(101)).await.expect("send");
+
+        let seen = drain_at_least(&mut subscription, 3).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::SessionEnded { .. })),
+            "a well-behaved session must stay open: {frames:?}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, PoolFrame::Peak { .. }))
+                .count(),
+            2,
+            "both valid peaks must be delivered: {frames:?}"
+        );
+    }
+
+    /// A transport that closes ends the session loudly rather than silently.
+    #[tokio::test]
+    async fn a_closed_transport_ends_the_session_loudly() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+        let (sender, source) = followed_session(&pool, address(1)).await;
+
+        drop(sender);
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        assert!(
+            seen.iter().any(|f| f.source == source
+                && f.frame
+                    == PoolFrame::SessionEnded {
+                        reason: SessionEndReason::Disconnected
+                    }),
+            "a dropped transport must be announced, not left as silence: {seen:?}"
+        );
+    }
+
+    /// **A peer whose session ended is EJECTED, without waiting for a failed request or the
+    /// rotation timer.**
+    ///
+    /// Two peers are held and only ONE dies, which is the fixture shape that separates ejecting
+    /// the right peer from ejecting on any death: a pass that removed both, or removed the wrong
+    /// one, fails here. The surviving peer is the control and is never fed anything, so nothing
+    /// about it changes except that its neighbour died.
+    #[tokio::test]
+    async fn a_peer_whose_session_ended_is_ejected_without_waiting_for_a_failure() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+
+        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        let (_surviving, _) = followed_session(&pool, address(2)).await;
+
+        drop(dying);
+
+        // Wait for the death to be announced, which is published after it is recorded.
+        let seen = drain_at_least(&mut subscription, 3).await;
+        assert!(
+            seen.iter()
+                .any(|f| f.source == dying_source
+                    && matches!(f.frame, PoolFrame::SessionEnded { .. })),
+            "the fixture depends on the session actually ending: {seen:?}"
+        );
+
+        assert_eq!(
+            pool.held_addresses_for_tests().await.len(),
+            2,
+            "a dead session is still HELD until maintenance runs — which is the gap being closed"
+        );
+
+        pool.eject_dead_sessions_for_tests().await;
+
+        assert_eq!(
+            pool.held_addresses_for_tests().await,
+            vec![address(2)],
+            "exactly the peer whose session ended is removed"
+        );
+    }
+
+    /// A replacement dialled to the same address is not removed by its predecessor's death.
+    ///
+    /// The dead session's address is re-admitted under a NEW session before maintenance runs, so
+    /// an ejection matching on ADDRESS alone — the obvious implementation — removes the live
+    /// replacement and leaves the pool short. Matching on the session too is what this pins.
+    #[tokio::test]
+    async fn a_replacement_at_the_same_address_survives_its_predecessors_death() {
+        let pool = empty_pool(4);
+        let mut subscription = pool.subscribe_frames(32).await;
+
+        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        drop(dying);
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        assert!(
+            seen.iter()
+                .any(|f| f.source == dying_source
+                    && matches!(f.frame, PoolFrame::SessionEnded { .. })),
+            "the fixture depends on the session actually ending: {seen:?}"
+        );
+
+        // The replacement takes the same address under a fresh session, exactly as a re-dial
+        // would once the dead entry is gone.
+        pool.eject_dead_sessions_for_tests().await;
+        let (_replacement, replacement_source) = followed_session(&pool, address(1)).await;
+        assert_ne!(replacement_source.session, dying_source.session);
+
+        // A second pass must not take the replacement with it.
+        pool.eject_dead_sessions_for_tests().await;
+
+        assert_eq!(
+            pool.held_addresses_for_tests().await,
+            vec![address(1)],
+            "the replacement session must survive its predecessor's death"
+        );
     }
 }

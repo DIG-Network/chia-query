@@ -284,22 +284,38 @@ corroborating voice:
 
 | Term | Why it is not a voice |
 |---|---|
-| 1 priority slot | the dialler tries `TRUSTED_FULLNODE` and the loopback first, so a `Priority` entry is the ordinary case, and a co-resident node is a source a local attacker can supply |
+| `PRIORITY_SLOTS` = 2 | the dialler tries `TRUSTED_FULLNODE` AND the loopback ahead of discovery, at two distinct socket addresses, so a host running both fills two slots with peers that are not independent voices |
 | 1 followed session | a subscriber follows one session's frames; the peer it reads from cannot corroborate itself |
 | `QUORUM_SAMPLE` = 4 | the sample an agreement ratio is expressed against |
 | 1 of slack | cycling removes a peer before its replacement connects, so one slot is transiently vacant |
 
-A default of 5 leaves three usable corroborators in the ordinary case — below `QUORUM_SAMPLE`.
+`default_max_peers()` is therefore `PRIORITY_SLOTS + 1 + QUORUM_SAMPLE + 1` = 8. A default
+of 5 leaves three usable corroborators in the ordinary case, and a default of 7 leaves three
+mid-rotation on a host running both priority addresses — both below `QUORUM_SAMPLE`.
 
 #### Corroboration arming: refuse, never degrade
 
 `corroboration_readiness()` reports `Armed` only when `independent_peer_count() - 1 >=
 CORROBORATION_FLOOR` (2); the `- 1` sets aside the peer that answered, which cannot corroborate
-itself. Below that it MUST report `Insufficient` and the caller MUST decline the read.
+itself. Below that it MUST report `Insufficient`.
 
-Proceeding with fewer voices is FORBIDDEN. Corroborating against whoever happens to be present
-converts a four-voice quorum into a two-voice one that still reports itself corroborated, and no
-consumer downstream can distinguish the two.
+Both corroborating reads consult it BEFORE asking anyone, and both grade the answers against the
+same floor afterwards:
+
+| stage | rule |
+|---|---|
+| before asking | `Insufficient` MUST yield `UncorroboratedFound` / `UncorroboratedAbsent`; no corroboration is attempted |
+| after asking | fewer than `CORROBORATION_FLOOR` AGREEING answers MUST yield `UncorroboratedFound` / `UncorroboratedAbsent` |
+| any answer | one contradicting answer MUST fail the read with `SourcesDisagree`, whatever the agreement count |
+
+Both stages are required and neither substitutes for the other: the first refuses a read the pool
+cannot support, the second catches a pool that held enough voices and then could not get answers
+from them.
+
+Reporting an answer as corroborated on fewer voices is FORBIDDEN. Corroborating against whoever
+happens to be present converts a four-voice quorum into a one-voice one that still reports itself
+corroborated, and no consumer downstream can distinguish the two. An `Uncorroborated*` answer is
+not a failure — it is the undecided fact handed up for another tier to settle.
 
 #### Cycling: peers are rotated on AGE
 
@@ -522,8 +538,10 @@ struct ChiaQueryConfig {
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
 5. **Pool size invariant**: The pool always targets `max_peers` connections. If below target, background tasks work to replenish
 5b. **Cycling invariant**: A `Discovered` peer held for `PEER_LIFETIME` or longer MUST be rotated out on AGE, independently of whether any request to it has failed
-5c. **Corroboration invariant**: A corroborated read MUST be REFUSED when fewer than `CORROBORATION_FLOOR` independent peers besides the answering one are held. It MUST NOT proceed with fewer voices
+5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
 5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
+5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
+5f. **Local-discovery invariant**: An address reached through DNS discovery MUST be refused if it is loopback, private, link-local or unspecified in either family. Only the priority path may reach a host-local node, and what it reaches is recorded as `Priority`
 5a. **Distinct-address invariant**: At most one connection per `SocketAddr` is held, decided under the write lock — see [Distinct admission](#distinct-admission). `max_peers` connections therefore mean `max_peers` distinct addresses, which is what makes the count meaningful as a measure of redundancy
 6. **Coinset-only endpoints**: Endpoints with no peer protocol equivalent (mempool queries, block count metrics, block spends with conditions, unfinished block headers) always go directly to `CoinsetBackend`. If coinset fallback is disabled, these return `ChiaQueryError::UnsupportedWithoutCoinset`
 7. **Thread safety**: `ChiaQuery` is `Send + Sync` -- all internal state is behind `Arc<Mutex<_>>` or `Arc<RwLock<_>>` as appropriate

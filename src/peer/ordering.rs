@@ -9,31 +9,26 @@ use std::net::SocketAddr;
 
 use rand::seq::SliceRandom;
 
-/// Order candidates IPv6-first, loopback-first within each family.
+/// Order candidates IPv6-first (§5.2).
 ///
 /// A stable partition, so whatever order the caller established between two addresses of the same
-/// class is preserved. That is what lets [`candidate_order`] shuffle for load spreading and then
+/// family is preserved. That is what lets [`candidate_order`] shuffle for load spreading and then
 /// order for §5.2 without the ordering undoing the shuffle.
+///
+/// **Locality is not a preference here.** An earlier version sorted loopback ahead of everything
+/// else within each family, which put a DISCOVERED local address in front of every public peer —
+/// and a discovered local address is precisely the one a local attacker can supply. Reaching a
+/// co-resident node is the priority path's job
+/// ([`connect::priority_addresses`](super::connect::priority_addresses)), where the peer is
+/// recorded as `Priority` and is not counted as an independent voice; the discovered set has no
+/// business preferring it (dig_ecosystem#2648).
 pub fn order_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut v6_loopback = Vec::new();
-    let mut v6_rest = Vec::new();
-    let mut v4_loopback = Vec::new();
-    let mut v4_rest = Vec::new();
-
-    for &addr in candidates {
-        match addr {
-            SocketAddr::V6(_) if addr.ip().is_loopback() => v6_loopback.push(addr),
-            SocketAddr::V6(_) => v6_rest.push(addr),
-            SocketAddr::V4(_) if addr.ip().is_loopback() => v4_loopback.push(addr),
-            SocketAddr::V4(_) => v4_rest.push(addr),
-        }
-    }
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        candidates.iter().partition(|addr| addr.is_ipv6());
 
     let mut ordered = Vec::with_capacity(candidates.len());
-    ordered.extend(v6_loopback);
-    ordered.extend(v6_rest);
-    ordered.extend(v4_loopback);
-    ordered.extend(v4_rest);
+    ordered.extend(v6);
+    ordered.extend(v4);
     ordered
 }
 
@@ -139,9 +134,26 @@ mod tests {
         );
     }
 
-    /// IPv6 loopback precedes IPv4 loopback, so a co-resident node is reached over v6 first.
+    /// The ordering is by FAMILY alone: a local address gets no head start over a public one.
+    ///
+    /// The fixture puts the loopback address LAST within its family, so the behaviour being
+    /// replaced — loopback first within each family — moves it and fails here. Both families carry
+    /// one, so a fix applied to only one of them is visible too.
     #[test]
-    fn ipv6_loopback_precedes_ipv4_loopback() {
+    fn a_local_address_is_not_preferred_over_a_public_one_of_the_same_family() {
+        let v6_lo = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8444);
+        let v4_lo = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8444);
+
+        assert_eq!(
+            order_candidates(&[v6(1), v6_lo, v4(1), v4_lo]),
+            vec![v6(1), v6_lo, v4(1), v4_lo],
+            "family orders the candidates; locality must not reorder them"
+        );
+    }
+
+    /// IPv6 still precedes IPv4 when both are loopback (§5.2 applies to every pair).
+    #[test]
+    fn ipv6_precedes_ipv4_for_loopback_too() {
         let v6_lo = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8444);
         let v4_lo = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8444);
         assert_eq!(order_candidates(&[v4_lo, v6_lo]), vec![v6_lo, v4_lo]);
