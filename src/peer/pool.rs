@@ -1184,10 +1184,22 @@ mod tests {
         let discovered_1 = address(1);
         let discovered_2 = address(2);
 
-        assert!(pool.admitted(peer.clone(), asked, PeerOrigin::Discovered).await);
-        assert!(pool.admitted(peer.clone(), priority, PeerOrigin::Priority).await);
-        assert!(pool.admitted(peer.clone(), discovered_1, PeerOrigin::Discovered).await);
-        assert!(pool.admitted(peer.clone(), discovered_2, PeerOrigin::Discovered).await);
+        assert!(
+            pool.admitted(peer.clone(), asked, PeerOrigin::Discovered)
+                .await
+        );
+        assert!(
+            pool.admitted(peer.clone(), priority, PeerOrigin::Priority)
+                .await
+        );
+        assert!(
+            pool.admitted(peer.clone(), discovered_1, PeerOrigin::Discovered)
+                .await
+        );
+        assert!(
+            pool.admitted(peer.clone(), discovered_2, PeerOrigin::Discovered)
+                .await
+        );
 
         // Both should see exactly 2 corroborators: discovered_1 and discovered_2.
         // Not `asked` (excluded by address), not `priority` (excluded by origin).
@@ -1200,7 +1212,8 @@ mod tests {
         };
 
         assert_eq!(
-            readiness_count, selected.len(),
+            readiness_count,
+            selected.len(),
             "corroboration_readiness and select_corroborating_peers must use the same predicate"
         );
         assert_eq!(
