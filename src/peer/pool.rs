@@ -619,23 +619,7 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
-                        let CoinStateUpdate {
-                            height,
-                            fork_height,
-                            peak_hash,
-                            items,
-                        } = update;
-                        fanout
-                            .publish(
-                                source,
-                                PoolFrame::CoinStates {
-                                    height,
-                                    fork_height,
-                                    peak_hash,
-                                    items,
-                                },
-                            )
-                            .await;
+                        fanout.publish(source, coin_states_frame(update)).await;
                     }
                     _ => {}
                 }
@@ -657,6 +641,27 @@ impl PeerPool {
     /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
     pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
         self.fanout.subscribe(capacity).await
+    }
+}
+
+/// Translate a decoded `CoinStateUpdate` into the frame its subscribers see.
+///
+/// The destructuring is the guard, not ceremony. A field added upstream to `CoinStateUpdate` must
+/// be named here or this stops compiling; the old field-access form (`update.height`, ...) accepted
+/// a new field silently, which is how WU2 shipped a frame with `peak_hash` missing and left
+/// subscribers pairing a new height with a stale hash. Never reintroduce `..`.
+fn coin_states_frame(update: CoinStateUpdate) -> PoolFrame {
+    let CoinStateUpdate {
+        height,
+        fork_height,
+        peak_hash,
+        items,
+    } = update;
+    PoolFrame::CoinStates {
+        height,
+        fork_height,
+        peak_hash,
+        items,
     }
 }
 
@@ -1280,7 +1285,7 @@ mod tests {
     // Session lifecycle: attribution, loud endings, and the ejection they drive
     // -----------------------------------------------------------------------
 
-    use chia_protocol::Bytes32;
+    use chia_protocol::{Bytes32, Coin, CoinState};
 
     use super::super::frames::SourcedFrame;
 
@@ -1587,37 +1592,53 @@ mod tests {
             "the replacement session must survive its predecessor's death"
         );
     }
-    /// **The destructuring pattern for `CoinStateUpdate` is load-bearing.**
-    ///
-    /// A field added upstream to `CoinStateUpdate` must be handled explicitly, or the code will
-    /// fail to compile. The old field-access form (`update.height`, `update.fork_height`, etc.)
-    /// silently dropped any new field � which is exactly how WU2 shipped a frame with a missing
-    /// `peak_hash`, leaving subscribers to pair a new height with a stale hash.
-    ///
-    /// The destructuring pattern `let CoinStateUpdate { height, fork_height, peak_hash, items }`
-    /// enforces that every field is named. To prove it is load-bearing: if a new field is added
-    /// upstream and this destructuring is not updated to include it, compilation fails with
-    /// "missing field" � never silently skipped.
-    ///
-    /// The test that proves it: reverting to the old field-access form and running the suite
-    /// passes at compile time (the old form is always valid), so the destructuring itself is the
-    /// entire verification layer. This test exists to document that the pattern works AND to
-    /// catch a revert: if someone replaces the destructuring with `update.*` field access or
-    /// `..` wildcard, this test comment is the record that the change was deliberate and its
-    /// reason was not "it compiles either way."
-    #[test]
-    fn destructuring_coin_state_update_is_load_bearing() {
-        // This test is primarily a documentation + comment anchor.
-        // The real verification is at compile time: the destructuring pattern makes a new field
-        // in CoinStateUpdate a COMPILE ERROR, not a silent drop.
-        //
-        // If you are reading this because someone used `..` or field-access form instead:
-        // that change removed the ONLY compile-time guard against dropping upstream fields.
-        // Revert to the destructuring form.
 
-        // The test itself simply affirms the fields exist and are the ones we expect:
-        // height, fork_height, peak_hash, items. No constructed CoinStateUpdate here,
-        // because constructing one is not part of the test � the compile-time check is.
-        assert_eq!(std::mem::size_of::<u32>(), 4, "height is u32");
+    /// **Every field of a `CoinStateUpdate` reaches its frame carrying its OWN value.**
+    ///
+    /// The destructuring in [`coin_states_frame`] makes a DROPPED field a compile error, but a
+    /// field crossed with another (`fork_height: height`) still compiles and still ships a frame.
+    /// So every value here is distinct — `height` differs from `fork_height`, `peak_hash` from any
+    /// other byte pattern in the fixture, and `items` is non-empty — because a fixture that reuses
+    /// a value across two fields cannot tell a faithful translation from a swapped one.
+    ///
+    /// The update is round-tripped through the wire first, so this covers the same decode-then-
+    /// translate pair the session loop runs, not a hand-built struct the loop never sees.
+    #[test]
+    fn a_coin_state_update_transfers_every_field_into_its_frame() {
+        let items = vec![CoinState {
+            coin: Coin::new(Bytes32::new([7; 32]), Bytes32::new([8; 32]), 9),
+            created_height: Some(150),
+            spent_height: None,
+        }];
+        let peak_hash = Bytes32::new([0xBB; 32]);
+        let update = CoinStateUpdate::new(200, 199, peak_hash, items.clone());
+        let decoded = CoinStateUpdate::from_bytes(
+            &update.to_bytes().expect("a CoinStateUpdate is streamable"),
+        )
+        .expect("its own bytes decode");
+
+        let PoolFrame::CoinStates {
+            height: got_height,
+            fork_height: got_fork_height,
+            peak_hash: got_peak_hash,
+            items: got_items,
+        } = coin_states_frame(decoded)
+        else {
+            panic!("a CoinStateUpdate must translate to a CoinStates frame");
+        };
+
+        assert_eq!(got_height, 200, "the peak height must be the update's own");
+        assert_eq!(
+            got_fork_height, 199,
+            "fork_height is the reorg depth; crossing it with height reports a rewind that did              not happen"
+        );
+        assert_eq!(
+            got_peak_hash, peak_hash,
+            "the header hash must travel with the height it belongs to"
+        );
+        assert_eq!(
+            got_items, items,
+            "the coin states are the payload; a frame without them advances the peak and tells              subscribers nothing about their coins"
+        );
     }
 }
