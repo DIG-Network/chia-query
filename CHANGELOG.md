@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-08-22
+
+### Features
+- **peer:** Single dialler, per-session frame fan-out, NC-12 plurality sizing (#32)
+
 ## [0.12.0] - 2026-08-21
 
 ### Bug Fixes
