@@ -500,8 +500,12 @@ impl QueryRouter {
         &self,
         height: u32,
     ) -> Result<Option<BlockRecord>, ChiaQueryError> {
-        // A successful peer read is authoritative; only a peer FAILURE falls through to coinset,
-        // whose null block_record is provable absence.
+        // NOT corroborated, and deliberately narrower than the rest of this crate: a successful
+        // peer read is taken on ONE peer's word here, and only a peer FAILURE falls through to
+        // coinset, whose null block_record is provable absence. Corroboration currently covers the
+        // two absence-aware coin reads only (`read_opt_corroborated`); this endpoint, the
+        // puzzle-hash / hint / names reads and `try_get_puzzle_and_solution` are still
+        // single-peer and UNGRADED (dig_ecosystem#2761).
         if let Ok(record) = self.peer.try_get_block_record_by_height(height).await {
             return Ok(Some(record));
         }

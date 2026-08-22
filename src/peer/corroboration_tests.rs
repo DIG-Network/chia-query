@@ -142,13 +142,19 @@ async fn a_preferred_peer_agreeing_is_not_corroboration() {
     assert_eq!(asked, 1, "the preferred peer must not even be consulted");
 }
 
-/// The control: two independent peers, both absent, IS an absence.
+/// The control: a FLOOR's worth of independent peers, all absent, IS an absence.
 ///
 /// Without this the three tests above would all pass on a backend that simply never reported
 /// absence at all.
+///
+/// Three peers, not two: the answering peer cannot corroborate itself, so `CORROBORATION_FLOOR`
+/// (2) agreeing voices need two peers BESIDES it. A two-peer fixture is the at-bound-minus-one
+/// case and is covered separately by
+/// [`agreement_below_the_floor_is_not_an_absence`].
 #[tokio::test]
-async fn two_independent_peers_agreeing_is_an_absence() {
+async fn a_floor_of_independent_peers_agreeing_is_an_absence() {
     let (backend, script) = backend_over(&[
+        (Says::Absent, PeerOrigin::Discovered),
         (Says::Absent, PeerOrigin::Discovered),
         (Says::Absent, PeerOrigin::Discovered),
     ])
@@ -161,9 +167,36 @@ async fn two_independent_peers_agreeing_is_an_absence() {
         OptAnswer::CorroboratedAbsent
     );
     assert_eq!(
-        asked, 2,
-        "corroboration means a second peer was really asked"
+        asked, 3,
+        "corroboration means every corroborator was really asked"
     );
+}
+
+/// **The floor from BELOW: one agreeing voice is not an absence.**
+///
+/// The pool is ARMED — two independent peers besides the one that answered — so this cannot pass
+/// by accident on a membership check. One of them fails, leaving ONE agreeing voice, and one is
+/// exactly the effective floor this crate shipped while declaring two.
+///
+/// Paired with the at-bound test above, this pins the boundary from both sides: two agreeing
+/// voices corroborate, one does not.
+#[tokio::test]
+async fn agreement_below_the_floor_is_not_an_absence() {
+    let (backend, script) = backend_over(&[
+        (Says::Absent, PeerOrigin::Discovered),
+        (Says::Absent, PeerOrigin::Discovered),
+        (Says::Fails, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("the first peer answered, so the read did not fail"),
+        OptAnswer::UncorroboratedAbsent,
+        "one agreeing voice is a second opinion, not corroboration"
+    );
+    assert_eq!(asked, 3, "both corroborators were asked; only one answered");
 }
 
 /// A contradiction is surfaced, never resolved.
@@ -239,13 +272,14 @@ async fn one_peer_saying_present_is_not_a_corroborated_presence() {
     assert_eq!(asked, 1, "there was only one peer to ask");
 }
 
-/// The control: a second independent peer making the SAME claim corroborates it.
+/// The control: a FLOOR's worth of independent peers making the SAME claim corroborates it.
 ///
 /// Without this, every presence test here would pass on a backend that had simply stopped
 /// reporting corroborated presence at all.
 #[tokio::test]
-async fn a_second_independent_peer_agreeing_makes_the_presence_corroborated() {
+async fn a_floor_of_independent_peers_agreeing_makes_the_presence_corroborated() {
     let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
         (Says::Present, PeerOrigin::Discovered),
         (Says::Present, PeerOrigin::Discovered),
     ])
@@ -258,9 +292,33 @@ async fn a_second_independent_peer_agreeing_makes_the_presence_corroborated() {
         OptAnswer::Found("the thing")
     );
     assert_eq!(
-        asked, 2,
-        "corroboration means a second peer was really asked"
+        asked, 3,
+        "corroboration means every corroborator was really asked"
     );
+}
+
+/// **The floor from BELOW, on the presence side: one agreeing voice is not corroboration.**
+///
+/// The pool is ARMED and one corroborator fails, so exactly one voice agrees. This is the read
+/// that previously returned `Found` — the declared floor of two satisfied by one — and it is the
+/// money-lie this wiring closes: a `Found` is what a consumer records a height from.
+#[tokio::test]
+async fn agreement_below_the_floor_is_not_a_corroborated_presence() {
+    let (backend, script) = backend_over(&[
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Present, PeerOrigin::Discovered),
+        (Says::Fails, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("the first peer answered, so the read did not fail"),
+        OptAnswer::UncorroboratedFound("the thing"),
+        "one agreeing voice is a second opinion, not corroboration"
+    );
+    assert_eq!(asked, 3, "both corroborators were asked; only one answered");
 }
 
 /// Agreement is on the CLAIM, not on the fact that something came back.
@@ -373,4 +431,42 @@ async fn a_preferred_peer_agreeing_is_not_corroboration_of_presence() {
         "a preferred peer is not an independent voice, however honestly it agrees"
     );
     assert_eq!(asked, 1, "the preferred peer must not even be consulted");
+}
+
+/// **A read from the operator's own node still corroborates against the discovered set.**
+///
+/// The preferred peer is admitted FIRST, so it is the one `select_peer` asks. Two genuinely
+/// independent peers then agree with it, which is a floor's worth of corroboration by every rule
+/// this tier states — the preferred peer is not among them and never claimed to be.
+///
+/// This fixture returned `UncorroboratedAbsent` before the fix, because readiness subtracted the
+/// asker's slot from the independent set without knowing the asker was not in it. That is not a
+/// harmless conservatism: an `Uncorroborated*` answer is settled by the router against the
+/// centralized coinset tier, so the effect was to route the most common configuration this pool is
+/// sized for — a host running a node, or one with `TRUSTED_FULLNODE` — away from peer plurality
+/// and on to a single HTTPS source (NC-12).
+///
+/// Deliberately the SAME peer count and the same answers as
+/// [`a_floor_of_independent_peers_agreeing_is_an_absence`]; only the first peer's origin differs,
+/// so nothing else in the fixture can explain the verdict.
+#[tokio::test]
+async fn a_preferred_peer_answering_is_still_corroborated_by_the_discovered_set() {
+    let (backend, script) = backend_over(&[
+        (Says::Absent, PeerOrigin::Priority),
+        (Says::Absent, PeerOrigin::Discovered),
+        (Says::Absent, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("no read failed"),
+        OptAnswer::CorroboratedAbsent,
+        "two independent peers agreeing is corroboration whoever was asked first"
+    );
+    assert_eq!(
+        asked, 3,
+        "the preferred peer answered and both independent peers were really asked"
+    );
 }

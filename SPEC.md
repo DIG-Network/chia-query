@@ -43,10 +43,10 @@ The crate exposes a single `ChiaQuery` struct. All methods are async and return 
 ```rust
 use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 
-// Default config: mainnet, 5 peers, coinset.org fallback enabled
+// Default config: mainnet, 8 peers, coinset.org fallback enabled
 let client = ChiaQuery::new(ChiaQueryConfig {
     network: NetworkType::Mainnet,
-    max_peers: 5,
+    max_peers: 8,
     coinset_base_url: "https://api.coinset.org".to_string(),
     coinset_fallback_enabled: true,
     tls_identity: TlsIdentity::Generated,
@@ -215,7 +215,7 @@ server-internal detail (stack frames) and is deliberately ignored.
 
 ### PeerPool
 
-Maintains a pool of exactly 5 (configurable) active peer connections.
+Maintains a pool of 8 (configurable) active peer connections. Eight is DERIVED, not chosen: see [Pool sizing](#pool-sizing).
 
 #### State
 
@@ -231,7 +231,7 @@ struct PeerEntry {
     peer: Peer,
     address: SocketAddr,
     origin: PeerOrigin,
-    connected_at: Instant,
+    admitted_at: Instant,
 }
 ```
 
@@ -277,6 +277,82 @@ peers. A caller deciding whether enough separate sources AGREE about the chain M
 authority, and a co-resident node is a source a local attacker can supply. A caller reporting how
 many peers a machine holds MUST use `peer_count()`.
 
+#### Pool sizing
+
+`max_peers` defaults to **8**. Every term is a slot that is occupied and is NOT an independent
+corroborating voice:
+
+| Term | Why it is not a voice |
+|---|---|
+| `PRIORITY_SLOTS` = 2 | the dialler tries `TRUSTED_FULLNODE` AND the loopback ahead of discovery, at two distinct socket addresses, so a host running both fills two slots with peers that are not independent voices |
+| 1 followed session | a subscriber follows one session's frames; the peer it reads from cannot corroborate itself |
+| `QUORUM_SAMPLE` = 4 | the sample an agreement ratio is expressed against |
+| 1 of slack | cycling removes a peer before its replacement connects, so one slot is transiently vacant |
+
+`default_max_peers()` is therefore `PRIORITY_SLOTS + 1 + QUORUM_SAMPLE + 1` = 8. A default
+of 5 leaves three usable corroborators in the ordinary case, and a default of 7 leaves three
+mid-rotation on a host running both priority addresses — both below `QUORUM_SAMPLE`.
+
+#### Corroboration arming: refuse, never degrade
+
+`corroboration_readiness(asked)` reports `Armed` only when at least `CORROBORATION_FLOOR` (2)
+`Discovered` peers at addresses OTHER than `asked` are held. Below that it MUST report
+`Insufficient`.
+
+It MUST be computed by the same predicate that selects corroborators, never as
+`independent_peer_count() - 1`. A blind subtraction charges the answering peer against the
+independent set even when it was never in it — a `Priority` peer, an operator's own node or one on
+this machine — so a pool holding a full floor of independent voices reports one short and the
+answer is downgraded to `Uncorroborated*`. On a host running a full node that is the ordinary case,
+not an edge one.
+
+Both corroborating reads consult it BEFORE asking anyone, and both grade the answers against the
+same floor afterwards:
+
+| stage | rule |
+|---|---|
+| before asking | `Insufficient` MUST yield `UncorroboratedFound` / `UncorroboratedAbsent`; no corroboration is attempted |
+| after asking | fewer than `CORROBORATION_FLOOR` AGREEING answers MUST yield `UncorroboratedFound` / `UncorroboratedAbsent` |
+| any answer | one contradicting answer MUST fail the read with `SourcesDisagree`, whatever the agreement count |
+
+Both stages are required and neither substitutes for the other: the first refuses a read the pool
+cannot support, the second catches a pool that held enough voices and then could not get answers
+from them.
+
+Reporting an answer as corroborated on fewer voices is FORBIDDEN. Corroborating against whoever
+happens to be present converts a four-voice quorum into a one-voice one that still reports itself
+corroborated, and no consumer downstream can distinguish the two. An `Uncorroborated*` answer is
+not a failure — it is the undecided fact handed up for another tier to settle.
+
+#### Cycling: peers are rotated on AGE
+
+`cycle_expired_peers()` removes the OLDEST `Discovered` entry whose `admitted_at` is at least
+`PEER_LIFETIME` (300s) old, one per call, and `maintain()` then refills. This is NC-12's cycling
+half: a fixed set is a set an attacker only has to capture once, and a captured peer does not fail,
+so failure-driven ejection cannot substitute for it. `Priority` entries are NOT rotated — re-dialling
+the same operator address spends a handshake to change nothing.
+
+#### Frame fan-out
+
+A pooled session's inbound frames are fanned out to subscribers over BOUNDED per-subscriber
+channels (`subscribe_frames(capacity)`). Every delivered frame is a `SourcedFrame`: a `PoolFrame`
+paired with the `FrameSource` that produced it — the peer `SocketAddr` this process DIALLED,
+together with a `SessionId`.
+
+- `SessionId` is drawn from a monotonic counter at the moment the pool allocates a session. It is
+  never reused, never derived from anything a peer sends, and a reconnect to the same address
+  receives a NEW one, so a peer cannot inherit the identity of a session it did not open.
+- A session MUST be announced by `PoolFrame::Reset` before its first frame and closed by
+  `PoolFrame::SessionEnded` after its last. `Reset` carries no generation of its own; the session
+  it announces is named by the `FrameSource` on the frame.
+- **A subscriber receives the frames of EVERY held session, not only the one it follows.** `Reset`
+  in particular is published to all subscribers, so a subscriber that tracks one peer MUST filter
+  on `FrameSource` — matching both address and `SessionId` — before acting on a frame. A subscriber
+  that clears its state on any `Reset` will discard it when an unrelated peer reconnects.
+- A subscriber whose channel is FULL MUST have its subscription TERMINATED. Dropping a frame and
+  continuing is FORBIDDEN: a missed `CoinStateUpdate` is a spend the consumer never learns about, so
+  a replica goes on reporting itself synced while reading spent money as present.
+
 #### DNS Introducers
 
 Mainnet:
@@ -295,10 +371,17 @@ Default port: `58444`
 #### Connection Logic (from DataLayer-Driver)
 
 1. Resolve all introducer DNS names to socket addresses
-2. Shuffle the resolved addresses for randomness
-3. Attempt connections in batches of 10, with 8-second timeout per attempt
-4. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
-5. Return the first successful connection
+2. Reduce to DISTINCT addresses. Deduplication MUST NOT rely on `Vec::dedup` after a shuffle:
+   `dedup` collapses only adjacent duplicates, so a shuffle immediately before it makes it near
+   vacuous and a repeated introducer result can occupy two dial slots
+3. Shuffle the distinct addresses for randomness
+4. Order the shuffled set IPv6-first (CLAUDE.md §5.2). The ordering is STABLE, so the shuffle
+   survives within each class. Locality MUST NOT reorder the discovered set: a local address
+   reached through DISCOVERY is refused outright by invariant 5f, and a co-resident node is reached
+   only by the priority path, where it is recorded as `Priority` and is not an independent voice
+5. Attempt connections in batches of 10, with 8-second timeout per attempt
+6. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
+7. Return the first successful connection
 
 If NO peer connects, construction fails with `PeerDiscoveryFailed` ONLY when
 `coinset_fallback_enabled` is `false`. With the fallback enabled the client MUST construct with an
@@ -425,7 +508,7 @@ chia-query/
 │   │   ├── response.rs         # Response structs (CoinRecord, BlockRecord, etc.)
 │   │   └── error.rs            # ChiaQueryError enum
 │   ├── router.rs               # (native) QueryRouter: peer-first dispatch + coinset fallback
-│   ├── peer/                   # (native) PeerBackend, pool, connect, translate
+│   ├── peer/                   # (native) PeerBackend, pool, connect, ordering, frames, plurality, translate
 │   └── coinset/
 │       ├── mod.rs              # CoinsetClient<T>: transport-generic REST wrapper
 │       └── transport.rs        # HttpTransport trait: ReqwestTransport / FetchTransport
@@ -471,7 +554,12 @@ struct ChiaQueryConfig {
 2. **Single retry on peer failure**: If a peer request fails, eject that peer, try one more peer. If that also fails, fall back to coinset.org
 3. **Immediate ejection**: Any peer that fails a request or whose connection drops is removed from the pool immediately
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
-5. **Pool size invariant**: The pool always targets `max_peers` connections. If below target, background tasks work to replenish
+5. **Pool size invariant**: The pool always targets `max_peers` connections. The `PeerBackend::read` path maintains the pool on every request, refilling it if below target
+5b. **Cycling invariant**: A `Discovered` peer held for `PEER_LIFETIME` or longer MUST be rotated out on AGE, independently of whether any request to it has failed
+5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
+5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
+5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
+5f. **Local-discovery invariant**: An address reached through DNS discovery MUST be refused if it is loopback, private, link-local or unspecified in either family. Only the priority path may reach a host-local node, and what it reaches is recorded as `Priority`
 5a. **Distinct-address invariant**: At most one connection per `SocketAddr` is held, decided under the write lock — see [Distinct admission](#distinct-admission). `max_peers` connections therefore mean `max_peers` distinct addresses, which is what makes the count meaningful as a measure of redundancy
 6. **Coinset-only endpoints**: Endpoints with no peer protocol equivalent (mempool queries, block count metrics, block spends with conditions, unfinished block headers) always go directly to `CoinsetBackend`. If coinset fallback is disabled, these return `ChiaQueryError::UnsupportedWithoutCoinset`
 7. **Thread safety**: `ChiaQuery` is `Send + Sync` -- all internal state is behind `Arc<Mutex<_>>` or `Arc<RwLock<_>>` as appropriate

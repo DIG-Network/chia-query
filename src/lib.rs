@@ -100,6 +100,12 @@ mod native_client {
 
     pub struct ChiaQueryConfig {
         pub network: NetworkType,
+        /// How many peer sessions the pool holds.
+        ///
+        /// Defaults to [`peer::plurality::default_max_peers`], which is DERIVED from the sample a
+        /// corroborated read needs to leave standing rather than picked. Lowering it below that
+        /// does not make corroboration weaker quietly — the pool refuses rather than degrading —
+        /// but it does make it unavailable.
         pub max_peers: usize,
         pub coinset_base_url: String,
         pub coinset_fallback_enabled: bool,
@@ -113,7 +119,7 @@ mod native_client {
         fn default() -> Self {
             Self {
                 network: NetworkType::Mainnet,
-                max_peers: 5,
+                max_peers: peer::plurality::default_max_peers(),
                 coinset_base_url: "https://api.coinset.org".into(),
                 coinset_fallback_enabled: true,
                 tls_identity: TlsIdentity::Generated,

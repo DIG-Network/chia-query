@@ -1,5 +1,8 @@
 pub mod block;
 pub mod connect;
+pub mod frames;
+pub mod ordering;
+pub mod plurality;
 pub mod pool;
 pub mod translate;
 
@@ -25,8 +28,9 @@ use tokio_tungstenite::Connector;
 use crate::types::*;
 
 use crate::NetworkType;
-use pool::PeerPool;
+use plurality::CORROBORATION_FLOOR;
 pub use pool::PeerRequirement;
+use pool::{CorroborationReadiness, PeerPool};
 
 // ---------------------------------------------------------------------------
 // OptAnswer
@@ -63,6 +67,32 @@ pub enum OptAnswer<T> {
     /// sources the peer tier does not own, so it hands the undecided fact up rather than deciding
     /// it (see [`QueryRouter`](crate::router::QueryRouter), which may corroborate against coinset).
     UncorroboratedAbsent,
+}
+
+/// Whether a round of `agreed` agreeing answers, taken from a pool in state `readiness`, may be
+/// reported as CORROBORATED.
+///
+/// Both halves are required and neither implies the other:
+///
+/// - **The pool must have been [`Armed`](CorroborationReadiness::Armed)** — it held at least
+///   [`CORROBORATION_FLOOR`] independent peers besides the one that answered. This is a fact about
+///   the pool's membership, checked before the round, so an answer can never be reported as
+///   corroborated by a pool that never had the voices to corroborate it.
+/// - **At least [`CORROBORATION_FLOOR`] peers must have AGREED** — a fact about the round itself.
+///   A pool that held enough peers and then had them time out has corroborated nothing, and
+///   membership alone cannot see that.
+///
+/// The membership half is not implied by the agreement half even though readiness now counts
+/// exactly the peers that will be asked. Readiness is a SNAPSHOT taken before the round, but on a
+/// shared [`QueryRouter`] multiple concurrent callers may each call [`PeerPool::maintain`] during
+/// the same question, so a round can be answered by more peers than the readiness snapshot held.
+/// Requiring the pool to have been armed BEFORE the round is what stops a pool that could not have
+/// corroborated anything from being rescued by a peer that arrived mid-question.
+///
+/// The floor is on agreement, never on peers asked: reading "I asked and heard no contradiction"
+/// as agreement is how silence becomes a second opinion.
+fn corroborated(readiness: CorroborationReadiness, agreed: usize) -> bool {
+    matches!(readiness, CorroborationReadiness::Armed { .. }) && agreed >= CORROBORATION_FLOOR
 }
 
 // ---------------------------------------------------------------------------
@@ -138,13 +168,32 @@ impl PeerBackend {
         self.pool.independent_peer_count().await
     }
 
+    /// Whether a corroborated read of an answer given by `asked` may be attempted at all — see
+    /// [`PeerPool::corroboration_readiness`]. It REFUSES rather than degrading.
+    pub async fn corroboration_readiness(&self, asked: SocketAddr) -> pool::CorroborationReadiness {
+        self.pool.corroboration_readiness(asked).await
+    }
+
+    /// Subscribe to the frames arriving on this backend's pooled sessions.
+    ///
+    /// Falling further behind than `capacity` ENDS the subscription rather than skipping a frame —
+    /// see [`frames::FrameSubscription`].
+    pub async fn subscribe_frames(&self, capacity: usize) -> frames::FrameSubscription {
+        self.pool.subscribe_frames(capacity).await
+    }
+
     // -----------------------------------------------------------------------
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------
 
     async fn pick(&self) -> Result<(Peer, SocketAddr), ChiaQueryError> {
-        // Attempt a background refill if under capacity.
-        self.pool.try_refill().await;
+        // One maintenance pass per request: rotate out a peer that has outlived
+        // [`plurality::PEER_LIFETIME`], then refill if under capacity.
+        //
+        // Driving cycling from the request path rather than a timer task is deliberate — it is the
+        // only place the pool is reliably reached, and a cycling policy that nothing calls is
+        // indistinguishable from no cycling at all (NC-12).
+        self.pool.maintain().await;
 
         self.pool
             .select_peer()
@@ -190,18 +239,27 @@ impl PeerBackend {
     ///
     /// `read` is run against one selected peer, and that peer's answer is then put to independent
     /// peers — peers at DIFFERENT addresses that were
-    /// [discovered](pool::PeerPool::select_corroborating_peer) rather than preferred. Neither
+    /// [discovered](pool::PeerPool::select_corroborating_peers) rather than preferred. Neither
     /// direction is taken on one peer's word:
     ///
+    /// Both directions are graded against [`CORROBORATION_FLOOR`], and a contradiction outranks
+    /// any amount of agreement:
+    ///
     /// - **Present** — the record's chain claim (see [`ChainClaim`]) is put to every independent
-    ///   peer at once. One that agrees makes it [`Found`](OptAnswer::Found); one that says
-    ///   anything else — a different height, or nothing at all — fails the read with
-    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); nobody able to answer leaves it
-    ///   [`UncorroboratedFound`](OptAnswer::UncorroboratedFound).
-    /// - **Absent** — one further independent peer is asked the same question. Both absent is
-    ///   [`CorroboratedAbsent`](OptAnswer::CorroboratedAbsent); a peer that produces the thing is
-    ///   [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); nobody to ask is
-    ///   [`UncorroboratedAbsent`](OptAnswer::UncorroboratedAbsent).
+    ///   peer at once. [`CORROBORATION_FLOOR`] peers agreeing makes it
+    ///   [`Found`](OptAnswer::Found); one that says anything else — a different height, or nothing
+    ///   at all — fails the read with [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); too few
+    ///   agreeing voices leaves it [`UncorroboratedFound`](OptAnswer::UncorroboratedFound).
+    /// - **Absent** — every independent peer is asked the same question. [`CORROBORATION_FLOOR`]
+    ///   agreeing absences make it [`CorroboratedAbsent`](OptAnswer::CorroboratedAbsent); a peer
+    ///   that produces the thing is [`SourcesDisagree`](ChiaQueryError::SourcesDisagree); too few
+    ///   agreeing voices leaves it [`UncorroboratedAbsent`](OptAnswer::UncorroboratedAbsent).
+    ///
+    /// **One agreeing peer is not corroboration.** An `Uncorroborated*` answer is not a failure —
+    /// it is the honest report that the peer tier could not establish the fact, and the router
+    /// settles it against another tier or surfaces it as
+    /// [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence). What it must never do
+    /// is report a one-voice answer as corroborated.
     ///
     /// **Why presence asks everyone and absence asks one.** A hostile peer that answers an absence
     /// wrongly is refuted by any honest peer, so a single corroborator is a sufficient confidence
@@ -251,6 +309,12 @@ impl PeerBackend {
         F: Fn(Peer) -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     {
+        // Read the pool's arming BEFORE the round, and treat it as a ceiling on the verdict
+        // rather than a gate on asking. Asking cannot make an answer worse — a contradiction is
+        // decisive however few peers are held — but reporting corroboration from a pool that never
+        // held enough independent voices is exactly the degradation the floor exists to prevent.
+        let readiness = self.pool.corroboration_readiness(addr).await;
+
         let corroborators = self.pool.select_corroborating_peers(addr).await;
         if corroborators.is_empty() {
             log::debug!("presence reported by {addr} has no independent corroborator available");
@@ -308,14 +372,21 @@ impl PeerBackend {
             return Err(ChiaQueryError::SourcesDisagree(detail));
         }
 
-        if agreed == 0 {
-            log::debug!("presence reported by {addr} was corroborated by nobody who could answer");
+        if !corroborated(readiness, agreed) {
+            log::debug!(
+                "presence reported by {addr} drew {agreed} agreeing voices with the pool \
+                 {readiness:?}; below the floor of {CORROBORATION_FLOOR}"
+            );
             return Ok(OptAnswer::UncorroboratedFound(found));
         }
         Ok(OptAnswer::Found(found))
     }
 
-    /// Put an absence to ONE further independent peer, and grade the agreement.
+    /// Put an absence to EVERY independent peer at once, and grade the agreement.
+    ///
+    /// Asking all of them together, rather than one at a time, is the same requirement presence
+    /// has: a single corroborator lets whichever peer is asked settle a claim about the chain, and
+    /// which peer that is, is not a property the reader controls.
     async fn corroborate_absence<T, F, Fut>(
         &self,
         addr: SocketAddr,
@@ -326,26 +397,58 @@ impl PeerBackend {
         F: Fn(Peer) -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     {
-        let Some((other, other_addr)) = self.pool.select_corroborating_peer(addr).await else {
+        let readiness = self.pool.corroboration_readiness(addr).await;
+
+        let corroborators = self.pool.select_corroborating_peers(addr).await;
+        if corroborators.is_empty() {
             log::debug!("absence reported by {addr} has no independent corroborator available");
             return Ok(OptAnswer::UncorroboratedAbsent);
-        };
+        }
 
-        match read(other).await {
-            Ok(None) => Ok(OptAnswer::CorroboratedAbsent),
-            Ok(Some(_)) => Err(ChiaQueryError::SourcesDisagree(format!(
-                "peer {addr} reports absent, peer {other_addr} reports present"
-            ))),
-            Err(e) => {
-                // The corroborator could not answer, so nothing was corroborated. Eject it — a
-                // peer that fails a read is ejected everywhere else in this backend — and report
-                // the absence as the undecided fact it still is, rather than letting a failed
-                // second opinion read as a confirmed first one.
-                self.pool.eject_peer(other_addr).await;
-                log::debug!("corroborator {other_addr} failed: {e}");
-                Ok(OptAnswer::UncorroboratedAbsent)
+        let answers =
+            futures_util::future::join_all(corroborators.into_iter().map(|(peer, peer_addr)| {
+                let answer = read(peer);
+                async move { (peer_addr, answer.await) }
+            }))
+            .await;
+
+        let mut agreed = 0usize;
+        let mut disagreement: Option<String> = None;
+        let mut failed: Vec<SocketAddr> = Vec::new();
+
+        for (peer_addr, answer) in answers {
+            match answer {
+                Ok(None) => agreed += 1,
+                Ok(Some(_)) => {
+                    disagreement.get_or_insert_with(|| {
+                        format!("peer {addr} reports absent, peer {peer_addr} reports present")
+                    });
+                }
+                Err(e) => {
+                    log::debug!("corroborator {peer_addr} failed: {e}");
+                    failed.push(peer_addr);
+                }
             }
         }
+
+        // A peer that fails a read is ejected everywhere else in this backend, whatever the
+        // verdict turns out to be.
+        for peer_addr in failed {
+            self.pool.eject_peer(peer_addr).await;
+        }
+
+        if let Some(detail) = disagreement {
+            return Err(ChiaQueryError::SourcesDisagree(detail));
+        }
+
+        if !corroborated(readiness, agreed) {
+            log::debug!(
+                "absence reported by {addr} drew {agreed} agreeing voices with the pool \
+                 {readiness:?}; below the floor of {CORROBORATION_FLOOR}"
+            );
+            return Ok(OptAnswer::UncorroboratedAbsent);
+        }
+        Ok(OptAnswer::CorroboratedAbsent)
     }
 
     /// Absence-aware read of the spend that spent `coin_id`.
@@ -1141,4 +1244,50 @@ fn to_protocol_spend_bundle(bundle: &SpendBundle) -> Result<ProtoBundle, ChiaQue
         coin_spends,
         aggregated_signature,
     })
+}
+
+#[cfg(test)]
+mod grading_tests {
+    use super::*;
+
+    /// **A round that agrees cannot rescue a pool that was never armed.**
+    ///
+    /// This is the state the two conjuncts of [`corroborated`] exist to separate, and it is
+    /// reachable in production for one reason: readiness is a snapshot taken BEFORE the round,
+    /// while background refills can add peers during it — so more peers can agree than were held
+    /// when the question was asked.
+    ///
+    /// No pool-level fixture can reach it, because a pool asks exactly the peers it counted. So it
+    /// is asserted here, on the grading function itself. Without it, deleting the membership
+    /// conjunct from [`corroborated`] leaves the whole suite green.
+    #[test]
+    fn agreement_alone_does_not_corroborate_when_the_pool_was_not_armed() {
+        let unarmed = CorroborationReadiness::Insufficient {
+            corroborators: 1,
+            required: CORROBORATION_FLOOR,
+        };
+
+        assert!(
+            !corroborated(unarmed, CORROBORATION_FLOOR),
+            "a pool that held too few independent peers has corroborated nothing, however many \
+             voices answered"
+        );
+    }
+
+    /// The control from the other side: armed AND agreed is the only state that corroborates.
+    ///
+    /// Paired with the test above, this pins both conjuncts — a `corroborated` that always
+    /// returned `false` would satisfy that one on its own.
+    #[test]
+    fn an_armed_pool_with_a_floor_of_agreement_corroborates() {
+        let armed = CorroborationReadiness::Armed {
+            corroborators: CORROBORATION_FLOOR,
+        };
+
+        assert!(corroborated(armed, CORROBORATION_FLOOR));
+        assert!(
+            !corroborated(armed, CORROBORATION_FLOOR - 1),
+            "an armed pool whose corroborators timed out has corroborated nothing"
+        );
+    }
 }
