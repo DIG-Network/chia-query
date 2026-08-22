@@ -141,13 +141,32 @@ impl PeerBackend {
         self.pool.independent_peer_count().await
     }
 
+    /// Whether a corroborated read may be attempted at all — see
+    /// [`PeerPool::corroboration_readiness`]. It REFUSES rather than degrading.
+    pub async fn corroboration_readiness(&self) -> pool::CorroborationReadiness {
+        self.pool.corroboration_readiness().await
+    }
+
+    /// Subscribe to the frames arriving on this backend's pooled sessions.
+    ///
+    /// Falling further behind than `capacity` ENDS the subscription rather than skipping a frame —
+    /// see [`frames::FrameSubscription`].
+    pub async fn subscribe_frames(&self, capacity: usize) -> frames::FrameSubscription {
+        self.pool.subscribe_frames(capacity).await
+    }
+
     // -----------------------------------------------------------------------
     // Select a peer (round-robin) then attempt to refill if pool is short.
     // -----------------------------------------------------------------------
 
     async fn pick(&self) -> Result<(Peer, SocketAddr), ChiaQueryError> {
-        // Attempt a background refill if under capacity.
-        self.pool.try_refill().await;
+        // One maintenance pass per request: rotate out a peer that has outlived
+        // [`plurality::PEER_LIFETIME`], then refill if under capacity.
+        //
+        // Driving cycling from the request path rather than a timer task is deliberate — it is the
+        // only place the pool is reliably reached, and a cycling policy that nothing calls is
+        // indistinguishable from no cycling at all (NC-12).
+        self.pool.maintain().await;
 
         self.pool
             .select_peer()
