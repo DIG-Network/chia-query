@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
