@@ -1614,16 +1614,10 @@ mod tests {
         // If you are reading this because someone used `..` or field-access form instead:
         // that change removed the ONLY compile-time guard against dropping upstream fields.
         // Revert to the destructuring form.
-        
+
         // The test itself simply affirms the fields exist and are the ones we expect:
         // height, fork_height, peak_hash, items. No constructed CoinStateUpdate here,
         // because constructing one is not part of the test � the compile-time check is.
-        assert_eq!(
-            std::mem::size_of::<u32>(),
-            4,
-            "height is u32"
-        );
+        assert_eq!(std::mem::size_of::<u32>(), 4, "height is u32");
     }
-
-
 }
