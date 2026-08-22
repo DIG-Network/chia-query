@@ -254,6 +254,27 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
+    /// How the pool reached the peer currently held at `address`, or `None` if it holds none.
+    ///
+    /// Exists so a consumer that PINS one session can describe it honestly. A
+    /// [`Priority`](connect::PeerOrigin::Priority) peer is an operator's own or co-resident node
+    /// and a [`Discovered`](connect::PeerOrigin::Discovered) one is an anonymous introducer result;
+    /// a component that reports a trust level for its answers must be able to tell which it is
+    /// talking to, rather than repeating what its own configuration claimed.
+    ///
+    /// This does NOT confer independence. Counting independent voices stays with
+    /// [`independent_peer_count`](Self::independent_peer_count) and
+    /// [`select_corroborating_peers`](Self::select_corroborating_peers), both of which already
+    /// exclude `Priority` peers, and reading a single origin is not a substitute for either.
+    pub async fn origin_of(&self, address: SocketAddr) -> Option<connect::PeerOrigin> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| e.origin)
+    }
+
     /// Every peer that could CORROBORATE an answer already given by the peer at `asked`.
     ///
     /// A corroborating peer must be two things at once, and neither alone is enough:
@@ -604,6 +625,7 @@ impl PeerPool {
                                 PoolFrame::CoinStates {
                                     height: update.height,
                                     fork_height: update.fork_height,
+                                    peak_hash: update.peak_hash,
                                     items: update.items,
                                 },
                             )

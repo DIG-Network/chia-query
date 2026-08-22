@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -35,6 +35,7 @@ native = [
     "dep:reqwest",
     "dep:rand",
     "dep:futures-util",
+    "dep:async-trait",
 ]
 # `coinset` is the wasm-safe core: the coinset.org REST tier only, with its
 # HTTP riding an injected `fetch` transport. Build it wasm-clean with
@@ -87,6 +88,10 @@ tokio-tungstenite = { version = "0.24", optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 rand = { version = "0.8", optional = true }
 futures-util = { version = "0.3", optional = true }
+# The light client's `CoinStateFetcher` seam is an ASYNC trait consumed as `dyn`, which native
+# `async fn` in traits cannot be (no vtable). The seam exists so the provider's fail-closed mapping
+# is testable against an in-memory double instead of a live full node, so erasing it is the point.
+async-trait = { version = "0.1", optional = true }
 
 # --- wasm-only (the injected-fetch coinset transport + bindings) ---
 wasm-bindgen = { version = "0.2", optional = true }

@@ -119,7 +119,7 @@ use std::time::Duration;
 /// future by the caller — so this only has to exist, not work.
 fn router(coinset_fallback_enabled: bool) -> QueryRouter {
     QueryRouter {
-        peer: PeerBackend::for_tests(),
+        peer: std::sync::Arc::new(PeerBackend::for_tests()),
         coinset: CoinsetClient::new("http://127.0.0.1:1", Duration::from_millis(1))
             .expect("build a client that is never called"),
         coinset_fallback_enabled,

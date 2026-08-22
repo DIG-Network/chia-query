@@ -1,0 +1,391 @@
+//! [`ChiaLightClient`] — a subscribing Chia wallet-protocol light client that BORROWS the crate's
+//! peer pool instead of dialling a connection of its own.
+//!
+//! # What moved here, and why
+//!
+//! This is `chia-peer`'s light client, folded into chia-query (dig_ecosystem#2761). `chia-peer`
+//! held its own TLS connection, its own DNS-introducer discovery, its own IPv6-first candidate
+//! ordering and its own reconnect loop — a second, independently-maintained copy of everything
+//! [`crate::peer::connect`] and [`crate::peer::pool`] already do. A node running both therefore
+//! held two connections to two independently-chosen full nodes, with two notions of the peak and
+//! nothing able to reconcile them.
+//!
+//! One crate cannot disagree with itself. That is the whole reason this is a MERGE rather than a
+//! relocation: `dig-node-core` pinned `chia-query = "=0.5.1"` — an exact-equals pin on a
+//! foundation crate — solely so two sibling crates would agree about a third crate's minor. There
+//! is now nothing left to disagree.
+//!
+//! # The subscription follows ONE session, and says which
+//!
+//! A subscription is server-side state on one connection, so this client PINS a pooled session as
+//! its anchor (see [`fetcher`]) and its drive-loop accepts frames from that source ALONE. The pool
+//! fans every held peer's frames into one subscription, and a `CoinStateUpdate` is an unsolicited
+//! push carrying no request id: accepting one from an unfollowed peer would let any held peer
+//! inject coin states this client never asked for, indistinguishable from the ones it did.
+//!
+//! # NC-12 is untouched
+//!
+//! Corroboration remains [`PeerPool`](crate::peer::pool::PeerPool)'s: plurality sizing, the
+//! `Discovered`-only independent count, [`CorroborationReadiness`], and periodic peer cycling all
+//! continue to run over the same pool this client borrows from. Folding a subscriber in adds a
+//! borrower; it removes no voices. Nothing here sets a `trusted` flag on a dialled peer — the pool
+//! dials with `PeerOptions::default()` and this module does not touch that.
+
+pub mod cache;
+pub mod error;
+pub mod fetcher;
+pub mod provider;
+
+use std::borrow::Cow;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use chia_protocol::{Bytes32, CoinStateFilters, SpendBundle};
+use dig_chainsource_interface::{ProviderId, ProviderInfo, ProviderKind};
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
+
+use crate::peer::connect::PeerOrigin;
+use crate::peer::frames::{FrameSource, FrameSubscription, PoolFrame, SourcedFrame};
+use crate::peer::PeerBackend;
+
+use cache::CoinStateCache;
+use error::LightClientError;
+use fetcher::{CoinStateFetcher, PooledFetcher};
+
+pub use provider::LightClientProvider;
+
+/// The default try-order priority a light-client provider registers with (lower = tried earlier).
+///
+/// 20 places it ahead of the coinset.org HTTP tier, which is the ordering `chia-peer` established
+/// and dig-node depends on: a subscribing session sees a spend land before an HTTP index does.
+pub const DEFAULT_PROVIDER_PRIORITY: i32 = 20;
+
+/// How many frames a light client may fall behind before its subscription is terminated.
+///
+/// Terminating is the intended outcome of overflow, not a failure of it — a SKIPPED
+/// `CoinStateUpdate` is a spend the cache never learns about, after which every read reports spent
+/// money as present. Sized to absorb a burst of per-block pushes across a full pool while staying
+/// far below anything that would make a slow consumer's backlog a memory problem.
+const FRAME_BUFFER: usize = 1024;
+
+/// The outcome of submitting a spend bundle, mapped from the node's `TransactionAck` status byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Accepted into the mempool (ack status `1`) — pending block confirmation.
+    Accepted,
+    /// Held pending by the node (ack status `2`).
+    Pending,
+    /// Rejected by the node (ack status `3`).
+    Failed,
+    /// An unrecognised ack status byte.
+    Unknown(u8),
+}
+
+impl SubmitOutcome {
+    fn from_status(status: u8) -> Self {
+        match status {
+            1 => SubmitOutcome::Accepted,
+            2 => SubmitOutcome::Pending,
+            3 => SubmitOutcome::Failed,
+            other => SubmitOutcome::Unknown(other),
+        }
+    }
+
+    /// Whether the node took custody of the bundle (accepted or pending), rather than rejecting it.
+    pub fn is_accepted(self) -> bool {
+        matches!(self, SubmitOutcome::Accepted | SubmitOutcome::Pending)
+    }
+}
+
+/// A subscribing Chia wallet-protocol light client over a shared [`PeerBackend`].
+pub struct ChiaLightClient {
+    fetcher: PooledFetcher,
+    cache: Arc<RwLock<CoinStateCache>>,
+    /// Set by the drive-loop when the anchor session ends, so a caller can tell a quiet chain from
+    /// a stream that stopped. Cleared by [`reconnect`](Self::reconnect).
+    ///
+    /// Signalled rather than acted on: re-arming needs the caller's runtime and its error handling,
+    /// and a drive-loop that re-subscribed itself would retry forever against a peer set it cannot
+    /// see, with nothing able to observe that it was failing.
+    rearm_needed: Arc<AtomicBool>,
+    drive: Option<JoinHandle<()>>,
+}
+
+impl ChiaLightClient {
+    /// Builds a light client over `backend`'s pool and starts the drive-loop that keeps its
+    /// subscription cache current.
+    ///
+    /// No connection is made here: the pool is already holding sessions, and this client pins one
+    /// of them the first time it subscribes.
+    pub async fn new(backend: Arc<PeerBackend>, request_timeout: Duration) -> Self {
+        let cache = Arc::new(RwLock::new(CoinStateCache::new()));
+        let fetcher = PooledFetcher::new(backend.clone(), request_timeout);
+        let rearm_needed = Arc::new(AtomicBool::new(false));
+        let subscription = backend.subscribe_frames(FRAME_BUFFER).await;
+        let drive = spawn_drive_loop(
+            subscription,
+            cache.clone(),
+            fetcher.clone(),
+            rearm_needed.clone(),
+        );
+        Self {
+            fetcher,
+            cache,
+            rearm_needed,
+            drive: Some(drive),
+        }
+    }
+
+    /// Subscribes to `coin_ids` on the anchor session and seeds the cache with their current state.
+    ///
+    /// Wraps `request_coin_state(subscribe = true)`; future changes stream back via the drive-loop.
+    pub async fn subscribe_coins(&self, coin_ids: Vec<Bytes32>) -> Result<(), LightClientError> {
+        let states = self.fetcher.coin_states(coin_ids.clone(), true).await?;
+        let mut cache = self.cache.write().await;
+        cache.track_coins(coin_ids);
+        cache.seed(states);
+        Ok(())
+    }
+
+    /// Subscribes to every coin paying to `puzzle_hashes` under `filters`, seeding the cache.
+    ///
+    /// Wraps `request_puzzle_state(subscribe = true)` (paging until finished).
+    pub async fn subscribe_puzzle_hashes(
+        &self,
+        puzzle_hashes: Vec<Bytes32>,
+        filters: CoinStateFilters,
+    ) -> Result<(), LightClientError> {
+        let states = self
+            .fetcher
+            .puzzle_states(puzzle_hashes.clone(), filters, true)
+            .await?;
+        let mut cache = self.cache.write().await;
+        cache.track_puzzle_hashes(puzzle_hashes);
+        cache.seed(states);
+        Ok(())
+    }
+
+    /// Submits `bundle` to the network, mapping the node's ack to a typed [`SubmitOutcome`].
+    ///
+    /// This is a WRITE path and is deliberately NOT part of the reads-only `ChainSource` surface.
+    pub async fn submit_spend(
+        &self,
+        bundle: SpendBundle,
+    ) -> Result<SubmitOutcome, LightClientError> {
+        let status = self.fetcher.send_transaction(bundle).await?;
+        Ok(SubmitOutcome::from_status(status))
+    }
+
+    /// The current peak `(height, header_hash)` as observed on the followed session, if known.
+    ///
+    /// Deliberately the FOLLOWED peer's peak and not
+    /// [`PeerPool::peak_height`](crate::peer::pool::PeerPool::peak_height), which is the highest
+    /// any held peer has claimed. The cache's coin states come from one session, and the
+    /// no-coin-above-the-peak invariant that keeps a confirmation count from underflowing is only
+    /// meaningful if the peak came from the same session as the coins.
+    pub async fn peak(&self) -> Option<(u32, Bytes32)> {
+        self.cache.read().await.peak()
+    }
+
+    /// Removes the subscription to `coin_ids` and stops tracking them locally.
+    pub async fn unsubscribe_coins(&self, coin_ids: Vec<Bytes32>) -> Result<(), LightClientError> {
+        self.fetcher
+            .remove_coin_subscriptions(coin_ids.clone())
+            .await?;
+        self.cache.write().await.untrack_coins(&coin_ids);
+        Ok(())
+    }
+
+    /// Whether the followed session has ENDED, so the subscription set is no longer armed anywhere.
+    ///
+    /// A consumer polling this can tell a chain with nothing to say from a stream that stopped
+    /// talking — the distinction a silent light client otherwise hides.
+    pub fn needs_rearm(&self) -> bool {
+        self.rearm_needed.load(Ordering::Acquire)
+    }
+
+    /// Re-anchors on a live pooled session and re-arms the existing subscription set, so a dropped
+    /// connection recovers without the caller re-subscribing.
+    ///
+    /// Cheaper than its `chia-peer` ancestor by exactly one dial: the pool is already holding
+    /// replacement sessions, so this re-issues subscriptions rather than reconnecting.
+    pub async fn reconnect(&self) -> Result<(), LightClientError> {
+        let (coins, puzzle_hashes) = {
+            let cache = self.cache.read().await;
+            (cache.subscribed_coins(), cache.subscribed_puzzle_hashes())
+        };
+        if !coins.is_empty() {
+            self.subscribe_coins(coins).await?;
+        }
+        if !puzzle_hashes.is_empty() {
+            self.subscribe_puzzle_hashes(puzzle_hashes, all_coin_states())
+                .await?;
+        }
+        // Cleared only once every re-subscription has SUCCEEDED. Clearing first would report an
+        // armed subscription set after a rearm that failed halfway.
+        self.rearm_needed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Exposes the read side as a [`LightClientProvider`] for registration in a chain-source
+    /// registry.
+    ///
+    /// `handle` MUST belong to a multi-thread tokio runtime (the sync facade blocks on it).
+    ///
+    /// Call this AFTER subscribing. The descriptor's [`ProviderKind`] is read from the session this
+    /// client is actually anchored to, and before the first subscription there is none — so an
+    /// early call reports the conservative [`Custom`](ProviderKind::Custom) rather than guessing.
+    pub async fn as_chain_source_provider(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> LightClientProvider {
+        LightClientProvider::new(
+            Arc::new(self.fetcher.clone()),
+            self.cache.clone(),
+            handle,
+            self.provider_info().await,
+        )
+    }
+
+    /// The provider descriptor this client registers with.
+    ///
+    /// [`LocalNode`](ProviderKind::LocalNode) when the answering session was reached from a
+    /// configured or co-resident address, [`Custom`](ProviderKind::Custom) when it came from a DNS
+    /// introducer. This is what the pool OBSERVED, not what an operator declared — `chia-peer`
+    /// derived the same field from a config flag, so a discovered peer answering a
+    /// `config.endpoint` client was reported as the operator's own node.
+    ///
+    /// `trustless` is always `false`: a light-client answer is one peer's word. The registry's
+    /// custody view is operator-assigned and fails closed, and this flag is advisory there — it
+    /// never grants trust, which is why reporting the origin honestly matters more than the
+    /// priority does.
+    pub async fn provider_info(&self) -> ProviderInfo {
+        let kind = match self.fetcher.current_anchor().await.map(|a| a.origin) {
+            Some(PeerOrigin::Priority) => ProviderKind::LocalNode,
+            Some(PeerOrigin::Discovered) | None => ProviderKind::Custom,
+        };
+        ProviderInfo {
+            id: ProviderId(Cow::Borrowed("chia-query-light-client")),
+            kind,
+            priority: DEFAULT_PROVIDER_PRIORITY,
+            trustless: false,
+        }
+    }
+}
+
+impl Drop for ChiaLightClient {
+    fn drop(&mut self) {
+        if let Some(handle) = self.drive.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// The filter set a re-arm uses: everything, so a re-subscription cannot narrow what the original
+/// subscription covered.
+fn all_coin_states() -> CoinStateFilters {
+    CoinStateFilters {
+        include_spent: true,
+        include_unspent: true,
+        include_hinted: true,
+        min_amount: 0,
+    }
+}
+
+/// Spawns the background task that keeps `cache` current from the pool's frame fan-out.
+///
+/// Only frames from the ANCHOR session are applied. Every other held peer's frames are dropped:
+/// they answer questions this client never asked, and a `CoinStateUpdate` carries no request id to
+/// tell the two apart.
+fn spawn_drive_loop(
+    mut subscription: FrameSubscription,
+    cache: Arc<RwLock<CoinStateCache>>,
+    fetcher: PooledFetcher,
+    rearm_needed: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(sourced) = subscription.recv().await {
+            if !follows(fetcher.anchor_address().await, sourced.source) {
+                continue;
+            }
+            let address = sourced.source.address;
+            if let AfterFrame::Resubscribe = apply_frame(&cache, sourced).await {
+                // Order matters: unpin FIRST, so a caller woken by the flag re-anchors on a live
+                // session rather than re-arming against the one that just died.
+                fetcher.release_anchor(address).await;
+                rearm_needed.store(true, Ordering::Release);
+            }
+        }
+        // The subscription ended — the pool was dropped, or this client fell behind and was
+        // terminated rather than silently skipped. Either way the cache can no longer be trusted to
+        // be current, and saying so is the point (see `frames::FrameSubscription`).
+        rearm_needed.store(true, Ordering::Release);
+    })
+}
+
+/// Whether a frame from `source` belongs to the session this client is following.
+///
+/// `None` — nothing subscribed yet — follows NOTHING. Before the first subscription there is no
+/// push this client could have asked for, so treating an unanchored client as following everything
+/// would admit exactly the unsolicited coin states the anchor exists to exclude.
+fn follows(anchor: Option<SocketAddr>, source: FrameSource) -> bool {
+    anchor.is_some_and(|address| address == source.address)
+}
+
+/// What the drive-loop must do about the SESSION after a frame has been applied to the cache.
+///
+/// Returned rather than done inline so the cache effect of a frame can be tested apart from the
+/// session bookkeeping, which needs a live peer to express at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterFrame {
+    /// The session continues; nothing further to do.
+    Continue,
+    /// The followed session is gone. Unpin it and tell the caller to re-arm.
+    Resubscribe,
+}
+
+/// Applies one attributed frame from the followed session to `cache`.
+async fn apply_frame(cache: &RwLock<CoinStateCache>, sourced: SourcedFrame) -> AfterFrame {
+    match sourced.frame {
+        // A new session at the followed address is a DIFFERENT connection, whose subscription set
+        // is empty. Anything derived from its predecessor is stale, so the client re-arms rather
+        // than reading the replacement's silence as an unchanging chain.
+        PoolFrame::Reset => AfterFrame::Resubscribe,
+        PoolFrame::Peak {
+            height,
+            header_hash,
+        } => {
+            cache.write().await.set_peak(height, header_hash);
+            AfterFrame::Continue
+        }
+        PoolFrame::CoinStates {
+            height,
+            fork_height,
+            peak_hash,
+            items,
+        } => {
+            let spent: Vec<Bytes32> = items
+                .iter()
+                .filter(|state| state.spent_height.is_some())
+                .map(|state| state.coin.coin_id())
+                .collect();
+            let mut cache = cache.write().await;
+            cache.apply_update(&items, height, fork_height, peak_hash);
+            cache.untrack_coins(&spent);
+            AfterFrame::Continue
+        }
+        PoolFrame::SessionEnded { reason } => {
+            log::debug!(
+                "light-client session {:?} ended: {reason:?}",
+                sourced.source.session
+            );
+            AfterFrame::Resubscribe
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
