@@ -40,6 +40,10 @@ pub const QUORUM_SAMPLE: usize = 4;
 /// that quietly corroborates against whoever happens to be present converts a four-voice quorum
 /// into a three- or two-voice one while still reporting the answer as corroborated, and nothing
 /// downstream can tell the difference.
+///
+/// Both denominators are recorded ecosystem-wide in the superproject `canonical` skill, under
+/// `CORROBORATION_FLOOR`, which names the HELD and the ANSWERED counts separately and forbids
+/// re-exporting either as the other. Read it before adopting this constant in another repo.
 pub const CORROBORATION_FLOOR: usize = 2;
 
 /// How long a peer may stay in the pool before it is rotated out.

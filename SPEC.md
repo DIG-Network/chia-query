@@ -43,10 +43,10 @@ The crate exposes a single `ChiaQuery` struct. All methods are async and return 
 ```rust
 use chia_query::{ChiaQuery, ChiaQueryConfig, NetworkType};
 
-// Default config: mainnet, 5 peers, coinset.org fallback enabled
+// Default config: mainnet, 8 peers, coinset.org fallback enabled
 let client = ChiaQuery::new(ChiaQueryConfig {
     network: NetworkType::Mainnet,
-    max_peers: 7,
+    max_peers: 8,
     coinset_base_url: "https://api.coinset.org".to_string(),
     coinset_fallback_enabled: true,
     tls_identity: TlsIdentity::Generated,
@@ -215,7 +215,7 @@ server-internal detail (stack frames) and is deliberately ignored.
 
 ### PeerPool
 
-Maintains a pool of 7 (configurable) active peer connections. Seven is DERIVED, not chosen: see [Pool sizing](#pool-sizing).
+Maintains a pool of 8 (configurable) active peer connections. Eight is DERIVED, not chosen: see [Pool sizing](#pool-sizing).
 
 #### State
 
@@ -279,7 +279,7 @@ many peers a machine holds MUST use `peer_count()`.
 
 #### Pool sizing
 
-`max_peers` defaults to **7**. Every term is a slot that is occupied and is NOT an independent
+`max_peers` defaults to **8**. Every term is a slot that is occupied and is NOT an independent
 corroborating voice:
 
 | Term | Why it is not a voice |
@@ -295,9 +295,16 @@ mid-rotation on a host running both priority addresses — both below `QUORUM_SA
 
 #### Corroboration arming: refuse, never degrade
 
-`corroboration_readiness()` reports `Armed` only when `independent_peer_count() - 1 >=
-CORROBORATION_FLOOR` (2); the `- 1` sets aside the peer that answered, which cannot corroborate
-itself. Below that it MUST report `Insufficient`.
+`corroboration_readiness(asked)` reports `Armed` only when at least `CORROBORATION_FLOOR` (2)
+`Discovered` peers at addresses OTHER than `asked` are held. Below that it MUST report
+`Insufficient`.
+
+It MUST be computed by the same predicate that selects corroborators, never as
+`independent_peer_count() - 1`. A blind subtraction charges the answering peer against the
+independent set even when it was never in it — a `Priority` peer, an operator's own node or one on
+this machine — so a pool holding a full floor of independent voices reports one short and the
+answer is downgraded to `Uncorroborated*`. On a host running a full node that is the ordinary case,
+not an edge one.
 
 Both corroborating reads consult it BEFORE asking anyone, and both grade the answers against the
 same floor afterwards:
@@ -328,11 +335,20 @@ the same operator address spends a handshake to change nothing.
 #### Frame fan-out
 
 A pooled session's inbound frames are fanned out to subscribers over BOUNDED per-subscriber
-channels (`subscribe_frames(capacity)`), carrying `Peak` and `CoinStates` frames tagged with a
-`Generation`.
+channels (`subscribe_frames(capacity)`). Every delivered frame is a `SourcedFrame`: a `PoolFrame`
+paired with the `FrameSource` that produced it — the peer `SocketAddr` this process DIALLED,
+together with a `SessionId`.
 
-- A reconnect increments the generation and MUST deliver `Reset { generation }` BEFORE any frame of
-  the new session.
+- `SessionId` is drawn from a monotonic counter at the moment the pool allocates a session. It is
+  never reused, never derived from anything a peer sends, and a reconnect to the same address
+  receives a NEW one, so a peer cannot inherit the identity of a session it did not open.
+- A session MUST be announced by `PoolFrame::Reset` before its first frame and closed by
+  `PoolFrame::SessionEnded` after its last. `Reset` carries no generation of its own; the session
+  it announces is named by the `FrameSource` on the frame.
+- **A subscriber receives the frames of EVERY held session, not only the one it follows.** `Reset`
+  in particular is published to all subscribers, so a subscriber that tracks one peer MUST filter
+  on `FrameSource` — matching both address and `SessionId` — before acting on a frame. A subscriber
+  that clears its state on any `Reset` will discard it when an unrelated peer reconnects.
 - A subscriber whose channel is FULL MUST have its subscription TERMINATED. Dropping a frame and
   continuing is FORBIDDEN: a missed `CoinStateUpdate` is a spend the consumer never learns about, so
   a replica goes on reporting itself synced while reading spent money as present.
@@ -359,11 +375,13 @@ Default port: `58444`
    `dedup` collapses only adjacent duplicates, so a shuffle immediately before it makes it near
    vacuous and a repeated introducer result can occupy two dial slots
 3. Shuffle the distinct addresses for randomness
-4. Order the shuffled set IPv6-first, loopback-first within each family (CLAUDE.md §5.2). The
-   ordering is STABLE, so the shuffle survives within each class
+4. Order the shuffled set IPv6-first (CLAUDE.md §5.2). The ordering is STABLE, so the shuffle
+   survives within each class. Locality MUST NOT reorder the discovered set: a local address
+   reached through DISCOVERY is refused outright by invariant 5f, and a co-resident node is reached
+   only by the priority path, where it is recorded as `Priority` and is not an independent voice
 5. Attempt connections in batches of 10, with 8-second timeout per attempt
-4. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
-5. Return the first successful connection
+6. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
+7. Return the first successful connection
 
 If NO peer connects, construction fails with `PeerDiscoveryFailed` ONLY when
 `coinset_fallback_enabled` is `false`. With the fallback enabled the client MUST construct with an

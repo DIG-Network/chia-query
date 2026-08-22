@@ -432,3 +432,41 @@ async fn a_preferred_peer_agreeing_is_not_corroboration_of_presence() {
     );
     assert_eq!(asked, 1, "the preferred peer must not even be consulted");
 }
+
+/// **A read from the operator's own node still corroborates against the discovered set.**
+///
+/// The preferred peer is admitted FIRST, so it is the one `select_peer` asks. Two genuinely
+/// independent peers then agree with it, which is a floor's worth of corroboration by every rule
+/// this tier states — the preferred peer is not among them and never claimed to be.
+///
+/// This fixture returned `UncorroboratedAbsent` before the fix, because readiness subtracted the
+/// asker's slot from the independent set without knowing the asker was not in it. That is not a
+/// harmless conservatism: an `Uncorroborated*` answer is settled by the router against the
+/// centralized coinset tier, so the effect was to route the most common configuration this pool is
+/// sized for — a host running a node, or one with `TRUSTED_FULLNODE` — away from peer plurality
+/// and on to a single HTTPS source (NC-12).
+///
+/// Deliberately the SAME peer count and the same answers as
+/// [`a_floor_of_independent_peers_agreeing_is_an_absence`]; only the first peer's origin differs,
+/// so nothing else in the fixture can explain the verdict.
+#[tokio::test]
+async fn a_preferred_peer_answering_is_still_corroborated_by_the_discovered_set() {
+    let (backend, script) = backend_over(&[
+        (Says::Absent, PeerOrigin::Priority),
+        (Says::Absent, PeerOrigin::Discovered),
+        (Says::Absent, PeerOrigin::Discovered),
+    ])
+    .await;
+
+    let (answer, asked) = read_scripted(&backend, &script).await;
+
+    assert_eq!(
+        answer.expect("no read failed"),
+        OptAnswer::CorroboratedAbsent,
+        "two independent peers agreeing is corroboration whoever was asked first"
+    );
+    assert_eq!(
+        asked, 3,
+        "the preferred peer answered and both independent peers were really asked"
+    );
+}

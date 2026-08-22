@@ -102,23 +102,34 @@ mod tests {
     /// adjacent before the shuffle and often still adjacent after it.
     ///
     /// Both families are duplicated so the ordering step cannot be what removes them.
+    ///
+    /// **Repeated, because the input to `dedup` is RANDOM and a proof must not be.** The property
+    /// asserted is exact — a set cannot hold a duplicate — but the proof that it is load-bearing
+    /// rests on `shuffle(); dedup()` actually failing, and that behaviour fails only when the
+    /// shuffle leaves some duplicate pair non-adjacent. A single call therefore lets the replaced
+    /// implementation through roughly one run in twenty-five, which is a flaky red waiting to
+    /// happen and, worse, a revert-proof that can report a fix as unnecessary. Each call shuffles
+    /// independently, so `ROUNDS` calls drive that below 1e-40 without seeding production code.
     #[test]
     fn a_duplicate_address_is_removed_even_when_the_duplicates_are_not_adjacent() {
+        const ROUNDS: usize = 32;
         let with_repeats = vec![v6(1), v4(1), v6(2), v6(1), v4(2), v4(1), v6(3), v6(1)];
 
-        let ordered = candidate_order(&with_repeats);
+        for round in 0..ROUNDS {
+            let ordered = candidate_order(&with_repeats);
 
-        let distinct: HashSet<SocketAddr> = ordered.iter().copied().collect();
-        assert_eq!(
-            ordered.len(),
-            distinct.len(),
-            "a candidate must be offered at most once, however the duplicates were spread: {ordered:?}"
-        );
-        assert_eq!(
-            distinct.len(),
-            5,
-            "the five distinct addresses must all survive: {ordered:?}"
-        );
+            let distinct: HashSet<SocketAddr> = ordered.iter().copied().collect();
+            assert_eq!(
+                ordered.len(),
+                distinct.len(),
+                "round {round}: a candidate must be offered at most once, however the duplicates                  were spread: {ordered:?}"
+            );
+            assert_eq!(
+                distinct.len(),
+                5,
+                "round {round}: the five distinct addresses must all survive: {ordered:?}"
+            );
+        }
     }
 
     /// The control: deduplication must not COST a candidate. Without it, returning a single

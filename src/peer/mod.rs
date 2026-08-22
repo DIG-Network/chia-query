@@ -82,6 +82,12 @@ pub enum OptAnswer<T> {
 ///   A pool that held enough peers and then had them time out has corroborated nothing, and
 ///   membership alone cannot see that.
 ///
+/// The membership half is not implied by the agreement half even though readiness now counts
+/// exactly the peers that will be asked. Readiness is a SNAPSHOT taken before the round, and the
+/// pool is refilled from background tasks, so a round can be answered by more peers than were held
+/// when it began. Requiring the pool to have been armed BEFORE the round is what stops a pool that
+/// could not have corroborated anything from being rescued by a peer that arrived mid-question.
+///
 /// The floor is on agreement, never on peers asked: reading "I asked and heard no contradiction"
 /// as agreement is how silence becomes a second opinion.
 fn corroborated(readiness: CorroborationReadiness, agreed: usize) -> bool {
@@ -161,10 +167,10 @@ impl PeerBackend {
         self.pool.independent_peer_count().await
     }
 
-    /// Whether a corroborated read may be attempted at all — see
+    /// Whether a corroborated read of an answer given by `asked` may be attempted at all — see
     /// [`PeerPool::corroboration_readiness`]. It REFUSES rather than degrading.
-    pub async fn corroboration_readiness(&self) -> pool::CorroborationReadiness {
-        self.pool.corroboration_readiness().await
+    pub async fn corroboration_readiness(&self, asked: SocketAddr) -> pool::CorroborationReadiness {
+        self.pool.corroboration_readiness(asked).await
     }
 
     /// Subscribe to the frames arriving on this backend's pooled sessions.
@@ -306,7 +312,7 @@ impl PeerBackend {
         // rather than a gate on asking. Asking cannot make an answer worse — a contradiction is
         // decisive however few peers are held — but reporting corroboration from a pool that never
         // held enough independent voices is exactly the degradation the floor exists to prevent.
-        let readiness = self.pool.corroboration_readiness().await;
+        let readiness = self.pool.corroboration_readiness(addr).await;
 
         let corroborators = self.pool.select_corroborating_peers(addr).await;
         if corroborators.is_empty() {
@@ -390,7 +396,7 @@ impl PeerBackend {
         F: Fn(Peer) -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, ChiaQueryError>>,
     {
-        let readiness = self.pool.corroboration_readiness().await;
+        let readiness = self.pool.corroboration_readiness(addr).await;
 
         let corroborators = self.pool.select_corroborating_peers(addr).await;
         if corroborators.is_empty() {
@@ -1237,4 +1243,50 @@ fn to_protocol_spend_bundle(bundle: &SpendBundle) -> Result<ProtoBundle, ChiaQue
         coin_spends,
         aggregated_signature,
     })
+}
+
+#[cfg(test)]
+mod grading_tests {
+    use super::*;
+
+    /// **A round that agrees cannot rescue a pool that was never armed.**
+    ///
+    /// This is the state the two conjuncts of [`corroborated`] exist to separate, and it is
+    /// reachable in production for one reason: readiness is a snapshot taken BEFORE the round,
+    /// while background refills can add peers during it — so more peers can agree than were held
+    /// when the question was asked.
+    ///
+    /// No pool-level fixture can reach it, because a pool asks exactly the peers it counted. So it
+    /// is asserted here, on the grading function itself. Without it, deleting the membership
+    /// conjunct from [`corroborated`] leaves the whole suite green.
+    #[test]
+    fn agreement_alone_does_not_corroborate_when_the_pool_was_not_armed() {
+        let unarmed = CorroborationReadiness::Insufficient {
+            corroborators: 1,
+            required: CORROBORATION_FLOOR,
+        };
+
+        assert!(
+            !corroborated(unarmed, CORROBORATION_FLOOR),
+            "a pool that held too few independent peers has corroborated nothing, however many \
+             voices answered"
+        );
+    }
+
+    /// The control from the other side: armed AND agreed is the only state that corroborates.
+    ///
+    /// Paired with the test above, this pins both conjuncts — a `corroborated` that always
+    /// returned `false` would satisfy that one on its own.
+    #[test]
+    fn an_armed_pool_with_a_floor_of_agreement_corroborates() {
+        let armed = CorroborationReadiness::Armed {
+            corroborators: CORROBORATION_FLOOR,
+        };
+
+        assert!(corroborated(armed, CORROBORATION_FLOOR));
+        assert!(
+            !corroborated(armed, CORROBORATION_FLOOR - 1),
+            "an armed pool whose corroborators timed out has corroborated nothing"
+        );
+    }
 }

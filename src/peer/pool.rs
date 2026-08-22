@@ -18,14 +18,23 @@ use super::connect;
 use super::frames::{
     FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
 };
-use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME};
+use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME, PRIORITY_SLOTS};
 
 /// How many dial rounds [`PeerPool::fill_toward_capacity`] may spend reaching capacity.
 ///
-/// Three: one round that the priority addresses win, one that reaches discovery with them
-/// excluded, and one for the ordinary attrition of a round whose dials did not all land. More
-/// would trade start-up latency for peers the round before it already failed to find.
-const FILL_ROUNDS: usize = 3;
+/// DERIVED, not chosen, for the same reason [`default_max_peers`](super::plurality::default_max_peers)
+/// is: the priority addresses are tried SEQUENTIALLY and a round admits at most one of them, so
+/// [`PRIORITY_SLOTS`] rounds can be consumed before a single dial reaches discovery at all. Two
+/// more are then owed — one that reaches discovery with every priority address excluded, and one
+/// for the ordinary attrition of a round whose dials did not all land.
+///
+/// A literal `3` was wrong on exactly the host this rule exists for: an operator with
+/// `TRUSTED_FULLNODE` who also runs a node spends round one on the trusted address and round two
+/// on the loopback, leaving ONE round for discovery and no slack. If that round admitted fewer
+/// than [`CORROBORATION_FLOOR`] independent peers the pool could never arm, and there was no
+/// fourth round in which to try. Deriving it means a third priority address widens the budget
+/// instead of silently consuming it.
+const FILL_ROUNDS: usize = PRIORITY_SLOTS + 2;
 
 // ---------------------------------------------------------------------------
 // Pool entry
@@ -324,19 +333,32 @@ impl PeerPool {
             .count()
     }
 
-    /// Whether the pool can honestly attempt a CORROBORATED read right now.
+    /// Whether the pool can honestly attempt a CORROBORATED read of an answer given by `asked`.
     ///
-    /// The peer that answered cannot corroborate itself, so the question is whether
-    /// [`CORROBORATION_FLOOR`] OTHER independent peers are held — hence the `- 1`.
+    /// The count is of the peers that WILL be asked to corroborate — precisely the set
+    /// [`select_corroborating_peers`](Self::select_corroborating_peers) returns for the same
+    /// address, and computed by the same predicate so the two can never drift apart.
+    ///
+    /// **It takes the answering address rather than subtracting one blindly.** An earlier version
+    /// charged the asker's slot against the independent set whatever the asker was, so a read from
+    /// the operator's own node — which is not in that set at all — silently spent an independent
+    /// voice it had never occupied. On the host this crate is sized for, two genuinely independent
+    /// peers agreeing with a co-resident node were downgraded to `Uncorroborated*` and pushed on
+    /// to the centralized coinset tier, which is the opposite of what NC-12 asks for.
     ///
     /// **This refuses; it never degrades.** Corroborating against however many peers happen to be
     /// present turns a four-voice quorum into a two-voice one that still reports itself
     /// corroborated, and no consumer downstream can tell those apart. A caller handed
     /// [`CorroborationReadiness::Insufficient`] must decline the read, not proceed with fewer
     /// voices.
-    pub async fn corroboration_readiness(&self) -> CorroborationReadiness {
-        let independent = self.independent_peer_count().await;
-        let corroborators = independent.saturating_sub(1);
+    pub async fn corroboration_readiness(&self, asked: SocketAddr) -> CorroborationReadiness {
+        let corroborators = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
+            .count();
         if corroborators >= CORROBORATION_FLOOR {
             CorroborationReadiness::Armed { corroborators }
         } else {
@@ -511,12 +533,17 @@ impl PeerPool {
     /// can tell one held peer's frames from another's — which is what lets it follow the peer it
     /// chose and eject one whose frames it rejected.
     ///
+    /// **`pub(crate)`, so the one-path claim on [`admit_and_follow`](Self::admit_and_follow) holds
+    /// across the crate boundary too.** A caller outside the crate could otherwise supply its own
+    /// [`FrameSource`] and publish frames under a session the pool never allocated — attribution
+    /// that is unforgeable in-crate becomes forgeable the moment the constructor is exported.
+    ///
     /// **The task never ends quietly.** Both ways a session can stop — the transport closing, and
     /// a message this crate cannot decode — publish a [`PoolFrame::SessionEnded`] and record the
     /// death for [`eject_dead_sessions`](Self::eject_dead_sessions). Returning silently would
     /// leave a subscriber unable to distinguish a peer that stopped from a chain that is quiet,
     /// and would leave the pool holding a connection nothing will ever read from.
-    pub fn spawn_receiver_handler(
+    pub(crate) fn spawn_receiver_handler(
         &self,
         source: FrameSource,
         mut receiver: mpsc::Receiver<Message>,
@@ -1044,7 +1071,7 @@ mod tests {
         }
 
         assert_eq!(
-            pool.corroboration_readiness().await,
+            pool.corroboration_readiness(address(1)).await,
             CorroborationReadiness::Insufficient {
                 corroborators: 1,
                 required: CORROBORATION_FLOOR,
@@ -1069,7 +1096,7 @@ mod tests {
         }
 
         assert_eq!(
-            pool.corroboration_readiness().await,
+            pool.corroboration_readiness(address(1)).await,
             CorroborationReadiness::Armed {
                 corroborators: CORROBORATION_FLOOR
             }
@@ -1097,9 +1124,72 @@ mod tests {
         }
 
         assert!(matches!(
-            pool.corroboration_readiness().await,
+            pool.corroboration_readiness(address(1)).await,
             CorroborationReadiness::Insufficient { .. }
         ));
+    }
+
+    /// **A PRIORITY peer answering does not spend an independent voice it never occupied.**
+    ///
+    /// The fixture varies exactly one thing against
+    /// [`a_pool_at_the_corroboration_floor_arms`]: WHO was asked. The independent set is a floor's
+    /// worth on its own, and the answer comes from a preferred peer that is not in that set — so
+    /// charging the asker's slot against it, as a blind `- 1` does, reports a pool with two
+    /// genuine corroborators as having one.
+    ///
+    /// That is not a missed opportunity, it is a downgrade with a destination: the answer becomes
+    /// `Uncorroborated*` and the router settles it against the centralized coinset tier
+    /// (`router.rs`), substituting one HTTPS source for the untrusted plurality NC-12 asks for. On
+    /// a host with `TRUSTED_FULLNODE` or a co-resident node — the configuration this pool is sized
+    /// for — that is the ordinary path, not an edge case.
+    #[tokio::test]
+    async fn a_priority_peer_answering_does_not_consume_an_independent_slot() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        for octet in 1..=(CORROBORATION_FLOOR as u8) {
+            assert!(
+                pool.admitted(peer.clone(), address(octet), PeerOrigin::Discovered)
+                    .await
+            );
+        }
+        let preferred = address(200);
+        assert!(
+            pool.admitted(peer.clone(), preferred, PeerOrigin::Priority)
+                .await
+        );
+
+        assert_eq!(
+            pool.corroboration_readiness(preferred).await,
+            CorroborationReadiness::Armed {
+                corroborators: CORROBORATION_FLOOR
+            },
+            "a preferred peer is not an independent voice, so answering from one cannot cost the              independent set a member"
+        );
+    }
+
+    /// **`FILL_ROUNDS` is DERIVED from the dialler, so a new priority address cannot starve it.**
+    ///
+    /// Network-free arithmetic, in the shape of the pool-sizing derivations: the priority
+    /// addresses are tried sequentially and a round admits at most one of them, so `PRIORITY_SLOTS`
+    /// rounds can pass before any dial reaches discovery. What is left must still be enough for a
+    /// discovery round AND one of attrition.
+    ///
+    /// The literal `3` this replaced satisfied that only while `PRIORITY_SLOTS` was 1. At 2 it
+    /// left exactly one discovery round with no slack, on precisely the host the rounds exist for.
+    #[test]
+    fn fill_rounds_leaves_a_discovery_round_and_one_of_attrition() {
+        let for_discovery = FILL_ROUNDS - PRIORITY_SLOTS;
+
+        assert_eq!(
+            for_discovery, 2,
+            "FILL_ROUNDS ({FILL_ROUNDS}) minus the {PRIORITY_SLOTS} rounds the priority              addresses can consume must leave a discovery round and one of attrition"
+        );
+        assert_eq!(
+            FILL_ROUNDS,
+            PRIORITY_SLOTS + 2,
+            "the budget must be derived, not restated"
+        );
     }
     // -----------------------------------------------------------------------
     // Session lifecycle: attribution, loud endings, and the ejection they drive
