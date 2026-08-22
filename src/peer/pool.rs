@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(got_height, 200, "the peak height must be the update's own");
         assert_eq!(
             got_fork_height, 199,
-            "fork_height is the reorg depth; crossing it with height reports a rewind that did              not happen"
+            "fork_height is the reorg depth; crossing it with height reports a rewind that did not happen"
         );
         assert_eq!(
             got_peak_hash, peak_hash,
@@ -1638,7 +1638,7 @@ mod tests {
         );
         assert_eq!(
             got_items, items,
-            "the coin states are the payload; a frame without them advances the peak and tells              subscribers nothing about their coins"
+            "the coin states are the payload; a frame without them tells subscribers nothing about their coins"
         );
     }
 }
