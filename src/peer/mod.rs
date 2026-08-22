@@ -83,10 +83,11 @@ pub enum OptAnswer<T> {
 ///   membership alone cannot see that.
 ///
 /// The membership half is not implied by the agreement half even though readiness now counts
-/// exactly the peers that will be asked. Readiness is a SNAPSHOT taken before the round, and the
-/// pool is refilled from background tasks, so a round can be answered by more peers than were held
-/// when it began. Requiring the pool to have been armed BEFORE the round is what stops a pool that
-/// could not have corroborated anything from being rescued by a peer that arrived mid-question.
+/// exactly the peers that will be asked. Readiness is a SNAPSHOT taken before the round, but on a
+/// shared [`QueryRouter`] multiple concurrent callers may each call [`PeerPool::maintain`] during
+/// the same question, so a round can be answered by more peers than the readiness snapshot held.
+/// Requiring the pool to have been armed BEFORE the round is what stops a pool that could not have
+/// corroborated anything from being rescued by a peer that arrived mid-question.
 ///
 /// The floor is on agreement, never on peers asked: reading "I asked and heard no contradiction"
 /// as agreement is how silence becomes a second opinion.

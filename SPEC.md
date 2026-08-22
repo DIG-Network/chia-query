@@ -554,7 +554,7 @@ struct ChiaQueryConfig {
 2. **Single retry on peer failure**: If a peer request fails, eject that peer, try one more peer. If that also fails, fall back to coinset.org
 3. **Immediate ejection**: Any peer that fails a request or whose connection drops is removed from the pool immediately
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
-5. **Pool size invariant**: The pool always targets `max_peers` connections. If below target, background tasks work to replenish
+5. **Pool size invariant**: The pool always targets `max_peers` connections. The `PeerBackend::read` path maintains the pool on every request, refilling it if below target
 5b. **Cycling invariant**: A `Discovered` peer held for `PEER_LIFETIME` or longer MUST be rotated out on AGE, independently of whether any request to it has failed
 5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
 5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it

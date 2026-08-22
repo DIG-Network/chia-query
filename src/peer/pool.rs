@@ -278,7 +278,7 @@ impl PeerPool {
             .read()
             .await
             .iter()
-            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
+            .filter(|e| Self::is_corroborator(e, asked))
             .map(|e| (e.peer.clone(), e.address))
             .collect()
     }
@@ -333,11 +333,16 @@ impl PeerPool {
             .count()
     }
 
+    /// Whether a peer entry qualifies as a corroborator: not the answering peer, and discovered.
+    fn is_corroborator(entry: &PeerEntry, asked: SocketAddr) -> bool {
+        entry.address != asked && entry.origin == connect::PeerOrigin::Discovered
+    }
+
     /// Whether the pool can honestly attempt a CORROBORATED read of an answer given by `asked`.
     ///
     /// The count is of the peers that WILL be asked to corroborate — precisely the set
     /// [`select_corroborating_peers`](Self::select_corroborating_peers) returns for the same
-    /// address, and computed by the same predicate so the two can never drift apart.
+    /// address, because both use [`is_corroborator`](Self::is_corroborator) to decide the set.
     ///
     /// **It takes the answering address rather than subtracting one blindly.** An earlier version
     /// charged the asker's slot against the independent set whatever the asker was, so a read from
@@ -357,7 +362,7 @@ impl PeerPool {
             .read()
             .await
             .iter()
-            .filter(|e| e.address != asked && e.origin == connect::PeerOrigin::Discovered)
+            .filter(|e| Self::is_corroborator(e, asked))
             .count();
         if corroborators >= CORROBORATION_FLOOR {
             CorroborationReadiness::Armed { corroborators }
@@ -1168,6 +1173,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn corroboration_readiness_and_select_use_the_same_predicate() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        // Build a pool with mixed origins: Priority, Discovered, and the asker itself.
+        let asked = address(100);
+        let priority = address(200);
+        let discovered_1 = address(1);
+        let discovered_2 = address(2);
+
+        assert!(pool.admitted(peer.clone(), asked, PeerOrigin::Discovered).await);
+        assert!(pool.admitted(peer.clone(), priority, PeerOrigin::Priority).await);
+        assert!(pool.admitted(peer.clone(), discovered_1, PeerOrigin::Discovered).await);
+        assert!(pool.admitted(peer.clone(), discovered_2, PeerOrigin::Discovered).await);
+
+        // Both should see exactly 2 corroborators: discovered_1 and discovered_2.
+        // Not `asked` (excluded by address), not `priority` (excluded by origin).
+        let readiness = pool.corroboration_readiness(asked).await;
+        let selected = pool.select_corroborating_peers(asked).await;
+
+        let readiness_count = match readiness {
+            CorroborationReadiness::Armed { corroborators } => corroborators,
+            CorroborationReadiness::Insufficient { corroborators, .. } => corroborators,
+        };
+
+        assert_eq!(
+            readiness_count, selected.len(),
+            "corroboration_readiness and select_corroborating_peers must use the same predicate"
+        );
+        assert_eq!(
+            readiness_count, 2,
+            "both should count exactly the two Discovered peers that are not the asker"
+        );
+    }
+
     /// **`FILL_ROUNDS` is DERIVED from the dialler, so a new priority address cannot starve it.**
     ///
     /// Network-free arithmetic, in the shape of the pool-sizing derivations: the priority
@@ -1188,8 +1229,11 @@ mod tests {
         assert_eq!(
             FILL_ROUNDS,
             PRIORITY_SLOTS + 2,
-            "the budget must be derived, not restated"
+            "FILL_ROUNDS stays coupled to PRIORITY_SLOTS + 2"
         );
+        // This assertion and the one above state the same mathematical fact: FILL_ROUNDS - PRIORITY_SLOTS == 2
+        // and FILL_ROUNDS == PRIORITY_SLOTS + 2 are equivalent. Both are present because changing either
+        // one invalidates FILL_ROUNDS' budget, but they do not add independent verification.
     }
     // -----------------------------------------------------------------------
     // Session lifecycle: attribution, loud endings, and the ejection they drive
