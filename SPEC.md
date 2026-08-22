@@ -56,6 +56,31 @@ let client = ChiaQuery::new(ChiaQueryConfig {
 }).await?;
 ```
 
+### Light client (native)
+
+`ChiaQuery::light_client(request_timeout)` returns a `peer::ChiaLightClient` over the SAME peer pool
+the client queries through — one set of held sessions, one notion of the peak.
+
+```rust
+let light = client.light_client(Duration::from_secs(30)).await;
+light.subscribe_coins(vec![coin_id]).await?;             // arms a subscription on the pinned session
+let peak = light.peak().await;                            // (height, header_hash) from that session
+let provider = light.as_chain_source_provider(handle).await;  // ChainSource at priority 20
+if light.needs_rearm() { light.reconnect().await?; }      // the followed session ended
+```
+
+- `subscribe_coins` / `subscribe_puzzle_hashes` — arm a subscription and seed the cache.
+- `submit_spend` — a WRITE, deliberately outside the reads-only `ChainSource` surface.
+- `peak` — the FOLLOWED session's peak, not `peer_peak_height` (the highest any held peer claims).
+- `needs_rearm` / `reconnect` — a followed session that ends is REPORTED, so a stopped stream is
+  never read as a chain with nothing to say.
+- `as_chain_source_provider` — registers as `ProviderKind::LocalNode` when the pinned session was
+  reached from a configured or co-resident address, `Custom` when discovered, `trustless = false`
+  always. Call after subscribing; with nothing pinned it reports the conservative `Custom`.
+
+`resolve_singleton_lineage` and `block_timestamp` are `Unsupported` from this provider — a
+subscribing session is not an archival index — and fall through to the coinset source.
+
 ### Endpoint Methods
 
 All methods are `async` and return `Result<Response, ChiaQueryError>`.
@@ -509,6 +534,7 @@ chia-query/
 │   │   └── error.rs            # ChiaQueryError enum
 │   ├── router.rs               # (native) QueryRouter: peer-first dispatch + coinset fallback
 │   ├── peer/                   # (native) PeerBackend, pool, connect, ordering, frames, plurality, translate
+│   │   └── light_client/       # (native) ChiaLightClient: subscriptions + cache + ChainSource provider
 │   └── coinset/
 │       ├── mod.rs              # CoinsetClient<T>: transport-generic REST wrapper
 │       └── transport.rs        # HttpTransport trait: ReqwestTransport / FetchTransport
@@ -559,6 +585,23 @@ struct ChiaQueryConfig {
 5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
 5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
 5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
+5g. **Single-dialler invariant**: `peer::connect` is the ONLY place this ecosystem opens a Chia
+    wallet-protocol connection, and `PeerPool` is the only thing that holds one. Every consumer that
+    needs a session — the router, the light client, a wallet replica — BORROWS one. A component that
+    dials its own is a second peer set with its own notion of the peak inside one process, which is
+    what `chia-peer` was and why it was folded in here.
+5h. **Anchored-subscription invariant**: A subscription is server-side state on ONE connection, so a
+    `subscribe = true` request MUST be issued on the subscriber's pinned session, and a subscriber
+    MUST apply only the frames whose `FrameSource.address` is that session's. Frames from any other
+    held peer MUST be discarded: `CoinStateUpdate` is an unsolicited push carrying no request id, so
+    an unattributed one is indistinguishable from a fabrication.
+5i. **Paired-peak invariant**: A peak height and its header hash MUST reach a subscriber from the
+    SAME message. `PoolFrame::CoinStates` therefore carries `peak_hash`; pairing a new height with a
+    previously-held hash names a block that never existed at that height.
+5j. **Observed-origin invariant**: A provider descriptor's `ProviderKind` MUST be derived from the
+    `PeerOrigin` of the session that actually answers, never from configuration. A client that names
+    an endpoint may still be answered by a discovered peer, and a descriptor that reports the
+    configured intent describes a source it does not have.
 5f. **Local-discovery invariant**: An address reached through DNS discovery MUST be refused if it is loopback, private, link-local or unspecified in either family. Only the priority path may reach a host-local node, and what it reaches is recorded as `Priority`
 5a. **Distinct-address invariant**: At most one connection per `SocketAddr` is held, decided under the write lock — see [Distinct admission](#distinct-admission). `max_peers` connections therefore mean `max_peers` distinct addresses, which is what makes the count meaningful as a measure of redundancy
 6. **Coinset-only endpoints**: Endpoints with no peer protocol equivalent (mempool queries, block count metrics, block spends with conditions, unfinished block headers) always go directly to `CoinsetBackend`. If coinset fallback is disabled, these return `ChiaQueryError::UnsupportedWithoutCoinset`

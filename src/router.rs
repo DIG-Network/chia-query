@@ -3,6 +3,7 @@
 //! both peer attempts fail.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chia_consensus::consensus_constants::ConsensusConstants;
 use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
@@ -117,7 +118,13 @@ fn settle_uncorroborated_presence<T: ChainClaim>(
 }
 
 pub struct QueryRouter {
-    pub(crate) peer: PeerBackend,
+    /// The peer tier, SHARED.
+    ///
+    /// Held behind an `Arc` so a [`ChiaLightClient`](crate::peer::ChiaLightClient) built from the
+    /// same client borrows this pool rather than dialling one of its own — the unification
+    /// dig_ecosystem#2761 exists to make. Two pools would mean two peaks and two sets of held
+    /// peers inside one process, which is the state this replaces.
+    pub(crate) peer: Arc<PeerBackend>,
     pub(crate) coinset: CoinsetClient,
     pub(crate) coinset_fallback_enabled: bool,
 }

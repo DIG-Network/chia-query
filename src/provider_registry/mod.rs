@@ -21,7 +21,7 @@
 //!
 //! This module is native-only: it never reaches the wasm coinset-only build.
 
-mod bridge;
+pub(crate) mod bridge;
 mod chia_query_provider;
 mod coinset_source;
 mod convert;

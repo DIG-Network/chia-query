@@ -103,6 +103,14 @@ pub enum PoolFrame {
     CoinStates {
         height: u32,
         fork_height: u32,
+        /// The header hash of the peak this update was observed against.
+        ///
+        /// Carried because `CoinStateUpdate` carries it and a subscriber tracking the peak needs
+        /// the height and the hash to arrive TOGETHER. Dropping it forces a subscriber to pair the
+        /// new height with whatever hash it already had, which names a block that never existed at
+        /// that height — and does so most often during a reorg, exactly when the pairing is what a
+        /// consumer is relying on.
+        peak_hash: Bytes32,
         items: Vec<CoinState>,
     },
     /// This session has ENDED and will produce no further frames.

@@ -180,7 +180,7 @@ mod native_client {
 
             Ok(Self {
                 router: router::QueryRouter {
-                    peer: peer_backend,
+                    peer: std::sync::Arc::new(peer_backend),
                     coinset: coinset_client,
                     coinset_fallback_enabled: cfg.coinset_fallback_enabled,
                 },
@@ -364,6 +364,19 @@ mod native_client {
         /// satisfy any "is this buried yet" comparison a caller makes.
         pub async fn peer_peak_height(&self) -> Option<u32> {
             observed_peak(self.router.peer.peak_height())
+        }
+
+        /// A subscribing light client over THIS client's peer pool.
+        ///
+        /// The returned [`ChiaLightClient`](peer::ChiaLightClient) borrows the same held sessions
+        /// this client reads through, so a consumer that needs both coin subscriptions and ordinary
+        /// queries holds ONE set of peers with ONE notion of the peak. Building a second
+        /// `ChiaQuery` to get a light client would recreate exactly the split this replaces.
+        ///
+        /// `request_timeout` bounds each of the light client's own requests; it does not affect
+        /// this client's.
+        pub async fn light_client(&self, request_timeout: Duration) -> peer::ChiaLightClient {
+            peer::ChiaLightClient::new(self.router.peer.clone(), request_timeout).await
         }
 
         /// The Unix timestamp of the block at `height` (`Ok(None)` when absent), `Err` on failure.

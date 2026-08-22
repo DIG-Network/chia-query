@@ -1,6 +1,7 @@
 pub mod block;
 pub mod connect;
 pub mod frames;
+pub mod light_client;
 pub mod ordering;
 pub mod plurality;
 pub mod pool;
@@ -28,6 +29,7 @@ use tokio_tungstenite::Connector;
 use crate::types::*;
 
 use crate::NetworkType;
+pub use light_client::{ChiaLightClient, LightClientProvider, SubmitOutcome};
 use plurality::CORROBORATION_FLOOR;
 pub use pool::PeerRequirement;
 use pool::{CorroborationReadiness, PeerPool};
@@ -108,11 +110,22 @@ fn corroborated(readiness: CorroborationReadiness, agreed: usize) -> bool {
 #[cfg(test)]
 impl PeerBackend {
     pub(crate) fn for_tests() -> Self {
+        Self::for_tests_with_capacity(0)
+    }
+
+    /// A backend over an empty pool that will ADMIT up to `max_peers`, so a test can populate it
+    /// with loopback peers at chosen addresses and origins.
+    pub(crate) fn for_tests_with_capacity(max_peers: usize) -> Self {
         Self {
-            pool: pool::PeerPool::for_tests(0),
+            pool: pool::PeerPool::for_tests(max_peers),
             network: NetworkType::Mainnet,
             request_timeout: Duration::from_millis(1),
         }
+    }
+
+    /// The pool underneath, so a test can admit peers into the backend it is exercising.
+    pub(crate) fn pool_for_tests(&self) -> &pool::PeerPool {
+        &self.pool
     }
 }
 
