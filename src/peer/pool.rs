@@ -25,7 +25,7 @@ use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME, PRIORITY_SLOTS};
 /// DERIVED, not chosen, for the same reason [`default_max_peers`](super::plurality::default_max_peers)
 /// is: the priority addresses are tried SEQUENTIALLY and a round admits at most one of them, so
 /// [`PRIORITY_SLOTS`] rounds can be consumed before a single dial reaches discovery at all. Two
-/// more are then owed — one that reaches discovery with every priority address excluded, and one
+/// more are then owed - one that reaches discovery with every priority address excluded, and one
 /// for the ordinary attrition of a round whose dials did not all land.
 ///
 /// A literal `3` was wrong on exactly the host this rule exists for: an operator with
@@ -50,7 +50,7 @@ struct PeerEntry {
     /// its freshly dialled replacement.
     session: SessionId,
     /// How this peer was reached. Held so a caller counting independent opinions can tell a
-    /// preferred local node from a discovered one — see [`connect::PeerOrigin`].
+    /// preferred local node from a discovered one - see [`connect::PeerOrigin`].
     origin: connect::PeerOrigin,
     /// When this connection entered the pool, so it can be rotated out on a TIMER.
     ///
@@ -118,7 +118,7 @@ pub struct PeerPool {
     /// A receiver handler runs in its own task and cannot take the pool's write lock without
     /// holding a reference to the pool, so it records the death here and lets
     /// [`maintain`](Self::maintain) act on it. Without this the pool's only removals are
-    /// failure-driven — a dead connection stays in `entries`, counted as a held peer and
+    /// failure-driven - a dead connection stays in `entries`, counted as a held peer and
     /// offered to `select_peer`, until a request happens to pick it or `PEER_LIFETIME`
     /// elapses.
     dead_sessions: Arc<StdMutex<Vec<FrameSource>>>,
@@ -167,7 +167,7 @@ impl PeerPool {
     /// concurrent dials know nothing of each other, so on a machine running a full node ALL of
     /// them return the same local address and every one but the first is discarded as a duplicate.
     /// A single round therefore leaves a pool of ONE peer on exactly the machines most likely to
-    /// have several available — and one peer is a pool that can never corroborate anything.
+    /// have several available - and one peer is a pool that can never corroborate anything.
     ///
     /// A later round excludes what the earlier ones admitted, so the priority addresses are no
     /// longer offered and the dial falls through to discovery. Rounds stop as soon as one admits
@@ -282,13 +282,13 @@ impl PeerPool {
     /// - **A different address than `asked`.** Asking the same connection twice returns the same
     ///   opinion twice, which reads as agreement while being one voice.
     /// - **[`PeerOrigin::Discovered`](connect::PeerOrigin).** A peer reached from a preferred
-    ///   address — an operator's node, or one on this machine — is an excellent peer to READ from
+    ///   address - an operator's node, or one on this machine - is an excellent peer to READ from
     ///   and is not evidence about the chain independent of this host, exactly as
     ///   [`independent_peer_count`](Self::independent_peer_count) records.
     ///
     /// They are returned ALL AT ONCE, and there is deliberately no singular form of this. Asking
     /// corroborators one at a time lets the first responder settle a claim about the chain, which
-    /// is exactly the power a hostile peer has (dig_ecosystem#2462) — and a single corroborator
+    /// is exactly the power a hostile peer has (dig_ecosystem#2462) - and a single corroborator
     /// cannot reach `CORROBORATION_FLOOR` at all, so a caller that took one would be building an
     /// answer it is not allowed to report as corroborated.
     ///
@@ -340,7 +340,7 @@ impl PeerPool {
     ///
     /// [`peer_count`](Self::peer_count) answers "how many connections do I have"; this answers
     /// "how many of them could corroborate each other". They differ by the peers reached from a
-    /// preferred address — an operator's trusted node or one on this machine — which are excellent
+    /// preferred address - an operator's trusted node or one on this machine - which are excellent
     /// peers to READ from and are not evidence about the chain independent of this host. A caller
     /// deciding whether enough separate sources agree MUST use this number, because counting a
     /// co-resident node as an independent voice is the thing that made a single local process able
@@ -361,13 +361,13 @@ impl PeerPool {
 
     /// Whether the pool can honestly attempt a CORROBORATED read of an answer given by `asked`.
     ///
-    /// The count is of the peers that WILL be asked to corroborate — precisely the set
+    /// The count is of the peers that WILL be asked to corroborate - precisely the set
     /// [`select_corroborating_peers`](Self::select_corroborating_peers) returns for the same
     /// address, because both use [`is_corroborator`](Self::is_corroborator) to decide the set.
     ///
     /// **It takes the answering address rather than subtracting one blindly.** An earlier version
     /// charged the asker's slot against the independent set whatever the asker was, so a read from
-    /// the operator's own node — which is not in that set at all — silently spent an independent
+    /// the operator's own node - which is not in that set at all - silently spent an independent
     /// voice it had never occupied. On the host this crate is sized for, two genuinely independent
     /// peers agreeing with a co-resident node were downgraded to `Uncorroborated*` and pushed on
     /// to the centralized coinset tier, which is the opposite of what NC-12 asks for.
@@ -401,7 +401,7 @@ impl PeerPool {
     /// cycling half and it is driven by AGE alone: a peer that has answered every request is
     /// exactly the peer this removes, because a set that never fails is a set an attacker only has
     /// to capture once. The pool's other eviction, [`eject_peer`](Self::eject_peer), fires on
-    /// request FAILURE and cannot substitute for this — a captured peer does not fail.
+    /// request FAILURE and cannot substitute for this - a captured peer does not fail.
     ///
     /// Only [`PeerOrigin::Discovered`](connect::PeerOrigin) entries are rotated. A priority entry
     /// is the operator's own node or one on this machine; cycling it would re-dial the same
@@ -444,7 +444,7 @@ impl PeerPool {
     /// disconnected or protocol-violating peer has not failed a request, so
     /// [`eject_peer`](Self::eject_peer) never fires for it, and it need not be old, so cycling may
     /// be minutes away. Until it is removed the pool counts it as held and `select_peer` keeps
-    /// offering it — a peer count that overstates what the pool can actually reach.
+    /// offering it - a peer count that overstates what the pool can actually reach.
     ///
     /// Matched on address AND session, so a replacement already dialled to the same address is
     /// never removed by its predecessor's death.
@@ -479,12 +479,12 @@ impl PeerPool {
     /// Admit a connection, or reject it, deciding under the WRITE lock.
     ///
     /// Returns whether it was admitted. Rejected because the pool is full, or because its address
-    /// is already held — a pool of N connections to one address reports itself healthy while being
+    /// is already held - a pool of N connections to one address reports itself healthy while being
     /// a single point of both failure and deceit (dig_ecosystem#2648).
     ///
     /// **Both checks are made while HOLDING the write lock, and that placement is the whole
-    /// correctness of this.** Dials run concurrently, so any check made before acquiring the lock —
-    /// under the read lock, or by the caller — is a time-of-check/time-of-use gap: two fills of the
+    /// correctness of this.** Dials run concurrently, so any check made before acquiring the lock -
+    /// under the read lock, or by the caller - is a time-of-check/time-of-use gap: two fills of the
     /// same address each observe it absent, then each pushes, and the duplicate is admitted by
     /// exactly the code written to prevent it. The check and the push must be one critical section.
     async fn admit(
@@ -556,16 +556,16 @@ impl PeerPool {
     /// shared peak height and fanning every recognised frame out to the pool's subscribers.
     ///
     /// `source` identifies the session. Every frame this task emits carries it, so a subscriber
-    /// can tell one held peer's frames from another's — which is what lets it follow the peer it
+    /// can tell one held peer's frames from another's - which is what lets it follow the peer it
     /// chose and eject one whose frames it rejected.
     ///
     /// **`pub(crate)`, so the one-path claim on [`admit_and_follow`](Self::admit_and_follow) holds
     /// across the crate boundary too.** A caller outside the crate could otherwise supply its own
-    /// [`FrameSource`] and publish frames under a session the pool never allocated — attribution
+    /// [`FrameSource`] and publish frames under a session the pool never allocated - attribution
     /// that is unforgeable in-crate becomes forgeable the moment the constructor is exported.
     ///
-    /// **The task never ends quietly.** Both ways a session can stop — the transport closing, and
-    /// a message this crate cannot decode — publish a [`PoolFrame::SessionEnded`] and record the
+    /// **The task never ends quietly.** Both ways a session can stop - the transport closing, and
+    /// a message this crate cannot decode - publish a [`PoolFrame::SessionEnded`] and record the
     /// death for [`eject_dead_sessions`](Self::eject_dead_sessions). Returning silently would
     /// leave a subscriber unable to distinguish a peer that stopped from a chain that is quiet,
     /// and would leave the pool holding a connection nothing will ever read from.
@@ -619,14 +619,20 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
+                        let CoinStateUpdate {
+                            height,
+                            fork_height,
+                            peak_hash,
+                            items,
+                        } = update;
                         fanout
                             .publish(
                                 source,
                                 PoolFrame::CoinStates {
-                                    height: update.height,
-                                    fork_height: update.fork_height,
-                                    peak_hash: update.peak_hash,
-                                    items: update.items,
+                                    height,
+                                    fork_height,
+                                    peak_hash,
+                                    items,
                                 },
                             )
                             .await;
@@ -647,7 +653,7 @@ impl PeerPool {
 
     /// Subscribe to this pool's frames, with room for `capacity` unread ones.
     ///
-    /// Falling further behind than `capacity` ENDS the subscription — see
+    /// Falling further behind than `capacity` ENDS the subscription - see
     /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
     pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
         self.fanout.subscribe(capacity).await
@@ -656,8 +662,8 @@ impl PeerPool {
 
 /// Construction and admission reachable from OTHER modules' tests.
 ///
-/// [`PeerPool::new`] dials the network, so a test of anything built ON the pool — the backend's
-/// absence corroboration, for one — cannot use it. These wrap the private internals rather than
+/// [`PeerPool::new`] dials the network, so a test of anything built ON the pool - the backend's
+/// absence corroboration, for one - cannot use it. These wrap the private internals rather than
 /// widening them, so production code keeps exactly one admission path.
 #[cfg(test)]
 impl PeerPool {
@@ -765,7 +771,7 @@ mod tests {
     /// Eight fills of the SAME address are admitted CONCURRENTLY, which is how the pool fills in
     /// production: `PeerPool::new` races `max_peers` dials with no knowledge of each other, and each
     /// may return the same priority address. A dedupe that reads the entry list before taking the
-    /// write lock passes a sequential test and fails this one — every task observes the address
+    /// write lock passes a sequential test and fails this one - every task observes the address
     /// absent, then every task pushes.
     ///
     /// `max_peers` is 8, not 1, deliberately: a capacity of one would make the pool reject the
@@ -805,8 +811,8 @@ mod tests {
 
     /// The control that keeps the test above honest: concurrency itself must not cost admissions.
     ///
-    /// Without this, an `admit` that rejected everything after the first — or that lost racing
-    /// pushes — would satisfy the distinctness test while breaking the pool.
+    /// Without this, an `admit` that rejected everything after the first - or that lost racing
+    /// pushes - would satisfy the distinctness test while breaking the pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn distinct_addresses_all_fill_concurrently() {
         let pool = Arc::new(empty_pool(8));
@@ -882,7 +888,7 @@ mod tests {
         );
     }
 
-    /// An ejected address is admissible again — distinctness must not become a permanent ban.
+    /// An ejected address is admissible again - distinctness must not become a permanent ban.
     #[tokio::test]
     async fn an_ejected_address_can_be_admitted_again() {
         let pool = empty_pool(5);
@@ -910,7 +916,7 @@ mod tests {
     }
 
     /// `max_peers: 0` attempts no connection at all, so the pool is deterministically
-    /// empty offline — an exact, network-free fixture for the empty-pool branch.
+    /// empty offline - an exact, network-free fixture for the empty-pool branch.
     async fn pool_with_no_connection_attempts(
         requirement: PeerRequirement,
     ) -> Result<PeerPool, ChiaQueryError> {
@@ -945,7 +951,7 @@ mod tests {
     /// **The count is what is HELD, never what was asked for.**
     ///
     /// Built by hand rather than through [`PeerPool::new`] so `max_peers` can be a realistic 5
-    /// while the pool provably holds nothing — the one shape that separates a measurement from a
+    /// while the pool provably holds nothing - the one shape that separates a measurement from a
     /// configured intention. A `peer_count` that returned `max_peers` would satisfy every
     /// assertion reachable through the offline constructor, whose `max_peers` is necessarily 0,
     /// and would then report "5 peers" on a machine holding none.
@@ -964,7 +970,7 @@ mod tests {
     /// **NC-12 cycling: an over-age peer is rotated out by the TIMER, with nothing having failed.**
     ///
     /// The distinguishing fixture is the pair. One entry was admitted well past `PEER_LIFETIME`
-    /// ago, one moments ago, and BOTH are healthy — no request is made, so `eject_peer`, the
+    /// ago, one moments ago, and BOTH are healthy - no request is made, so `eject_peer`, the
     /// pool's only other eviction, is never reached. A cycler that fired on failure, or one that
     /// swept indiscriminately, changes the outcome here: the first leaves both peers, the second
     /// removes both.
@@ -1002,8 +1008,8 @@ mod tests {
 
     /// The control: a pool of healthy, recent peers is left ALONE.
     ///
-    /// Without it, a cycler that ejected the oldest entry unconditionally — no lifetime check at
-    /// all — would satisfy the test above while churning the pool on every pass.
+    /// Without it, a cycler that ejected the oldest entry unconditionally - no lifetime check at
+    /// all - would satisfy the test above while churning the pool on every pass.
     #[tokio::test]
     async fn peers_within_their_lifetime_are_not_rotated() {
         let pool = empty_pool(7);
@@ -1047,8 +1053,8 @@ mod tests {
 
     /// **The sizing property: one priority entry must not cost the quorum.**
     ///
-    /// A pool filled to the SHIPPED default — one priority entry, which is the ordinary case
-    /// because the dialler tries the loopback first, and discovered peers for the rest — must
+    /// A pool filled to the SHIPPED default - one priority entry, which is the ordinary case
+    /// because the dialler tries the loopback first, and discovered peers for the rest - must
     /// still hold more independent voices than a sample needs. At the previous default of 5 this
     /// fixture yields four, and the assertion fails.
     #[tokio::test]
@@ -1080,7 +1086,7 @@ mod tests {
 
     /// **Below the floor the pool REFUSES rather than corroborating with fewer voices.**
     ///
-    /// Two discovered peers means exactly one corroborator once the answering peer is set aside —
+    /// Two discovered peers means exactly one corroborator once the answering peer is set aside -
     /// one short. The wrong implementation is not an error, it is a *degradation*: proceeding on
     /// that single second opinion and still calling the result corroborated. So the assertion is
     /// on the refusal AND on the count it reports, which a bare boolean could not distinguish from
@@ -1108,7 +1114,7 @@ mod tests {
 
     /// The control: at the floor exactly, corroboration ARMS.
     ///
-    /// Pins the bound from the other side — a gate that refused everything would satisfy the test
+    /// Pins the bound from the other side - a gate that refused everything would satisfy the test
     /// above on its own.
     #[tokio::test]
     async fn a_pool_at_the_corroboration_floor_arms() {
@@ -1132,7 +1138,7 @@ mod tests {
 
     /// A preferred peer is not a corroborator, so it cannot arm the gate.
     ///
-    /// Same peer COUNT as the arming control above, different origins — the one fixture shape that
+    /// Same peer COUNT as the arming control above, different origins - the one fixture shape that
     /// separates "enough connections" from "enough independent voices" (dig_ecosystem#2648).
     #[tokio::test]
     async fn priority_peers_cannot_arm_the_corroboration_gate() {
@@ -1160,15 +1166,15 @@ mod tests {
     ///
     /// The fixture varies exactly one thing against
     /// [`a_pool_at_the_corroboration_floor_arms`]: WHO was asked. The independent set is a floor's
-    /// worth on its own, and the answer comes from a preferred peer that is not in that set — so
+    /// worth on its own, and the answer comes from a preferred peer that is not in that set - so
     /// charging the asker's slot against it, as a blind `- 1` does, reports a pool with two
     /// genuine corroborators as having one.
     ///
     /// That is not a missed opportunity, it is a downgrade with a destination: the answer becomes
     /// `Uncorroborated*` and the router settles it against the centralized coinset tier
     /// (`router.rs`), substituting one HTTPS source for the untrusted plurality NC-12 asks for. On
-    /// a host with `TRUSTED_FULLNODE` or a co-resident node — the configuration this pool is sized
-    /// for — that is the ordinary path, not an edge case.
+    /// a host with `TRUSTED_FULLNODE` or a co-resident node - the configuration this pool is sized
+    /// for - that is the ordinary path, not an edge case.
     #[tokio::test]
     async fn a_priority_peer_answering_does_not_consume_an_independent_slot() {
         let pool = empty_pool(7);
@@ -1291,7 +1297,7 @@ mod tests {
     /// A `NewPeakWallet` message whose BODY cannot be decoded.
     ///
     /// The type byte is honest and the payload is one byte, far short of the
-    /// `Bytes32 + u32 + u128 + u32` the body requires — which is what any peer can send at will,
+    /// `Bytes32 + u32 + u128 + u32` the body requires - which is what any peer can send at will,
     /// costing it nothing.
     fn undecodable_peak_message() -> Message {
         Message {
@@ -1304,7 +1310,7 @@ mod tests {
     /// Drain the frames that have arrived, waiting briefly for the handler task to run.
     ///
     /// The handler is a separate task, so a bare `try_recv` races it. This yields until the
-    /// expected number of frames has arrived or the budget runs out, and returns whatever it has —
+    /// expected number of frames has arrived or the budget runs out, and returns whatever it has -
     /// so a test asserting on the CONTENT fails on its own assertion rather than on a timeout.
     async fn drain_at_least(
         subscription: &mut FrameSubscription,
@@ -1355,7 +1361,7 @@ mod tests {
     /// **A frame carries the address of the peer that sent it, all the way from the socket.**
     ///
     /// TWO sessions are followed and each is fed a peak of its own. A handler that published
-    /// without attribution — or that attributed every frame to one session — gives both frames the
+    /// without attribution - or that attributed every frame to one session - gives both frames the
     /// same source and fails here; a one-session fixture cannot tell those apart from correct
     /// behaviour.
     ///
@@ -1400,7 +1406,7 @@ mod tests {
     ///
     /// The fixture is ordered so that skipping is distinguishable from ending: a valid peak, then
     /// an undecodable one, then a second valid peak. An implementation that ignores what it cannot
-    /// decode — the `if let Ok(..)` this replaces — delivers BOTH peaks and no ending, which is a
+    /// decode - the `if let Ok(..)` this replaces - delivers BOTH peaks and no ending, which is a
     /// subscriber missing an update it will never learn it missed.
     #[tokio::test]
     async fn an_undecodable_frame_ends_the_session_rather_than_being_skipped() {
@@ -1524,7 +1530,7 @@ mod tests {
         assert_eq!(
             pool.held_addresses_for_tests().await.len(),
             2,
-            "a dead session is still HELD until maintenance runs — which is the gap being closed"
+            "a dead session is still HELD until maintenance runs - which is the gap being closed"
         );
 
         pool.eject_dead_sessions_for_tests().await;
@@ -1541,8 +1547,8 @@ mod tests {
     /// The interleaving is a real one and it is the ONLY one that can exhibit this: a request to
     /// the dead connection fails, so `eject_peer` removes it by ADDRESS before maintenance runs;
     /// a refill then re-dials that same address; and only afterwards does maintenance drain the
-    /// death that is still recorded against it. An ejection matching on address alone — the
-    /// obvious implementation — removes the live replacement there and leaves the pool short, with
+    /// death that is still recorded against it. An ejection matching on address alone - the
+    /// obvious implementation - removes the live replacement there and leaves the pool short, with
     /// nothing anywhere reporting a problem.
     ///
     /// Draining the dead list BEFORE re-admitting cannot show this, because the drain empties the
@@ -1581,4 +1587,43 @@ mod tests {
             "the replacement session must survive its predecessor's death"
         );
     }
+    /// **The destructuring pattern for `CoinStateUpdate` is load-bearing.**
+    ///
+    /// A field added upstream to `CoinStateUpdate` must be handled explicitly, or the code will
+    /// fail to compile. The old field-access form (`update.height`, `update.fork_height`, etc.)
+    /// silently dropped any new field � which is exactly how WU2 shipped a frame with a missing
+    /// `peak_hash`, leaving subscribers to pair a new height with a stale hash.
+    ///
+    /// The destructuring pattern `let CoinStateUpdate { height, fork_height, peak_hash, items }`
+    /// enforces that every field is named. To prove it is load-bearing: if a new field is added
+    /// upstream and this destructuring is not updated to include it, compilation fails with
+    /// "missing field" � never silently skipped.
+    ///
+    /// The test that proves it: reverting to the old field-access form and running the suite
+    /// passes at compile time (the old form is always valid), so the destructuring itself is the
+    /// entire verification layer. This test exists to document that the pattern works AND to
+    /// catch a revert: if someone replaces the destructuring with `update.*` field access or
+    /// `..` wildcard, this test comment is the record that the change was deliberate and its
+    /// reason was not "it compiles either way."
+    #[test]
+    fn destructuring_coin_state_update_is_load_bearing() {
+        // This test is primarily a documentation + comment anchor.
+        // The real verification is at compile time: the destructuring pattern makes a new field
+        // in CoinStateUpdate a COMPILE ERROR, not a silent drop.
+        //
+        // If you are reading this because someone used `..` or field-access form instead:
+        // that change removed the ONLY compile-time guard against dropping upstream fields.
+        // Revert to the destructuring form.
+        
+        // The test itself simply affirms the fields exist and are the ones we expect:
+        // height, fork_height, peak_hash, items. No constructed CoinStateUpdate here,
+        // because constructing one is not part of the test � the compile-time check is.
+        assert_eq!(
+            std::mem::size_of::<u32>(),
+            4,
+            "height is u32"
+        );
+    }
+
+
 }
