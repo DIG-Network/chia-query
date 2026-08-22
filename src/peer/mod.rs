@@ -2,6 +2,7 @@ pub mod block;
 pub mod connect;
 pub mod frames;
 pub mod ordering;
+pub mod plurality;
 pub mod pool;
 pub mod translate;
 

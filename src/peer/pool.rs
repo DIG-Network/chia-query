@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chia_protocol::{CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes};
 use chia_traits::Streamable;
@@ -16,6 +16,7 @@ use crate::NetworkType;
 
 use super::connect;
 use super::frames::{FrameFanout, FrameSubscription, Generation, PoolFrame};
+use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME};
 
 // ---------------------------------------------------------------------------
 // Pool entry
@@ -27,6 +28,12 @@ struct PeerEntry {
     /// How this peer was reached. Held so a caller counting independent opinions can tell a
     /// preferred local node from a discovered one — see [`connect::PeerOrigin`].
     origin: connect::PeerOrigin,
+    /// When this connection entered the pool, so it can be rotated out on a TIMER.
+    ///
+    /// The pool's other eviction is failure-driven, and failure is not the risk this guards: a set
+    /// of peers that all keep answering is exactly the set an attacker only has to capture once
+    /// (NC-12). Age is the only signal that separates the two.
+    admitted_at: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +56,22 @@ pub enum PeerRequirement {
 // ---------------------------------------------------------------------------
 // PeerPool
 // ---------------------------------------------------------------------------
+
+/// Whether the pool holds enough independent voices for a corroborated read.
+///
+/// A two-variant answer rather than a bare count, so a caller cannot accidentally proceed with
+/// "some" corroboration: the insufficient case names what it has AND what it needed, which is the
+/// information a log line or a user-facing message actually requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorroborationReadiness {
+    /// Enough independent peers, besides the one answering, to corroborate.
+    Armed { corroborators: usize },
+    /// Too few. The read must be REFUSED, never attempted with fewer voices.
+    Insufficient {
+        corroborators: usize,
+        required: usize,
+    },
+}
 
 pub struct PeerPool {
     entries: RwLock<Vec<PeerEntry>>,
@@ -249,6 +272,71 @@ impl PeerPool {
             .count()
     }
 
+    /// Whether the pool can honestly attempt a CORROBORATED read right now.
+    ///
+    /// The peer that answered cannot corroborate itself, so the question is whether
+    /// [`CORROBORATION_FLOOR`] OTHER independent peers are held — hence the `- 1`.
+    ///
+    /// **This refuses; it never degrades.** Corroborating against however many peers happen to be
+    /// present turns a four-voice quorum into a two-voice one that still reports itself
+    /// corroborated, and no consumer downstream can tell those apart. A caller handed
+    /// [`CorroborationReadiness::Insufficient`] must decline the read, not proceed with fewer
+    /// voices.
+    pub async fn corroboration_readiness(&self) -> CorroborationReadiness {
+        let independent = self.independent_peer_count().await;
+        let corroborators = independent.saturating_sub(1);
+        if corroborators >= CORROBORATION_FLOOR {
+            CorroborationReadiness::Armed { corroborators }
+        } else {
+            CorroborationReadiness::Insufficient {
+                corroborators,
+                required: CORROBORATION_FLOOR,
+            }
+        }
+    }
+
+    /// Rotate out the OLDEST discovered peer that has outlived [`PEER_LIFETIME`], if any.
+    ///
+    /// Returns the address ejected, so a caller can log or refill deliberately. This is NC-12's
+    /// cycling half and it is driven by AGE alone: a peer that has answered every request is
+    /// exactly the peer this removes, because a set that never fails is a set an attacker only has
+    /// to capture once. The pool's other eviction, [`eject_peer`](Self::eject_peer), fires on
+    /// request FAILURE and cannot substitute for this — a captured peer does not fail.
+    ///
+    /// Only [`PeerOrigin::Discovered`](connect::PeerOrigin) entries are rotated. A priority entry
+    /// is the operator's own node or one on this machine; cycling it would re-dial the same
+    /// address, spending a handshake to change nothing.
+    ///
+    /// One per call, so cycling can never empty the pool in a single sweep.
+    pub async fn cycle_expired_peers(&self) -> Option<SocketAddr> {
+        let mut entries = self.entries.write().await;
+        let now = Instant::now();
+
+        let oldest = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.origin == connect::PeerOrigin::Discovered
+                    && now.duration_since(e.admitted_at) >= PEER_LIFETIME
+            })
+            .min_by_key(|(_, e)| e.admitted_at)
+            .map(|(idx, e)| (idx, e.address));
+
+        let (idx, address) = oldest?;
+        entries.remove(idx);
+        log::debug!("peer {address} rotated out after {PEER_LIFETIME:?} (NC-12 cycling)");
+        Some(address)
+    }
+
+    /// One maintenance pass: rotate out an over-age peer, then refill toward capacity.
+    ///
+    /// Cycling before refilling is deliberate. Refilling first would find the pool at capacity and
+    /// do nothing, so the rotation would leave a permanently smaller pool.
+    pub async fn maintain(&self) {
+        self.cycle_expired_peers().await;
+        self.try_refill().await;
+    }
+
     /// Admit a connection, or reject it, deciding under the WRITE lock.
     ///
     /// Returns whether it was admitted. Rejected because the pool is full, or because its address
@@ -276,6 +364,7 @@ impl PeerPool {
             peer,
             address,
             origin,
+            admitted_at: Instant::now(),
         });
         log::debug!("peer admitted: {address} ({origin:?})");
         true
@@ -412,12 +501,45 @@ impl PeerPool {
     ) -> bool {
         self.admit(peer, address, origin).await
     }
+
+    /// The addresses currently held, in pool order.
+    pub(crate) async fn held_addresses_for_tests(&self) -> Vec<SocketAddr> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .map(|e| e.address)
+            .collect()
+    }
+
+    /// Admit a connection as if it had entered the pool at `admitted_at`.
+    ///
+    /// Age is otherwise only reachable by waiting, and a test that waits five minutes is a test
+    /// nobody runs. Wrapping the private field rather than widening it keeps production code on
+    /// exactly one admission path.
+    pub(crate) async fn admit_at_for_tests(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        origin: connect::PeerOrigin,
+        admitted_at: Instant,
+    ) -> bool {
+        if !self.admit(peer, address, origin).await {
+            return false;
+        }
+        let mut entries = self.entries.write().await;
+        if let Some(entry) = entries.iter_mut().find(|e| e.address == address) {
+            entry.admitted_at = admitted_at;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::peer::connect::{create_generated_tls, PeerOrigin};
+    use crate::peer::plurality::{default_max_peers, QUORUM_SAMPLE};
     use crate::peer::test_support::{address, loopback_peer};
 
     use super::PeerPool as _Pool;
@@ -616,5 +738,200 @@ mod tests {
             "held is 0 while the target is 5"
         );
         assert!(!pool.has_peers().await);
+    }
+
+    /// **NC-12 cycling: an over-age peer is rotated out by the TIMER, with nothing having failed.**
+    ///
+    /// The distinguishing fixture is the pair. One entry was admitted well past `PEER_LIFETIME`
+    /// ago, one moments ago, and BOTH are healthy — no request is made, so `eject_peer`, the
+    /// pool's only other eviction, is never reached. A cycler that fired on failure, or one that
+    /// swept indiscriminately, changes the outcome here: the first leaves both peers, the second
+    /// removes both.
+    #[tokio::test]
+    async fn an_over_age_peer_is_rotated_out_with_no_request_having_failed() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        let stale = address(1);
+        let fresh = address(2);
+        let long_past = Instant::now() - (PEER_LIFETIME + Duration::from_secs(100));
+
+        assert!(
+            pool.admit_at_for_tests(peer.clone(), stale, PeerOrigin::Discovered, long_past)
+                .await
+        );
+        assert!(
+            pool.admit_at_for_tests(peer, fresh, PeerOrigin::Discovered, Instant::now())
+                .await
+        );
+
+        let rotated = pool.cycle_expired_peers().await;
+
+        assert_eq!(
+            rotated,
+            Some(stale),
+            "the peer past its lifetime must be rotated out on age alone"
+        );
+        assert_eq!(
+            pool.held_addresses_for_tests().await,
+            vec![fresh],
+            "cycling must remove the over-age peer and keep the fresh one"
+        );
+    }
+
+    /// The control: a pool of healthy, recent peers is left ALONE.
+    ///
+    /// Without it, a cycler that ejected the oldest entry unconditionally — no lifetime check at
+    /// all — would satisfy the test above while churning the pool on every pass.
+    #[tokio::test]
+    async fn peers_within_their_lifetime_are_not_rotated() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        for octet in 1..=3u8 {
+            assert!(
+                pool.admit_at_for_tests(
+                    peer.clone(),
+                    address(octet),
+                    PeerOrigin::Discovered,
+                    Instant::now() - (PEER_LIFETIME - Duration::from_secs(30)),
+                )
+                .await
+            );
+        }
+
+        assert_eq!(
+            pool.cycle_expired_peers().await,
+            None,
+            "a peer inside its lifetime must not be rotated"
+        );
+        assert_eq!(pool.peer_count().await, 3);
+    }
+
+    /// A priority entry is not rotated: cycling it would re-dial the same address.
+    #[tokio::test]
+    async fn an_over_age_priority_peer_is_not_rotated() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+        let long_past = Instant::now() - (PEER_LIFETIME + Duration::from_secs(100));
+
+        assert!(
+            pool.admit_at_for_tests(peer, address(1), PeerOrigin::Priority, long_past)
+                .await
+        );
+
+        assert_eq!(pool.cycle_expired_peers().await, None);
+        assert_eq!(pool.peer_count().await, 1);
+    }
+
+    /// **The sizing property: one priority entry must not cost the quorum.**
+    ///
+    /// A pool filled to the SHIPPED default — one priority entry, which is the ordinary case
+    /// because the dialler tries the loopback first, and discovered peers for the rest — must
+    /// still hold more independent voices than a sample needs. At the previous default of 5 this
+    /// fixture yields four, and the assertion fails.
+    #[tokio::test]
+    async fn one_priority_entry_does_not_cost_the_quorum() {
+        let pool = empty_pool(default_max_peers());
+        let peer = loopback_peer().await;
+
+        assert!(
+            pool.admit(peer.clone(), address(1), PeerOrigin::Priority)
+                .await
+        );
+        for octet in 2..=(default_max_peers() as u8) {
+            assert!(
+                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        assert_eq!(pool.peer_count().await, default_max_peers());
+        // A whole sample, plus the one session a subscriber is following and which therefore
+        // cannot corroborate itself.
+        let owed = QUORUM_SAMPLE + 1;
+        let independent = pool.independent_peer_count().await;
+        assert!(
+            independent >= owed,
+            "a full pool holding one priority entry still owes a whole sample plus the session being followed; it holds {independent}"
+        );
+    }
+
+    /// **Below the floor the pool REFUSES rather than corroborating with fewer voices.**
+    ///
+    /// Two discovered peers means exactly one corroborator once the answering peer is set aside —
+    /// one short. The wrong implementation is not an error, it is a *degradation*: proceeding on
+    /// that single second opinion and still calling the result corroborated. So the assertion is
+    /// on the refusal AND on the count it reports, which a bare boolean could not distinguish from
+    /// an empty pool.
+    #[tokio::test]
+    async fn a_pool_below_the_corroboration_floor_refuses_rather_than_degrading() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        for octet in 1..=2u8 {
+            assert!(
+                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        assert_eq!(
+            pool.corroboration_readiness().await,
+            CorroborationReadiness::Insufficient {
+                corroborators: 1,
+                required: CORROBORATION_FLOOR,
+            }
+        );
+    }
+
+    /// The control: at the floor exactly, corroboration ARMS.
+    ///
+    /// Pins the bound from the other side — a gate that refused everything would satisfy the test
+    /// above on its own.
+    #[tokio::test]
+    async fn a_pool_at_the_corroboration_floor_arms() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        for octet in 1..=(CORROBORATION_FLOOR as u8 + 1) {
+            assert!(
+                pool.admit(peer.clone(), address(octet), PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        assert_eq!(
+            pool.corroboration_readiness().await,
+            CorroborationReadiness::Armed {
+                corroborators: CORROBORATION_FLOOR
+            }
+        );
+    }
+
+    /// A preferred peer is not a corroborator, so it cannot arm the gate.
+    ///
+    /// Same peer COUNT as the arming control above, different origins — the one fixture shape that
+    /// separates "enough connections" from "enough independent voices" (dig_ecosystem#2648).
+    #[tokio::test]
+    async fn priority_peers_cannot_arm_the_corroboration_gate() {
+        let pool = empty_pool(7);
+        let peer = loopback_peer().await;
+
+        assert!(
+            pool.admit(peer.clone(), address(1), PeerOrigin::Discovered)
+                .await
+        );
+        for octet in 2..=(CORROBORATION_FLOOR as u8 + 1) {
+            assert!(
+                pool.admit(peer.clone(), address(octet), PeerOrigin::Priority)
+                    .await
+            );
+        }
+
+        assert!(matches!(
+            pool.corroboration_readiness().await,
+            CorroborationReadiness::Insufficient { .. }
+        ));
     }
 }

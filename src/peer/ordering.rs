@@ -69,7 +69,10 @@ mod tests {
     }
 
     fn v6(seg: u16) -> SocketAddr {
-        SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, seg).into(), 8444)
+        SocketAddr::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, seg).into(),
+            8444,
+        )
     }
 
     /// §5.2: every IPv6 candidate is dialled before any IPv4 one.
