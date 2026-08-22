@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chia_protocol::{Message, NewPeakWallet, ProtocolMessageTypes};
+use chia_protocol::{CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes};
 use chia_traits::Streamable;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, RwLock};
@@ -15,6 +15,7 @@ use crate::types::ChiaQueryError;
 use crate::NetworkType;
 
 use super::connect;
+use super::frames::{FrameFanout, FrameSubscription, Generation, PoolFrame};
 
 // ---------------------------------------------------------------------------
 // Pool entry
@@ -59,6 +60,12 @@ pub struct PeerPool {
     /// Latest peak height observed from any connected peer's NewPeakWallet
     /// messages.  Updated in the background by receiver handler tasks.
     peak_height: Arc<AtomicU32>,
+    /// Fans every inbound frame out to the pool's subscribers.
+    ///
+    /// The atomic above answers "how high is the chain"; this carries the frames THEMSELVES, which
+    /// is what a consumer following coin states needs and what its absence forced into a second
+    /// dialled session (dig_ecosystem#2761).
+    fanout: Arc<FrameFanout>,
 }
 
 impl PeerPool {
@@ -100,6 +107,7 @@ impl PeerPool {
             network,
             connect_timeout,
             peak_height,
+            fanout: Arc::new(FrameFanout::new()),
         };
 
         // Every connection enters through `admit`, including these, so the distinctness invariant
@@ -111,7 +119,7 @@ impl PeerPool {
         // construction so the `peak_height` Arc exists.
         for (peer, addr, receiver, origin) in connected {
             if pool.admit(peer, addr, origin).await {
-                pool.spawn_receiver_handler(receiver);
+                pool.spawn_receiver_handler(pool.fanout.generation(), receiver);
             }
         }
 
@@ -298,7 +306,11 @@ impl PeerPool {
         {
             Ok((peer, addr, receiver, origin)) => {
                 if self.admit(peer, addr, origin).await {
-                    self.spawn_receiver_handler(receiver);
+                    // A replacement session is a RECONNECT: bump the generation and announce it
+                    // BEFORE the new session can publish anything, so a subscriber never has to
+                    // infer a discontinuity from the frames themselves.
+                    let generation = self.fanout.begin_generation().await;
+                    self.spawn_receiver_handler(generation, receiver);
                     log::debug!("replacement peer connected: {addr}");
                 }
             }
@@ -310,23 +322,65 @@ impl PeerPool {
     // Receiver helpers (handle NewPeakWallet from peers)
     // -----------------------------------------------------------------------
 
-    /// Spawn a background task that reads inbound messages from a peer's
-    /// receiver channel and updates the shared peak height.  This mirrors
-    /// the pattern used by chia-block-listener.
-    pub fn spawn_receiver_handler(&self, mut receiver: mpsc::Receiver<Message>) {
+    /// Spawn a background task that reads inbound messages from one peer session, updating the
+    /// shared peak height and fanning every recognised frame out to the pool's subscribers.
+    ///
+    /// `generation` identifies the session. Every frame this task emits carries it, so a
+    /// subscriber can tell frames of a replaced session from frames of the current one.
+    pub fn spawn_receiver_handler(
+        &self,
+        generation: Generation,
+        mut receiver: mpsc::Receiver<Message>,
+    ) {
         let peak = Arc::clone(&self.peak_height);
+        let fanout = Arc::clone(&self.fanout);
         tokio::spawn(async move {
             while let Some(msg) = receiver.recv().await {
-                if msg.msg_type == ProtocolMessageTypes::NewPeakWallet {
-                    if let Ok(new_peak) = NewPeakWallet::from_bytes(&msg.data) {
-                        let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
-                        if new_peak.height > prev {
-                            log::debug!("new peak from peer: {}", new_peak.height);
+                match msg.msg_type {
+                    ProtocolMessageTypes::NewPeakWallet => {
+                        if let Ok(new_peak) = NewPeakWallet::from_bytes(&msg.data) {
+                            let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
+                            if new_peak.height > prev {
+                                log::debug!("new peak from peer: {}", new_peak.height);
+                            }
+                            fanout
+                                .publish(PoolFrame::Peak {
+                                    generation,
+                                    height: new_peak.height,
+                                    header_hash: new_peak.header_hash,
+                                })
+                                .await;
                         }
                     }
+                    ProtocolMessageTypes::CoinStateUpdate => {
+                        if let Ok(update) = CoinStateUpdate::from_bytes(&msg.data) {
+                            fanout
+                                .publish(PoolFrame::CoinStates {
+                                    generation,
+                                    height: update.height,
+                                    fork_height: update.fork_height,
+                                    items: update.items,
+                                })
+                                .await;
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
+    }
+
+    /// Subscribe to this pool's frames, with room for `capacity` unread ones.
+    ///
+    /// Falling further behind than `capacity` ENDS the subscription — see
+    /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
+    pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
+        self.fanout.subscribe(capacity).await
+    }
+
+    /// The generation frames are currently tagged with.
+    pub fn frame_generation(&self) -> Generation {
+        self.fanout.generation()
     }
 }
 
@@ -346,6 +400,7 @@ impl PeerPool {
             network: NetworkType::Mainnet,
             connect_timeout: Duration::from_millis(1),
             peak_height: Arc::new(AtomicU32::new(0)),
+            fanout: Arc::new(FrameFanout::new()),
         }
     }
 
