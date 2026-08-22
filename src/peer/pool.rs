@@ -1369,9 +1369,16 @@ mod tests {
 
     /// A replacement dialled to the same address is not removed by its predecessor's death.
     ///
-    /// The dead session's address is re-admitted under a NEW session before maintenance runs, so
-    /// an ejection matching on ADDRESS alone — the obvious implementation — removes the live
-    /// replacement and leaves the pool short. Matching on the session too is what this pins.
+    /// The interleaving is a real one and it is the ONLY one that can exhibit this: a request to
+    /// the dead connection fails, so `eject_peer` removes it by ADDRESS before maintenance runs;
+    /// a refill then re-dials that same address; and only afterwards does maintenance drain the
+    /// death that is still recorded against it. An ejection matching on address alone — the
+    /// obvious implementation — removes the live replacement there and leaves the pool short, with
+    /// nothing anywhere reporting a problem.
+    ///
+    /// Draining the dead list BEFORE re-admitting cannot show this, because the drain empties the
+    /// list and the second pass then has nothing to match with. That ordering was this test's
+    /// first shape and it passed against address-only matching, which is to say it proved nothing.
     #[tokio::test]
     async fn a_replacement_at_the_same_address_survives_its_predecessors_death() {
         let pool = empty_pool(4);
@@ -1388,13 +1395,15 @@ mod tests {
             "the fixture depends on the session actually ending: {seen:?}"
         );
 
-        // The replacement takes the same address under a fresh session, exactly as a re-dial
-        // would once the dead entry is gone.
-        pool.eject_dead_sessions_for_tests().await;
+        // A request to the dead connection fails first, which is how it leaves `entries` while its
+        // death is still recorded.
+        pool.eject_peer(address(1)).await;
+        assert!(pool.held_addresses_for_tests().await.is_empty());
+
         let (_replacement, replacement_source) = followed_session(&pool, address(1)).await;
         assert_ne!(replacement_source.session, dying_source.session);
 
-        // A second pass must not take the replacement with it.
+        // Maintenance now drains a death recorded against an address the replacement holds.
         pool.eject_dead_sessions_for_tests().await;
 
         assert_eq!(
