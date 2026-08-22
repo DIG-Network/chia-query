@@ -1,5 +1,6 @@
 pub mod block;
 pub mod connect;
+pub mod ordering;
 pub mod pool;
 pub mod translate;
 

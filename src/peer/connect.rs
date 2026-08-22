@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use rand::seq::SliceRandom;
 
 use chia_ssl::ChiaCertificate;
 use chia_wallet_sdk::client::{
@@ -14,6 +13,7 @@ use tokio_tungstenite::Connector;
 use chia_protocol::Message;
 use tokio::sync::mpsc;
 
+use super::ordering;
 use crate::types::ChiaQueryError;
 use crate::NetworkType;
 
@@ -158,15 +158,15 @@ pub async fn connect_random_peer_excluding(
         NetworkType::Testnet11 => Network::default_testnet11(),
     };
 
-    let mut addrs = net.lookup_all(timeout, BATCH_SIZE).await;
+    let discovered = net.lookup_all(timeout, BATCH_SIZE).await;
 
-    if addrs.is_empty() {
+    if discovered.is_empty() {
         return Err(ChiaQueryError::PeerDiscoveryFailed);
     }
 
-    // Randomise so we don't always hammer the same peer.
-    addrs.shuffle(&mut rand::thread_rng());
-    addrs.dedup();
+    // Distinct, spread, then IPv6-first (§5.2) — see `ordering::candidate_order`, which also
+    // carries the fix for the shuffle-then-`dedup` that made deduplication near-vacuous here.
+    let mut addrs = ordering::candidate_order(&discovered);
 
     // Remove any addresses we already tried above, and any the caller already holds.
     addrs.retain(|a| !priority_addrs.contains(a) && !exclude.contains(a));
