@@ -187,6 +187,42 @@ mod native_client {
             })
         }
 
+        /// The independence group this client must be registered under, derived from the fabric it
+        /// can actually REACH rather than from what a caller believes it is.
+        ///
+        /// # Why this is not a caller's choice
+        ///
+        /// `ProviderRegistry` decides custody by independence group: a pure-public quorum keeps one
+        /// representative answer per group and refuses below the threshold. So the group id is a
+        /// security-relevant input, and on dig-node#354 it was supplied as a literal that had gone
+        /// stale — a `ChiaQuery` was registered as `"chia-peers"` while its router asks
+        /// `api.coinset.org` FIRST whenever the fallback is enabled. Both "independent" groups then
+        /// answered from one endpoint, and a client configured with `max_peers: 0` — holding no
+        /// peers whatsoever — satisfied a two-of-two independent-group custody quorum.
+        ///
+        /// # The derivation, and why it collapses conservatively
+        ///
+        /// A client whose coinset fallback is enabled CAN answer from coinset.org, so it is not
+        /// independent of any other coinset-backed source and reports
+        /// [`COINSET_INDEPENDENCE_GROUP`](crate::provider_registry::COINSET_INDEPENDENCE_GROUP).
+        /// Only a client that cannot reach coinset at all is a pure peer fabric and reports
+        /// [`CHIA_PEERS_INDEPENDENCE_GROUP`](crate::provider_registry::CHIA_PEERS_INDEPENDENCE_GROUP).
+        ///
+        /// Collapsing a peers-AND-coinset client into the coinset group is deliberate and
+        /// fail-closed: it can lie *together with* coinset, which is precisely what a shared group
+        /// records. Claiming the peer group because peers are also reachable would restore the
+        /// defect — an attacker controlling coinset would face a quorum it could satisfy alone.
+        ///
+        /// Register with this, never with a literal:
+        ///
+        /// ```ignore
+        /// let group = query.independence_group();
+        /// let registry = ProviderRegistry::new().register(Box::new(provider), None, group);
+        /// ```
+        pub fn independence_group(&self) -> &'static str {
+            crate::provider_registry::independence_group_for(self.router.coinset_fallback_enabled)
+        }
+
         // =======================================================================
         // Blocks
         // =======================================================================
