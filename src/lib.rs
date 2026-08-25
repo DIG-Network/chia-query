@@ -699,6 +699,70 @@ mod native_client {
             assert_eq!(observed_peak(9_139_211), Some(9_139_211));
         }
     }
+
+    #[cfg(test)]
+    mod independence_group_tests {
+        use super::*;
+        use crate::coinset::CoinsetClient;
+        use crate::peer::PeerBackend;
+        use crate::provider_registry::{CHIA_PEERS_INDEPENDENCE_GROUP, COINSET_INDEPENDENCE_GROUP};
+
+        /// A client whose router dials NOTHING, built directly so both fallback settings are
+        /// reachable offline.
+        ///
+        /// It cannot go through [`ChiaQuery::new`], and that is the whole reason this fixture
+        /// exists: `new` sets [`peer::PeerRequirement::Required`] whenever the coinset fallback is
+        /// DISABLED, so the `false` branch can only be constructed by dialling a real peer. Built
+        /// this way, the branch that a constant-returning method would misclassify becomes
+        /// testable on an isolated runner. Mirrors the router fixture in
+        /// `router::presence_tests`; neither tier is ever consulted, so the URL is unroutable.
+        fn client(coinset_fallback_enabled: bool) -> ChiaQuery {
+            ChiaQuery {
+                router: router::QueryRouter {
+                    peer: std::sync::Arc::new(PeerBackend::for_tests()),
+                    coinset: CoinsetClient::new("http://127.0.0.1:1", Duration::from_millis(1))
+                        .expect("build a client that is never called"),
+                    coinset_fallback_enabled,
+                },
+            }
+        }
+
+        /// **The METHOD reads the routing predicate; it does not return a constant.**
+        ///
+        /// The mutation this catches is
+        /// `independence_group_for(self.router.coinset_fallback_enabled)` becoming
+        /// `independence_group_for(true)`. Every other test in the crate stays green under it: the
+        /// free-function tests call `independence_group_for` directly and never reach this method,
+        /// and the integration suite can only build a fallback-ENABLED client, whose expected
+        /// answer a coinset-hard-wired method produces identically.
+        ///
+        /// The surviving direction is fail-closed and still harmful. A genuine pure-peer fabric
+        /// reported as coinset-backed COLLAPSES two real independence groups into one, so a
+        /// legitimate two-group quorum can never be satisfied - a denial of exactly the property
+        /// NC-12 needs, rather than a bypass of it.
+        ///
+        /// The `false` case is asserted FIRST because it is the only assertion the mutation can
+        /// fail; putting the passing case first would make the panic message ambiguous about which
+        /// property broke.
+        #[test]
+        fn the_group_is_read_from_the_routers_own_fallback_setting() {
+            assert_eq!(
+                client(false).independence_group(),
+                CHIA_PEERS_INDEPENDENCE_GROUP,
+                "a router that CANNOT reach coinset is a pure peer fabric; reporting the coinset                  group here collapses two independence groups into one and makes a legitimate                  two-group quorum permanently unsatisfiable",
+            );
+            assert_eq!(
+                client(true).independence_group(),
+                COINSET_INDEPENDENCE_GROUP,
+                "a router that falls back to coinset.org shares the coinset group",
+            );
+            assert_ne!(
+                client(true).independence_group(),
+                client(false).independence_group(),
+                "the method must distinguish the two fabrics, or the classification it feeds                  register() carries no information at all",
+            );
+        }
+    }
 } // mod native_client
 
 #[cfg(feature = "native")]
