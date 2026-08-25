@@ -37,6 +37,6 @@ pub use chia_query_provider::ChiaQueryProvider;
 pub use coinset_source::{CoinsetChainSource, COINSET_URL_ENV, DEFAULT_COINSET_URL};
 pub use providers::{CoinsetProvider, CustomProvider, DigPeersProvider, LocalNodeProvider};
 pub use registry::{
-    independence_group_for, DiscoveryView, ProviderRegistry, RegisteredProvider, TrustLevel, TrustedView,
-    CHIA_PEERS_INDEPENDENCE_GROUP, COINSET_INDEPENDENCE_GROUP,
+    independence_group_for, DiscoveryView, ProviderRegistry, RegisteredProvider, TrustLevel,
+    TrustedView, CHIA_PEERS_INDEPENDENCE_GROUP, COINSET_INDEPENDENCE_GROUP,
 };
