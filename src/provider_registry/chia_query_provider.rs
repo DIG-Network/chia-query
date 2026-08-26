@@ -46,6 +46,17 @@ impl ChiaQueryProvider {
             info,
         }
     }
+
+    /// The independence group this provider must be registered under, derived from the fabric the
+    /// [`ChiaQuery`] behind it can REACH.
+    ///
+    /// Delegates to [`ChiaQuery::independence_group`], which records why the derivation is
+    /// conservative and why a literal at the registration site is the defect this replaces
+    /// (dig-node#354). Pass this to
+    /// [`ProviderRegistry::register`](super::ProviderRegistry::register).
+    pub fn independence_group(&self) -> &'static str {
+        self.inner.independence_group()
+    }
 }
 
 impl ChainSource for ChiaQueryProvider {

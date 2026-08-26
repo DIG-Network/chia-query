@@ -953,6 +953,23 @@ records in a different order AGREE (compared by canonical coin-id order) rather 
 disagreeing; a genuinely different record SET still fails closed (the security property is preserved,
 only the false negative on ordering is removed). The canonical order computes each record's coin id
 ONCE into the sort key (O(n) hashes, not the O(n log n) a per-comparison `coin_id()` would cost).
+
+**A group id MUST be DERIVED from the fabric a source can reach, never chosen at the registration
+site.** The group decides custody, so a stale literal is a custody defect: a router registered as a
+pure peer fabric while its coinset fallback is enabled answers from the same endpoint as a coinset
+provider, and the two then satisfy a 2-group threshold between them while being one voice. A source
+able to reach coinset.org therefore reports `COINSET_INDEPENDENCE_GROUP`, whatever else it also
+reaches -- the collapse is one-directional and fail-closed, because a shared group states who a
+source could lie WITH. `ChiaQuery::independence_group` and `ChiaQueryProvider::independence_group`
+perform this derivation and MUST be passed to `register` in place of a literal.
+
+**The registered classification MUST be readable without a network.** `ProviderRegistry::registrations`
+returns a read-only `RegisteredProvider` per registration -- kind, recorded trust, and group -- and
+`ProviderRegistry::independence_groups` returns the groups in registration order with duplicates
+KEPT. Duplicates are RETAINED deliberately: two registrations sharing a group is exactly the state in
+which a 2-group threshold cannot be satisfied, and deduplicating would hide it. These accessors let a
+consumer assert its own classification offline, which is otherwise observable only against a live
+network.
 **Transport response-body cap.** The native coinset HTTP transport bounds every response at the RECEIVE
 layer: a body whose `Content-Length` exceeds `MAX_RESPONSE_BYTES` (256 MiB) is rejected before download,
 and a body with absent/under-declared length is streamed with a running-size check that aborts once the

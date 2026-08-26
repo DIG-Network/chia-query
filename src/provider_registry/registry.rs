@@ -61,6 +61,52 @@ struct Registration {
     independence_group: String,
 }
 
+/// The independence group a source that can reach **coinset.org** must be registered in.
+///
+/// Any fabric able to answer from coinset.org shares this group, however it is reached — directly,
+/// or as a router's fallback behind a peer tier. Two such sources are NOT independent, because one
+/// endpoint answering twice is one voice (SPEC §5).
+pub const COINSET_INDEPENDENCE_GROUP: &str = "coinset.org";
+
+/// The independence group a source that reaches ONLY dialled Chia full nodes belongs to.
+pub const CHIA_PEERS_INDEPENDENCE_GROUP: &str = "chia-peers";
+
+/// The independence group a source belongs to, derived from whether it can reach coinset.org.
+///
+/// `coinset_reachable` is a fact about the fabric, not a label: a router that falls back to
+/// coinset.org CAN answer from it, so it shares coinset's group and is not an independent voice
+/// beside another coinset-backed source. Only a source that cannot reach coinset at all is a pure
+/// peer fabric.
+///
+/// The collapse is deliberately one-directional. A peers-AND-coinset source reports the COINSET
+/// group even though it also holds peers, because a shared group is a statement about who it could
+/// lie *with*; reporting the peer group would let one endpoint satisfy a two-group quorum alone,
+/// which is the dig-node#354 defect.
+pub fn independence_group_for(coinset_reachable: bool) -> &'static str {
+    if coinset_reachable {
+        COINSET_INDEPENDENCE_GROUP
+    } else {
+        CHIA_PEERS_INDEPENDENCE_GROUP
+    }
+}
+
+/// A read-only view of one registration, so a consumer can assert OFFLINE what it registered.
+///
+/// The registry asks a consumer to classify each source's independence, and that classification
+/// decides custody — [`ProviderRegistry::trusted`] keeps one representative answer per group and
+/// refuses below the public-quorum threshold. Until this view existed, a consumer had no way to
+/// check its own classification except by watching quorum behaviour against a live network, which
+/// is the one condition CI cannot reproduce (dig_ecosystem#2790).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisteredProvider<'a> {
+    /// What kind of source this is, as the provider describes itself.
+    pub kind: ProviderKind,
+    /// The operator-assigned custody trust actually recorded for it.
+    pub trust: TrustLevel,
+    /// The independence group it was registered under.
+    pub independence_group: &'a str,
+}
+
 /// Composes [`ChainSourceProvider`]s under an operator trust model, exposing a fail-closed custody
 /// view and a low-trust discovery view.
 #[derive(Default)]
@@ -111,6 +157,41 @@ impl ProviderRegistry {
             independence_group: independence_group.into(),
         });
         self
+    }
+
+    /// Every registration, in registration order, as a read-only view.
+    ///
+    /// This is the network-free way to pin a trust classification: a consumer can assert that the
+    /// two sources it believes are independent were actually registered under DIFFERENT groups,
+    /// without dialling anything.
+    ///
+    /// **A group is only as honest as its derivation.** Reporting a label a caller typed reproduces
+    /// the defect this exists to catch — on dig-node#354 two "independent" groups both resolved to
+    /// `api.coinset.org`, and a client holding no peers at all satisfied a two-group custody quorum.
+    /// So derive the group from what the fabric can REACH — see
+    /// [`ChiaQueryProvider::independence_group`](crate::provider_registry::ChiaQueryProvider::independence_group)
+    /// — and register THAT, rather than a literal chosen at the call site.
+    pub fn registrations(&self) -> Vec<RegisteredProvider<'_>> {
+        self.providers
+            .iter()
+            .map(|reg| RegisteredProvider {
+                kind: reg.provider.provider_info().kind,
+                trust: reg.trust,
+                independence_group: reg.independence_group.as_str(),
+            })
+            .collect()
+    }
+
+    /// The independence groups currently registered, in registration order, with duplicates KEPT.
+    ///
+    /// Duplicates are the interesting case, not noise: two registrations sharing a group is exactly
+    /// the state in which a two-of-two public quorum cannot be satisfied, and deduplicating here
+    /// would hide it.
+    pub fn independence_groups(&self) -> Vec<&str> {
+        self.providers
+            .iter()
+            .map(|reg| reg.independence_group.as_str())
+            .collect()
     }
 
     /// The CUSTODY view — sound for money-routing reads.
