@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-08-26
+
+### Features
+- **peer:** Only discovered peers vote in the eviction reference; oversubscribe the dial (#43)
+
 ## [0.18.1] - 2026-08-26
 
 ### Features
