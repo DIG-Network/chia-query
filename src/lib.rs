@@ -749,7 +749,11 @@ mod native_client {
             assert_eq!(
                 client(false).independence_group(),
                 CHIA_PEERS_INDEPENDENCE_GROUP,
-                "a router that CANNOT reach coinset is a pure peer fabric; reporting the coinset                  group here collapses two independence groups into one and makes a legitimate                  two-group quorum permanently unsatisfiable",
+                concat!(
+                    "a router that CANNOT reach coinset is a pure peer fabric; reporting the ",
+                    "coinset group here collapses two independence groups into one, making a ",
+                    "legitimate two-group quorum permanently unsatisfiable",
+                ),
             );
             assert_eq!(
                 client(true).independence_group(),
@@ -759,7 +763,10 @@ mod native_client {
             assert_ne!(
                 client(true).independence_group(),
                 client(false).independence_group(),
-                "the method must distinguish the two fabrics, or the classification it feeds                  register() carries no information at all",
+                concat!(
+                    "the method must distinguish the two fabrics, or the classification it ",
+                    "feeds register() carries no information at all",
+                ),
             );
         }
     }
