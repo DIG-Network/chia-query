@@ -465,8 +465,15 @@ impl PeerPool {
     /// announced. A maximum would hand the bar to whichever peer claims the highest number, so one
     /// hostile peer announcing an inflated peak would evict every honest peer in the pool and
     /// leave itself — turning an eviction written for NC-12 into the cleanest possible attack on
-    /// it. A median moves only if MORE THAN HALF the held peers agree to move it, and a pool whose
-    /// majority is hostile has already lost, so no eviction policy can rescue it.
+    /// it. A median moves UPWARD — the direction that evicts honest peers — only if MORE THAN HALF
+    /// the held peers agree to move it: 5 of 8, 3 of 4, 2 of 3, measured. A pool whose majority is
+    /// hostile has already lost, so no eviction policy can rescue it.
+    ///
+    /// Moving it DOWNWARD is cheaper — at an even size exactly half suffices, 4 of 8 — and that
+    /// asymmetry is deliberate rather than a gap. Lag is `reference - peak > PEAK_LAG_EVICTION`, so
+    /// a lower reference can only evict FEWER peers; the worst a colluding half achieves is the
+    /// no-eviction status quo, which it could reach more cheaply by announcing the true peak. The
+    /// bar is guarded in the only direction where crossing it costs anything.
     ///
     /// A peer that has announced NOTHING yet is never evicted here. Silence is not lag: a
     /// just-admitted peer has had no chance to speak, and its `last_peak` of 0 would otherwise read
@@ -504,7 +511,8 @@ impl PeerPool {
                 && reference.saturating_sub(peak) > PEAK_LAG_EVICTION;
             if lagging {
                 log::debug!(
-                    "peer {} evicted: peak {peak} trails the pool's reference {reference} by more                      than {PEAK_LAG_EVICTION} blocks",
+                    "peer {} evicted: peak {peak} trails the pool's reference {reference} by more \
+                     than {PEAK_LAG_EVICTION} blocks",
                     entry.address
                 );
                 evicted.push(entry.address);
@@ -742,8 +750,9 @@ impl PeerPool {
 ///
 /// A median rather than a maximum because this number decides which peers are evicted for lag, and
 /// a maximum is settable by a single voice: one peer claiming an absurd height would make every
-/// honest peer look hopelessly behind. Moving a median requires more than half the held peers to
-/// agree, which is the plurality NC-12 already rests on.
+/// honest peer look hopelessly behind. Raising a median requires more than half the held peers to
+/// agree, which is the plurality NC-12 already rests on. Lowering it takes only half at an even
+/// size, which is harmless: a lower reference evicts fewer peers, never more.
 ///
 /// The LOWER median on an even-sized set — the smaller of the two middles — so the bar is the more
 /// forgiving of the two candidates. Eviction is destructive and a redial is not free, so where the
