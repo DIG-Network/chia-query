@@ -36,6 +36,77 @@ use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PR
 /// instead of silently consuming it.
 const FILL_ROUNDS: usize = PRIORITY_SLOTS + 2;
 
+/// How many dials a round opens per slot it is trying to fill.
+///
+/// The pool dials WIDER than it can hold and keeps the most credible answers, because a dial is
+/// the only point at which peers can be compared at all: once a connection is admitted the slot is
+/// spent, and the alternative to comparing candidates is admitting whichever ones happened to
+/// answer. Discovery returns an introducer's address set in shuffled order, so "happened to answer"
+/// is the pool's entire selection policy without this.
+///
+/// **Two, and deliberately no more.** The retained peers are chosen by handshake latency, and
+/// latency is partly a measure of network PROXIMITY — so a strong selection pressure would
+/// concentrate the pool on peers near this host, which is the population a local or regional
+/// adversary is likeliest to hold. Choosing 8 of 16 is a mild preference for peers that answer;
+/// choosing 8 of 100 would be a proximity filter wearing a credibility label, and NC-12 rests on
+/// the held peers being independent of each other. The factor is a bound on that pressure, which
+/// is why it is small rather than as large as the discovery set allows.
+///
+/// It is NOT part of the capacity derivation. Capacity remains
+/// [`default_max_peers`](super::plurality::default_max_peers), derived from
+/// [`QUORUM_SAMPLE`](super::plurality::QUORUM_SAMPLE); this widens the CANDIDATE set only, so the
+/// number of independent voices the pool ends up holding is unchanged and only their identity
+/// differs.
+const DIAL_OVERSUBSCRIPTION: usize = 2;
+
+/// How many dials to open when `wanted` slots remain.
+///
+/// A free function rather than an inline multiplication so the property it carries — that the
+/// candidate set is strictly wider than the slots, whenever there are slots at all — is stated
+/// where it can be tested.
+fn dials_for(wanted: usize) -> usize {
+    wanted.saturating_mul(DIAL_OVERSUBSCRIPTION)
+}
+
+/// A dial that succeeded, waiting to be judged against its round's other successes.
+///
+/// Generic over the connection it carries so the ranking below can be exercised on a fixture of
+/// plain numbers. The alternative — proving the ordering only through `fill_toward_capacity` —
+/// cannot be done without a live network, which is how a selection policy ends up asserted rather
+/// than measured.
+struct DialCandidate<T> {
+    origin: connect::PeerOrigin,
+    /// Time from opening the dial to a usable connection: the one behavioural signal a peer has
+    /// actually produced by the moment the pool must decide whether to keep it.
+    handshake: Duration,
+    connection: T,
+}
+
+/// Keep the `slots` most credible candidates of a round, discarding the rest.
+///
+/// Ordering, in this order:
+///
+/// 1. **[`Priority`](connect::PeerOrigin::Priority) first, unconditionally.** A priority entry is
+///    the operator's own or co-resident node; it is admitted because the operator said so, and it
+///    must not be crowded out by a stranger that answered a millisecond sooner. It is not a voice
+///    (#42), so keeping it costs the independent set nothing.
+/// 2. **Then by ascending handshake time.** A peer that completed a handshake quickly has DONE
+///    something; a peer that took most of the connect timeout to answer is the one most likely to
+///    be slow again, and the pool has no other evidence about either at this moment.
+///
+/// The sort is STABLE, so candidates that tie keep the order the round produced them in — which is
+/// discovery's shuffle, not an address ordering. A tie broken by address would let an adversary
+/// pick addresses that sort early.
+///
+/// Discarding a candidate DROPS its connection, which closes it. That is the cost of dialling
+/// wide and it is paid on purpose: a handshake spent learning that a peer is slow is cheaper than
+/// a pool slot held for [`PEER_LIFETIME`] by one.
+fn most_credible<T>(mut candidates: Vec<DialCandidate<T>>, slots: usize) -> Vec<DialCandidate<T>> {
+    candidates.sort_by_key(|c| (c.origin != connect::PeerOrigin::Priority, c.handshake));
+    candidates.truncate(slots);
+    candidates
+}
+
 // ---------------------------------------------------------------------------
 // Pool entry
 // ---------------------------------------------------------------------------
@@ -179,6 +250,11 @@ impl PeerPool {
     /// A single round therefore leaves a pool of ONE peer on exactly the machines most likely to
     /// have several available - and one peer is a pool that can never corroborate anything.
     ///
+    /// Each round dials [`DIAL_OVERSUBSCRIPTION`] times the slots it is trying to fill and keeps
+    /// the most credible answers ([`most_credible`]). Capacity is untouched by this — the pool
+    /// still holds [`default_max_peers`](super::plurality::default_max_peers) — so it changes WHICH
+    /// peers occupy the slots, never how many independent voices stand in them.
+    ///
     /// A later round excludes what the earlier ones admitted, so the priority addresses are no
     /// longer offered and the dial falls through to discovery. Rounds stop as soon as one admits
     /// nothing: a round that admitted nothing is evidence that dialling again would not help
@@ -196,26 +272,47 @@ impl PeerPool {
             }
 
             let mut dials = FuturesUnordered::new();
-            for _ in 0..wanted {
+            for _ in 0..dials_for(wanted) {
                 let tls = self.tls.clone();
                 let held = held.clone();
                 let network = self.network;
                 let timeout = self.connect_timeout;
                 dials.push(async move {
-                    connect::connect_random_peer_excluding(network, &tls, timeout, &held).await
+                    let started = Instant::now();
+                    connect::connect_random_peer_excluding(network, &tls, timeout, &held)
+                        .await
+                        .map(|connection| (connection, started.elapsed()))
                 });
             }
 
-            let mut admitted = 0usize;
+            // The whole round is collected before anything is admitted. Admitting eagerly, as
+            // this did, spends the slots on whichever dials returned first and leaves nothing to
+            // compare - the round has to be complete before "most credible" means anything. It is
+            // bounded by `connect_timeout`, since that is what every dial resolves within.
+            let mut candidates = Vec::new();
             while let Some(result) = dials.next().await {
                 match result {
-                    Ok((peer, addr, receiver, origin)) => {
-                        if self.admit_and_follow(peer, addr, receiver, origin).await {
-                            admitted += 1;
-                        }
-                    }
+                    Ok((connection, handshake)) => candidates.push(DialCandidate {
+                        origin: connection.3,
+                        handshake,
+                        connection,
+                    }),
                     Err(e) => log::debug!("peer connect failed: {e}"),
                 }
+            }
+
+            let offered = candidates.len();
+            let mut admitted = 0usize;
+            for candidate in most_credible(candidates, wanted) {
+                let (peer, addr, receiver, origin) = candidate.connection;
+                if self.admit_and_follow(peer, addr, receiver, origin).await {
+                    admitted += 1;
+                }
+            }
+            if offered > admitted {
+                log::debug!(
+                    "dial round kept {admitted} of {offered} candidates for {wanted} slots"
+                );
             }
 
             if admitted == 0 {
@@ -2213,6 +2310,120 @@ mod tests {
             pool.evict_lagging_peers_for_tests().await,
             vec![address(6)],
             "the reference follows the independent peers, so the lagger is still evicted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dialling wider than capacity (dig_ecosystem#2836)
+    // -----------------------------------------------------------------------
+
+    /// A round of dials against a simulated network of heterogeneous peers.
+    ///
+    /// `network[i]` is the handshake time of the i-th peer discovery offers, and the pool opens
+    /// `dials` of them. The list is deliberately NOT sorted: the peers that answer first are
+    /// mediocre and the good ones sit further in, which is what makes a narrow dial and a wide one
+    /// reach different answers. A network whose best peers came first would let a pool with no
+    /// selection at all score identically, and prove nothing.
+    fn round_over(network: &[u64], dials: usize) -> Vec<DialCandidate<usize>> {
+        network
+            .iter()
+            .take(dials)
+            .enumerate()
+            .map(|(i, ms)| DialCandidate {
+                origin: PeerOrigin::Discovered,
+                handshake: Duration::from_millis(*ms),
+                connection: i,
+            })
+            .collect()
+    }
+
+    /// **Proves (dig_ecosystem#2836):** dialling wider than capacity retains BETTER peers than
+    /// dialling exactly to capacity, on the same network and for the same number of slots.
+    ///
+    /// The comparison is the test. Both arms fill `SLOTS` slots from the same peers in the same
+    /// order and differ only in how many dials the round opened, so nothing but the width can
+    /// explain the split — and if [`DIAL_OVERSUBSCRIPTION`] were 1, `dials_for(SLOTS)` would equal
+    /// `SLOTS`, the two arms would be the same round, and the strict inequality below would fail.
+    /// A test that passed at either width would be measuring the sort, not the oversubscription.
+    #[test]
+    fn dialling_wider_than_capacity_retains_better_peers_than_dialling_to_it() {
+        const SLOTS: usize = 4;
+        // Eight peers. The first four - all a narrow round can see - are the slow half.
+        let network = [900, 700, 800, 750, 40, 90, 60, 20];
+
+        let worst_kept = |dials: usize| {
+            most_credible(round_over(&network, dials), SLOTS)
+                .iter()
+                .map(|c| c.handshake)
+                .max()
+                .expect("the round admitted nothing")
+        };
+
+        let narrow = worst_kept(SLOTS);
+        let wide = worst_kept(dials_for(SLOTS));
+
+        assert!(
+            wide < narrow,
+            "the wide round's worst kept peer ({wide:?}) must beat the narrow round's ({narrow:?})"
+        );
+        assert_eq!(
+            most_credible(round_over(&network, dials_for(SLOTS)), SLOTS).len(),
+            SLOTS,
+            "widening the dial must not change how many slots are filled"
+        );
+    }
+
+    /// **Proves:** the width is the CANDIDATE set only — capacity stays derived from the sample.
+    ///
+    /// The regression this ticket was raised from was a pool sized by a literal, and the ticket's
+    /// own premise ("holds a fixed max of 5") would have reintroduced it. So the number of peers a
+    /// round admits is pinned to the slots asked for, at every width, and capacity is pinned to
+    /// the derivation rather than to any number this change introduces.
+    #[test]
+    fn oversubscription_widens_the_candidate_set_and_never_the_capacity() {
+        let network: Vec<u64> = (1..=64).collect();
+
+        for slots in 1..=default_max_peers() {
+            assert!(
+                dials_for(slots) > slots,
+                "a round with {slots} slots must offer more candidates than it can keep"
+            );
+            assert_eq!(
+                most_credible(round_over(&network, dials_for(slots)), slots).len(),
+                slots,
+                "a round fills the slots it was given, never the dials it opened"
+            );
+        }
+
+        assert_eq!(
+            default_max_peers(),
+            PRIORITY_SLOTS + 1 + QUORUM_SAMPLE + 1,
+            "capacity remains derived from the sample; oversubscription is not one of its terms"
+        );
+    }
+
+    /// **Proves:** a priority candidate is never crowded out by a faster stranger.
+    ///
+    /// The priority entry is the SLOWEST in the round, so any ranking that considered only latency
+    /// would discard it — and on a single-slot round it is discarded in favour of a peer the
+    /// operator did not choose. It is not an independent voice (#42), so keeping it costs the
+    /// quorum nothing and losing it costs the operator the node they configured.
+    #[test]
+    fn a_priority_candidate_outranks_a_faster_stranger() {
+        let mut round = round_over(&[1, 2, 3], 3);
+        round.push(DialCandidate {
+            origin: PeerOrigin::Priority,
+            handshake: Duration::from_millis(999),
+            connection: 99,
+        });
+
+        let kept = most_credible(round, 1);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].origin,
+            PeerOrigin::Priority,
+            "the operator's own node is admitted because they said so, not because it was quick"
         );
     }
 
