@@ -318,6 +318,25 @@ corroborating voice:
 of 5 leaves three usable corroborators in the ordinary case, and a default of 7 leaves three
 mid-rotation on a host running both priority addresses — both below `QUORUM_SAMPLE`.
 
+#### Dialling: wider than capacity, keeping the most credible
+
+A dial round MUST open more dials than it has slots to fill — `DIAL_OVERSUBSCRIPTION` (2) per slot —
+collect the whole round, and admit only the most credible candidates, up to the slots available.
+Without this the pool's selection policy is whichever peers discovery's shuffled address set happened
+to reach first, and a slot once spent is held for `PEER_LIFETIME`.
+
+Candidates are ranked `Priority` first, then by ascending handshake time — the only behavioural
+signal a peer has produced by the moment the pool must judge it. The sort MUST be stable, so ties
+keep discovery's shuffle rather than an address ordering an adversary could sort early into.
+Discarded candidates' connections are closed.
+
+Oversubscription is NOT a term in the capacity derivation. `max_peers` remains `default_max_peers()`,
+derived from `QUORUM_SAMPLE` above; this widens the CANDIDATE set only, so the number of independent
+voices the pool holds is unchanged and only their identity differs. The factor is deliberately small:
+handshake latency is partly a measure of network proximity, so a strong selection pressure would
+concentrate the pool on peers near this host — the population a local or regional adversary is
+likeliest to hold — and NC-12 rests on the held peers being independent of each other.
+
 #### Corroboration arming: refuse, never degrade
 
 `corroboration_readiness(asked)` reports `Armed` only when at least `CORROBORATION_FLOOR` (2)
@@ -368,8 +387,31 @@ session, and may have minutes of `PEER_LIFETIME` left, so the other three never 
 The reference peak is the MEDIAN of the peaks the held peers have announced, and MUST NOT be the
 maximum. A maximum is settable by a single voice, so one peer announcing an inflated peak would
 evict every honest peer and leave itself holding the pool. A peer entry that has announced NOTHING
-is never evicted here — silence is not lag — and `Priority` entries are exempt for the same reason
-cycling exempts them.
+is never evicted here — silence is not lag.
+
+`Priority` entries are treated separately in TWO respects, and both are required:
+
+| property | rule |
+|---|---|
+| being EVICTED | a `Priority` entry MUST NOT be evicted for lag, for the same reason cycling exempts it — re-dialling reaches the same address |
+| VOTING | a `Priority` entry's announced peak MUST NOT be counted in the median the reference is taken over |
+
+The second is the one with security content. Exempting a peer decides only its own fate; letting it
+vote gives it a say over every other peer's. A `Priority` entry is the operator's own or a
+co-resident node — the source a local attacker can supply — which is why it is already refused a
+place in `independent_peer_count()`. Counting its peak in the reference returned that authority
+through the side door: with `PRIORITY_SLOTS` such entries the median rests on them whenever the
+pool holds a single `Discovered` peer, so two fabricated heights evict it and take the independent
+count to zero.
+
+Consequently, **when no `Discovered` entry has announced a peak, `evict_lagging_peers()` MUST evict
+nothing.** This state is reachable in ordinary operation — a host whose priority addresses connect
+before discovery does — and refusing to evict is the fail-safe direction: `corroboration_readiness`
+already refuses below its floor, so keeping a peer the pool cannot judge downgrades a read, whereas
+evicting against a bar set by non-voices destroys the peers the pool needs.
+
+Note that an announced peak is an UNAUTHENTICATED self-report; the median is the mitigation, and any
+consumer of a peer-announced value inherits that.
 
 Eviction is NOT capped to preserve `CORROBORATION_FLOOR`. Holding a lagging peer so the arithmetic
 still reaches the floor preserves exactly the inflated denominator this removal exists to correct;
