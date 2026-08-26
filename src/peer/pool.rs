@@ -36,6 +36,119 @@ use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PR
 /// instead of silently consuming it.
 const FILL_ROUNDS: usize = PRIORITY_SLOTS + 2;
 
+/// How many dials a round opens per slot it is trying to fill.
+///
+/// The pool dials WIDER than it can hold and keeps the most credible answers, because a dial is
+/// the only point at which peers can be compared at all: once a connection is admitted the slot is
+/// spent, and the alternative to comparing candidates is admitting whichever ones happened to
+/// answer. Discovery returns an introducer's address set in shuffled order, so "happened to answer"
+/// is the pool's entire selection policy without this.
+///
+/// **Two, and deliberately no more.** The retained peers are chosen by handshake latency, and
+/// latency is partly a measure of network PROXIMITY — so a strong selection pressure would
+/// concentrate the pool on peers near this host, which is the population a local or regional
+/// adversary is likeliest to hold. Choosing 8 of 16 is a mild preference for peers that answer;
+/// choosing 8 of 100 would be a proximity filter wearing a credibility label, and NC-12 rests on
+/// the held peers being independent of each other. The factor is a bound on that pressure, which
+/// is why it is small rather than as large as the discovery set allows.
+///
+/// It is NOT part of the capacity derivation. Capacity remains
+/// [`default_max_peers`](super::plurality::default_max_peers), derived from
+/// [`QUORUM_SAMPLE`](super::plurality::QUORUM_SAMPLE); this widens the CANDIDATE set only, so the
+/// number of independent voices the pool ends up holding is unchanged and only their identity
+/// differs.
+const DIAL_OVERSUBSCRIPTION: usize = 2;
+
+/// How many dials to open when `wanted` slots remain.
+///
+/// A free function rather than an inline multiplication so the property it carries — that the
+/// candidate set is strictly wider than the slots, whenever there are slots at all — is stated
+/// where it can be tested.
+fn dials_for(wanted: usize) -> usize {
+    wanted.saturating_mul(DIAL_OVERSUBSCRIPTION)
+}
+
+/// What one successful dial hands back: the peer, where it was reached, its inbound frames, and
+/// how it was found.
+///
+/// Named so the round's selection can be written against it rather than repeating the tuple, and
+/// so the address a candidate carries is visibly the SAME address the admission uses.
+type Connected = (
+    Peer,
+    SocketAddr,
+    mpsc::Receiver<Message>,
+    connect::PeerOrigin,
+);
+
+/// A dial that succeeded, waiting to be judged against its round's other successes.
+///
+/// Generic over the connection it carries so the ranking below can be exercised on a fixture of
+/// plain numbers. The alternative — proving the ordering only through `fill_toward_capacity` —
+/// cannot be done without a live network, which is how a selection policy ends up asserted rather
+/// than measured.
+struct DialCandidate<T> {
+    origin: connect::PeerOrigin,
+    /// The address this dial reached.
+    ///
+    /// Carried SEPARATELY from `connection` rather than read back out of it, because the ranking
+    /// below has to compare candidates by identity and `connection` is opaque to it. Without this
+    /// field the round can only order candidates, never tell two of them apart — which is how a
+    /// round of duplicates was ranked, truncated, and handed the whole budget (#43).
+    address: SocketAddr,
+    /// Time from opening the dial to a usable connection: the one behavioural signal a peer has
+    /// actually produced by the moment the pool must decide whether to keep it.
+    handshake: Duration,
+    connection: T,
+}
+
+/// Keep the `slots` most credible candidates of a round, discarding the rest.
+///
+/// Ordering, in this order:
+///
+/// 1. **[`Priority`](connect::PeerOrigin::Priority) first, unconditionally.** A priority entry is
+///    the operator's own or co-resident node; it is admitted because the operator said so, and it
+///    must not be crowded out by a stranger that answered a millisecond sooner. It is not a voice
+///    (#42), so keeping it costs the independent set nothing.
+/// 2. **Then by ascending handshake time.** A peer that completed a handshake quickly has DONE
+///    something; a peer that took most of the connect timeout to answer is the one most likely to
+///    be slow again, and the pool has no other evidence about either at this moment.
+///
+/// The sort is STABLE, so candidates that tie keep the order the round produced them in — which is
+/// discovery's shuffle, not an address ordering. A tie broken by address would let an adversary
+/// pick addresses that sort early.
+///
+/// # Deduplication comes BEFORE the truncate, and that order is the security of it
+///
+/// A round produces duplicate winners BY CONSTRUCTION, with no attacker present: every dial in a
+/// round shares one `held` snapshot, each offers the priority addresses first, and each returns the
+/// first address in its chunk to finish a handshake. So the copies of the fastest reachable peer
+/// are exactly what an ascending-handshake sort gathers at the head, and truncating there keeps the
+/// duplicates and discards every distinct peer behind them. Measured on an ordinary start-up round
+/// — eight copies of one reachable priority address beside eight distinct discovered peers, eight
+/// slots — the round admitted ONE distinct peer (#43). [`admit`](PeerPool::admit) rejects the
+/// copies afterwards, so the pool never HOLDS a duplicate; what it loses is the slots, which stay
+/// empty for the round. That depresses
+/// [`independent_peer_count`](PeerPool::independent_peer_count) — the count
+/// [`corroboration_readiness`](PeerPool::corroboration_readiness) arms on — and a pool below the
+/// floor falls back to the centralized tier, which is the outcome NC-12 exists to avoid.
+///
+/// Deduplicating first makes the budget a budget of DISTINCT peers. Because the dedup runs on the
+/// already-sorted list and keeps the FIRST occurrence of each address, the survivor of a group is
+/// its fastest member — the same candidate the ranking would have chosen anyway.
+///
+/// Discarding a candidate DROPS its connection, which closes it. That is the cost of dialling
+/// wide and it is paid on purpose: a handshake spent learning that a peer is slow is cheaper than
+/// a pool slot held for [`PEER_LIFETIME`] by one.
+fn most_credible<T>(mut candidates: Vec<DialCandidate<T>>, slots: usize) -> Vec<DialCandidate<T>> {
+    candidates.sort_by_key(|c| (c.origin != connect::PeerOrigin::Priority, c.handshake));
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert(c.address));
+
+    candidates.truncate(slots);
+    candidates
+}
+
 // ---------------------------------------------------------------------------
 // Pool entry
 // ---------------------------------------------------------------------------
@@ -179,6 +292,11 @@ impl PeerPool {
     /// A single round therefore leaves a pool of ONE peer on exactly the machines most likely to
     /// have several available - and one peer is a pool that can never corroborate anything.
     ///
+    /// Each round dials [`DIAL_OVERSUBSCRIPTION`] times the slots it is trying to fill and keeps
+    /// the most credible answers ([`most_credible`]). Capacity is untouched by this — the pool
+    /// still holds [`default_max_peers`](super::plurality::default_max_peers) — so it changes WHICH
+    /// peers occupy the slots, never how many independent voices stand in them.
+    ///
     /// A later round excludes what the earlier ones admitted, so the priority addresses are no
     /// longer offered and the dial falls through to discovery. Rounds stop as soon as one admits
     /// nothing: a round that admitted nothing is evidence that dialling again would not help
@@ -196,32 +314,74 @@ impl PeerPool {
             }
 
             let mut dials = FuturesUnordered::new();
-            for _ in 0..wanted {
+            for _ in 0..dials_for(wanted) {
                 let tls = self.tls.clone();
                 let held = held.clone();
                 let network = self.network;
                 let timeout = self.connect_timeout;
                 dials.push(async move {
-                    connect::connect_random_peer_excluding(network, &tls, timeout, &held).await
+                    let started = Instant::now();
+                    connect::connect_random_peer_excluding(network, &tls, timeout, &held)
+                        .await
+                        .map(|connection| (connection, started.elapsed()))
                 });
             }
 
-            let mut admitted = 0usize;
+            // The whole round is collected before anything is admitted. Admitting eagerly, as
+            // this did, spends the slots on whichever dials returned first and leaves nothing to
+            // compare - the round has to be complete before "most credible" means anything.
+            //
+            // The wait is bounded by ONE dial's worst case, since the dials run concurrently - and
+            // a single dial is NOT one `connect_timeout`. It tries the priority addresses
+            // sequentially, then a DNS lookup, then the discovered addresses in sequential chunks
+            // of `connect::BATCH_SIZE`, each of those steps bounded by `connect_timeout`
+            // separately: `(PRIORITY_SLOTS + 1 + ceil(N / BATCH_SIZE)) * connect_timeout` for a
+            // discovery set of N addresses. Stated because the earlier text claimed a bound of one
+            // `connect_timeout`, which a caller sizing its own deadline around this would have
+            // believed.
+            let mut candidates = Vec::new();
             while let Some(result) = dials.next().await {
                 match result {
-                    Ok((peer, addr, receiver, origin)) => {
-                        if self.admit_and_follow(peer, addr, receiver, origin).await {
-                            admitted += 1;
-                        }
-                    }
+                    Ok((connection, handshake)) => candidates.push(DialCandidate {
+                        origin: connection.3,
+                        address: connection.1,
+                        handshake,
+                        connection,
+                    }),
                     Err(e) => log::debug!("peer connect failed: {e}"),
                 }
             }
 
-            if admitted == 0 {
+            if self.admit_most_credible(candidates, wanted).await == 0 {
                 return;
             }
         }
+    }
+
+    /// Judge one completed round and admit its winners, returning how many were admitted.
+    ///
+    /// Separated from [`fill_toward_capacity`](Self::fill_toward_capacity) because it is the whole
+    /// of the round's SELECTION — rank, deduplicate, truncate, admit — and the surrounding function
+    /// cannot be exercised without a live network. The defect this addresses (#43) lived precisely
+    /// in the join between the ranking and the admission, where a unit test of the ranking alone
+    /// could not see it.
+    async fn admit_most_credible(
+        &self,
+        candidates: Vec<DialCandidate<Connected>>,
+        wanted: usize,
+    ) -> usize {
+        let offered = candidates.len();
+        let mut admitted = 0usize;
+        for candidate in most_credible(candidates, wanted) {
+            let (peer, addr, receiver, origin) = candidate.connection;
+            if self.admit_and_follow(peer, addr, receiver, origin).await {
+                admitted += 1;
+            }
+        }
+        if offered > admitted {
+            log::debug!("dial round kept {admitted} of {offered} candidates for {wanted} slots");
+        }
+        admitted
     }
 
     /// Admit a connection and, if it was admitted, start following its frames.
@@ -479,11 +639,27 @@ impl PeerPool {
     /// just-admitted peer has had no chance to speak, and its `last_peak` of 0 would otherwise read
     /// as the furthest-behind peer in the pool. Session death and age own that peer's fate.
     ///
-    /// # Only DISCOVERED peers, and no floor exemption
+    /// # Only DISCOVERED peers — both as CANDIDATES and as VOTERS
     ///
-    /// Discovered entries are exactly the set whose count this defect corrupts — a priority entry
-    /// is the operator's own node and is not an independent voice in the first place — and
-    /// re-dialling one would only reach the same address.
+    /// `Priority` entries are exempt from being evicted, and they are also excluded from the
+    /// `announced` set the reference is taken over. **These are two separate properties and the
+    /// second is the one that has security content** (#42): exempting a peer decides only its own
+    /// fate, while letting it vote hands it a say over everyone else's.
+    ///
+    /// A priority entry is the operator's own or co-resident node — precisely the source a local
+    /// attacker can supply (dig_ecosystem#2648) — so `independent_peer_count` already refuses to
+    /// count it as a voice. Counting its announced peak in the median granted it back, through the
+    /// side door, the authority the origin was introduced to deny: with `PRIORITY_SLOTS` such
+    /// entries the median rests on them whenever the pool holds one discovered peer, and two
+    /// fabricated heights evict it, taking the independent count to zero.
+    ///
+    /// The consequence is stated on the empty case below: once only discovered peaks vote, a pool
+    /// holding no independent voice has no reference and evicts NOTHING.
+    ///
+    /// # No floor exemption
+    ///
+    /// Discovered entries are exactly the set whose count this defect corrupts, and re-dialling a
+    /// priority address would only reach the same address.
     ///
     /// Eviction is NOT capped to keep the pool at [`CORROBORATION_FLOOR`]. Keeping a lagging peer
     /// so the arithmetic still reaches the floor would preserve precisely the inflated denominator
@@ -496,9 +672,22 @@ impl PeerPool {
 
         let announced: Vec<u32> = entries
             .iter()
+            .filter(|e| e.origin == connect::PeerOrigin::Discovered)
             .map(|e| e.last_peak.load(Ordering::Relaxed))
             .filter(|peak| *peak > 0)
             .collect();
+
+        // No independent voice has spoken, so there is no bar to judge anyone against, and the
+        // pool evicts NOTHING. This branch is reachable in ordinary operation - a host that
+        // connected its priority addresses before discovery holds entries that all announce and
+        // none of which may vote - and it says so IN ITS OWN VOICE rather than relying on the
+        // retain below.
+        //
+        // It is deliberately not load-bearing, and claiming otherwise would be false: replacing it
+        // with `unwrap_or(0)` leaves every test green, because `reference.saturating_sub(peak)`
+        // floors at zero and a reference of zero can never exceed `PEAK_LAG_EVICTION`. The two
+        // spellings agree. What the early return adds is that "there is no bar" and "the bar is
+        // zero" are different statements about the pool, and only one of them is true here.
         let Some(reference) = reference_peak(&announced) else {
             return Vec::new();
         };
@@ -880,6 +1069,22 @@ impl PeerPool {
         origin: connect::PeerOrigin,
     ) -> bool {
         self.admit_and_follow(peer, address, receiver, origin).await
+    }
+
+    /// Judge and admit one completed round, exactly as [`fill_toward_capacity`] would.
+    ///
+    /// The round is the unit under test: a dial cannot be made offline, but the candidates a dial
+    /// produces can be, and everything the pool decides about them happens after the dial returns.
+    ///
+    /// `DialCandidate` stays module-private deliberately — this helper exists for the round test in
+    /// this file and nothing else, so the type is not widened to `pub(crate)` to satisfy the lint.
+    #[allow(private_interfaces)]
+    pub(crate) async fn admit_most_credible_for_tests(
+        &self,
+        candidates: Vec<DialCandidate<Connected>>,
+        wanted: usize,
+    ) -> usize {
+        self.admit_most_credible(candidates, wanted).await
     }
 
     /// Run only the dead-session half of [`maintain`](Self::maintain), which does not dial.
@@ -2092,5 +2297,380 @@ mod tests {
     fn a_single_outlier_cannot_move_the_reference_peak() {
         assert_eq!(reference_peak(&[100, 100, 100, u32::MAX]), Some(100));
         assert_eq!(reference_peak(&[100, 100, 100, 1]), Some(100));
+    }
+
+    // -----------------------------------------------------------------------
+    // Who VOTES in the reference peak (#42)
+    // -----------------------------------------------------------------------
+
+    /// Admit `entries` as `(origin, announced peak)` at `address(i + 1)`.
+    ///
+    /// [`pool_at_peaks`] cannot express these fixtures: its peers are all `Discovered`, and the
+    /// property under test is precisely what changes when the origins DIFFER.
+    async fn pool_of(max_peers: usize, entries: &[(PeerOrigin, u32)]) -> PeerPool {
+        let pool = empty_pool(max_peers);
+        for (i, (origin, peak)) in entries.iter().enumerate() {
+            assert!(
+                pool.admit_at_peak_for_tests(
+                    loopback_peer().await,
+                    address(i as u8 + 1),
+                    *origin,
+                    *peak,
+                )
+                .await,
+                "fixture entry {i} must be admitted"
+            );
+        }
+        pool
+    }
+
+    /// **Proves (#42):** hostile `Priority` entries cannot VOTE the only independent peer out of
+    /// the pool.
+    ///
+    /// `Priority` entries are already exempt from BEING evicted. That is a different property from
+    /// whether they COUNT toward the reference the eviction is measured against, and granting the
+    /// second is what let two co-resident entries — the exact pair a local attacker supplies
+    /// (dig_ecosystem#2648) — carry the median to a fabricated height and take
+    /// `independent_peer_count` from 1 to 0.
+    ///
+    /// **The fixture is the minimum that can express the failure and is sized from the crate's own
+    /// bound.** The attack needs the priority voices to be at least as many as the discovered ones
+    /// — at two discovered peers the median already sits on an honest voice — so the worst case
+    /// reachable in production is `PRIORITY_SLOTS` hostile entries against ONE discovered peer.
+    /// That is not an arbitrarily small fixture; it is the whole of what the dialler can produce.
+    #[tokio::test]
+    async fn hostile_priority_entries_cannot_vote_the_only_independent_peer_out() {
+        let inflated = CURRENT + 1_000_000;
+        let pool = pool_of(
+            5,
+            &[
+                (PeerOrigin::Priority, inflated),
+                (PeerOrigin::Priority, inflated),
+                (PeerOrigin::Discovered, CURRENT),
+            ],
+        )
+        .await;
+        assert_eq!(pool.independent_peer_count().await, 1);
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "peers that are not independent voices must not set the bar that evicts one"
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            1,
+            "the pool must not be emptied of independent voices by entries that never were any"
+        );
+    }
+
+    /// **The control, and the placement proof.** The filter must narrow WHOSE peak is counted, not
+    /// switch the eviction off.
+    ///
+    /// Here the priority entries are far BELOW the chain rather than above it, which drags an
+    /// unfiltered median down onto the lagging peer and shields it. Counting only the discovered
+    /// peaks puts the reference back on the honest majority and the lagger goes. So this fixture
+    /// fails both for an implementation that stopped evicting and for one that kept the priority
+    /// votes — and its verdict is the OPPOSITE of the test above, which no "evict less" change can
+    /// satisfy at the same time.
+    #[tokio::test]
+    async fn priority_entries_below_the_chain_cannot_shield_a_lagging_discovered_peer() {
+        let stale = CURRENT - 500_000;
+        let behind = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = pool_of(
+            8,
+            &[
+                (PeerOrigin::Priority, stale),
+                (PeerOrigin::Priority, stale),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, behind),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address(6)],
+            "the reference follows the independent peers, so the lagger is still evicted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dialling wider than capacity (dig_ecosystem#2836)
+    // -----------------------------------------------------------------------
+
+    /// A round of dials against a simulated network of heterogeneous peers.
+    ///
+    /// `network[i]` is the handshake time of the i-th peer discovery offers, and the pool opens
+    /// `dials` of them. The list is deliberately NOT sorted: the peers that answer first are
+    /// mediocre and the good ones sit further in, which is what makes a narrow dial and a wide one
+    /// reach different answers. A network whose best peers came first would let a pool with no
+    /// selection at all score identically, and prove nothing.
+    fn round_over(network: &[u64], dials: usize) -> Vec<DialCandidate<usize>> {
+        network
+            .iter()
+            .take(dials)
+            .enumerate()
+            .map(|(i, ms)| DialCandidate {
+                origin: PeerOrigin::Discovered,
+                address: address(i as u8 + 1),
+                handshake: Duration::from_millis(*ms),
+                connection: i,
+            })
+            .collect()
+    }
+
+    /// **Proves (dig_ecosystem#2836):** dialling wider than capacity retains BETTER peers than
+    /// dialling exactly to capacity, on the same network and for the same number of slots.
+    ///
+    /// The comparison is the test. Both arms fill `SLOTS` slots from the same peers in the same
+    /// order and differ only in how many dials the round opened, so nothing but the width can
+    /// explain the split — and if [`DIAL_OVERSUBSCRIPTION`] were 1, `dials_for(SLOTS)` would equal
+    /// `SLOTS`, the two arms would be the same round, and the strict inequality below would fail.
+    /// A test that passed at either width would be measuring the sort, not the oversubscription.
+    #[test]
+    fn dialling_wider_than_capacity_retains_better_peers_than_dialling_to_it() {
+        const SLOTS: usize = 4;
+        // Eight peers. The first four - all a narrow round can see - are the slow half.
+        let network = [900, 700, 800, 750, 40, 90, 60, 20];
+
+        let worst_kept = |dials: usize| {
+            most_credible(round_over(&network, dials), SLOTS)
+                .iter()
+                .map(|c| c.handshake)
+                .max()
+                .expect("the round admitted nothing")
+        };
+
+        let narrow = worst_kept(SLOTS);
+        let wide = worst_kept(dials_for(SLOTS));
+
+        assert!(
+            wide < narrow,
+            "the wide round's worst kept peer ({wide:?}) must beat the narrow round's ({narrow:?})"
+        );
+        assert_eq!(
+            most_credible(round_over(&network, dials_for(SLOTS)), SLOTS).len(),
+            SLOTS,
+            "widening the dial must not change how many slots are filled"
+        );
+    }
+
+    /// **Proves:** the width is the CANDIDATE set only — capacity stays derived from the sample.
+    ///
+    /// The regression this ticket was raised from was a pool sized by a literal, and the ticket's
+    /// own premise ("holds a fixed max of 5") would have reintroduced it. So the number of peers a
+    /// round admits is pinned to the slots asked for, at every width, and capacity is pinned to
+    /// the derivation rather than to any number this change introduces.
+    #[test]
+    fn oversubscription_widens_the_candidate_set_and_never_the_capacity() {
+        let network: Vec<u64> = (1..=64).collect();
+
+        for slots in 1..=default_max_peers() {
+            assert!(
+                dials_for(slots) > slots,
+                "a round with {slots} slots must offer more candidates than it can keep"
+            );
+            assert_eq!(
+                most_credible(round_over(&network, dials_for(slots)), slots).len(),
+                slots,
+                "a round fills the slots it was given, never the dials it opened"
+            );
+        }
+
+        assert_eq!(
+            default_max_peers(),
+            PRIORITY_SLOTS + 1 + QUORUM_SAMPLE + 1,
+            "capacity remains derived from the sample; oversubscription is not one of its terms"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A round's budget is a budget of DISTINCT peers (#43)
+    // -----------------------------------------------------------------------
+
+    /// One candidate as a completed dial would produce it, carrying a REAL connection.
+    ///
+    /// The receiver is held by the candidate and dropped with it, so a discarded candidate closes
+    /// exactly as a discarded dial does.
+    async fn candidate_at(
+        peer: &Peer,
+        addr: SocketAddr,
+        origin: PeerOrigin,
+        ms: u64,
+    ) -> DialCandidate<Connected> {
+        let (_tx, rx) = mpsc::channel(1);
+        DialCandidate {
+            origin,
+            address: addr,
+            handshake: Duration::from_millis(ms),
+            connection: (peer.clone(), addr, rx, origin),
+        }
+    }
+
+    /// **Proves (#43), at ROUND level:** a round's slots are spent on DISTINCT peers, so duplicate
+    /// winners cannot consume the budget the pool's independent voices need.
+    ///
+    /// **The fixture is an ordinary start-up round with no attacker in it.** Every dial in a round
+    /// shares one `held` snapshot and every dial offers the priority addresses first, so when one
+    /// priority address is reachable each dial returns it — eight copies — and the dials that were
+    /// refused by that node's inbound limit fall through to discovery and return distinct peers.
+    /// Sorting priority-first then by ascending handshake gathers all eight copies at the head,
+    /// which is exactly what a truncate to eight slots keeps.
+    ///
+    /// **It asserts DISTINCT admitted addresses.** A plain count would be equally sensitive here —
+    /// [`PeerPool::admit`] already rejects a duplicate address, so `held.len()` is identically the
+    /// distinct count and both read 1 before the fix and 8 after. Distinctness is asserted because
+    /// it names the property the pool must have, not because a count is blind to it: what the
+    /// defect costs is the seven slots the copies occupied in the budget, and an assertion that
+    /// says so survives a future change to what `admit` deduplicates.
+    /// Measured before the fix, this round admitted 1 distinct peer of 8 slots.
+    ///
+    /// **And it runs the round, not the ranker.** `most_credible` in isolation cannot show this:
+    /// the loss is in the join between ranking and admission, which is why the ranker was provably
+    /// ordered while the round it fed was not.
+    #[tokio::test]
+    async fn a_round_of_duplicate_winners_still_spends_its_slots_on_distinct_peers() {
+        const SLOTS: usize = 8;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+        let reachable_priority = address(1);
+
+        let mut round = Vec::new();
+        // Eight dials all reached the one reachable priority address, fastest-first at the head.
+        for i in 0..8u64 {
+            round.push(candidate_at(&peer, reachable_priority, PeerOrigin::Priority, i).await);
+        }
+        // Eight dials fell through to discovery and reached eight distinct peers, every one of
+        // them slower than every copy above - so nothing but distinctness can save them.
+        for octet in 10..18u8 {
+            round.push(candidate_at(&peer, address(octet), PeerOrigin::Discovered, 500).await);
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let distinct: std::collections::HashSet<_> = held.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            SLOTS,
+            "a round of {SLOTS} slots must admit {SLOTS} DISTINCT peers, not {} (held: {held:?})",
+            distinct.len()
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            SLOTS - 1,
+            "the one priority entry costs one slot; the rest must be independent voices"
+        );
+    }
+
+    /// The control: deduplication must not cost a round that had no duplicates in it.
+    ///
+    /// Without this, collapsing the candidate set to one entry — or to one per origin — would
+    /// satisfy the test above while emptying every ordinary round.
+    #[tokio::test]
+    async fn a_round_of_distinct_peers_is_unaffected_by_deduplication() {
+        const SLOTS: usize = 8;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for octet in 1..=8u8 {
+            round.push(candidate_at(&peer, address(octet), PeerOrigin::Discovered, 100).await);
+        }
+
+        let admitted = pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        assert_eq!(
+            admitted, SLOTS,
+            "eight distinct candidates fill eight slots"
+        );
+        assert_eq!(pool.independent_peer_count().await, SLOTS);
+    }
+
+    /// **Proves:** the survivor of a duplicate group is its FASTEST member, not an arbitrary one.
+    ///
+    /// Deduplicating before the sort — or keeping the last occurrence — would keep a slower copy of
+    /// the same peer, which is a different and worse ranking wearing the same distinct count. The
+    /// slow copy is FIRST in the round so a dedup that ran on the unsorted list keeps it.
+    #[test]
+    fn deduplication_keeps_the_fastest_copy_of_a_repeated_address() {
+        let repeated = address(1);
+        let round = vec![
+            DialCandidate {
+                origin: PeerOrigin::Discovered,
+                address: repeated,
+                handshake: Duration::from_millis(900),
+                connection: 0usize,
+            },
+            DialCandidate {
+                origin: PeerOrigin::Discovered,
+                address: repeated,
+                handshake: Duration::from_millis(10),
+                connection: 1usize,
+            },
+        ];
+
+        let kept = most_credible(round, 4);
+
+        assert_eq!(kept.len(), 1, "one address is one candidate");
+        assert_eq!(
+            kept[0].connection, 1,
+            "the fastest copy of the address must be the one retained"
+        );
+    }
+
+    /// **Proves:** a priority candidate is never crowded out by a faster stranger.
+    ///
+    /// The priority entry is the SLOWEST in the round, so any ranking that considered only latency
+    /// would discard it — and on a single-slot round it is discarded in favour of a peer the
+    /// operator did not choose. It is not an independent voice (#42), so keeping it costs the
+    /// quorum nothing and losing it costs the operator the node they configured.
+    #[test]
+    fn a_priority_candidate_outranks_a_faster_stranger() {
+        let mut round = round_over(&[1, 2, 3], 3);
+        round.push(DialCandidate {
+            origin: PeerOrigin::Priority,
+            address: address(99),
+            handshake: Duration::from_millis(999),
+            connection: 99,
+        });
+
+        let kept = most_credible(round, 1);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].origin,
+            PeerOrigin::Priority,
+            "the operator's own node is admitted because they said so, not because it was quick"
+        );
+    }
+
+    /// **Proves:** with no independent voice having spoken, the pool evicts NOTHING — stated, not
+    /// left to fall out of the arithmetic.
+    ///
+    /// This is the decision the filter forces: once only `Discovered` peaks vote, a pool that holds
+    /// none — a just-started host whose priority addresses connected first — has no reference at
+    /// all. Refusing to evict is the fail-safe direction: `corroboration_readiness` already REFUSES
+    /// below its floor, so a pool that keeps a peer it cannot judge downgrades a read, while a pool
+    /// that evicts on a bar set by non-voices destroys the very peers it needs.
+    #[tokio::test]
+    async fn a_pool_whose_only_speakers_are_priority_entries_evicts_nothing() {
+        let pool = pool_of(
+            5,
+            &[
+                (PeerOrigin::Priority, CURRENT + 1_000_000),
+                (PeerOrigin::Priority, CURRENT - 1_000_000),
+                (PeerOrigin::Discovered, 0),
+            ],
+        )
+        .await;
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "no independent voice has spoken, so there is no bar to evict against"
+        );
+        assert_eq!(pool.held_addresses_for_tests().await.len(), 3);
     }
 }
