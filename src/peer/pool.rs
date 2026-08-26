@@ -68,6 +68,18 @@ fn dials_for(wanted: usize) -> usize {
     wanted.saturating_mul(DIAL_OVERSUBSCRIPTION)
 }
 
+/// What one successful dial hands back: the peer, where it was reached, its inbound frames, and
+/// how it was found.
+///
+/// Named so the round's selection can be written against it rather than repeating the tuple, and
+/// so the address a candidate carries is visibly the SAME address the admission uses.
+type Connected = (
+    Peer,
+    SocketAddr,
+    mpsc::Receiver<Message>,
+    connect::PeerOrigin,
+);
+
 /// A dial that succeeded, waiting to be judged against its round's other successes.
 ///
 /// Generic over the connection it carries so the ranking below can be exercised on a fixture of
@@ -76,6 +88,13 @@ fn dials_for(wanted: usize) -> usize {
 /// than measured.
 struct DialCandidate<T> {
     origin: connect::PeerOrigin,
+    /// The address this dial reached.
+    ///
+    /// Carried SEPARATELY from `connection` rather than read back out of it, because the ranking
+    /// below has to compare candidates by identity and `connection` is opaque to it. Without this
+    /// field the round can only order candidates, never tell two of them apart — which is how a
+    /// round of duplicates was ranked, truncated, and handed the whole budget (#43).
+    address: SocketAddr,
     /// Time from opening the dial to a usable connection: the one behavioural signal a peer has
     /// actually produced by the moment the pool must decide whether to keep it.
     handshake: Duration,
@@ -98,11 +117,34 @@ struct DialCandidate<T> {
 /// discovery's shuffle, not an address ordering. A tie broken by address would let an adversary
 /// pick addresses that sort early.
 ///
+/// # Deduplication comes BEFORE the truncate, and that order is the security of it
+///
+/// A round produces duplicate winners BY CONSTRUCTION, with no attacker present: every dial in a
+/// round shares one `held` snapshot, each offers the priority addresses first, and each returns the
+/// first address in its chunk to finish a handshake. So the copies of the fastest reachable peer
+/// are exactly what an ascending-handshake sort gathers at the head, and truncating there keeps the
+/// duplicates and discards every distinct peer behind them. Measured on an ordinary start-up round
+/// — eight copies of one reachable priority address beside eight distinct discovered peers, eight
+/// slots — the round admitted ONE distinct peer (#43). [`admit`](PeerPool::admit) rejects the
+/// copies afterwards, so the pool never HOLDS a duplicate; what it loses is the slots, which stay
+/// empty for the round. That depresses
+/// [`independent_peer_count`](PeerPool::independent_peer_count) — the count
+/// [`corroboration_readiness`](PeerPool::corroboration_readiness) arms on — and a pool below the
+/// floor falls back to the centralized tier, which is the outcome NC-12 exists to avoid.
+///
+/// Deduplicating first makes the budget a budget of DISTINCT peers. Because the dedup runs on the
+/// already-sorted list and keeps the FIRST occurrence of each address, the survivor of a group is
+/// its fastest member — the same candidate the ranking would have chosen anyway.
+///
 /// Discarding a candidate DROPS its connection, which closes it. That is the cost of dialling
 /// wide and it is paid on purpose: a handshake spent learning that a peer is slow is cheaper than
 /// a pool slot held for [`PEER_LIFETIME`] by one.
 fn most_credible<T>(mut candidates: Vec<DialCandidate<T>>, slots: usize) -> Vec<DialCandidate<T>> {
     candidates.sort_by_key(|c| (c.origin != connect::PeerOrigin::Priority, c.handshake));
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert(c.address));
+
     candidates.truncate(slots);
     candidates
 }
@@ -287,13 +329,22 @@ impl PeerPool {
 
             // The whole round is collected before anything is admitted. Admitting eagerly, as
             // this did, spends the slots on whichever dials returned first and leaves nothing to
-            // compare - the round has to be complete before "most credible" means anything. It is
-            // bounded by `connect_timeout`, since that is what every dial resolves within.
+            // compare - the round has to be complete before "most credible" means anything.
+            //
+            // The wait is bounded by ONE dial's worst case, since the dials run concurrently - and
+            // a single dial is NOT one `connect_timeout`. It tries the priority addresses
+            // sequentially, then a DNS lookup, then the discovered addresses in sequential chunks
+            // of `connect::BATCH_SIZE`, each of those steps bounded by `connect_timeout`
+            // separately: `(PRIORITY_SLOTS + 1 + ceil(N / BATCH_SIZE)) * connect_timeout` for a
+            // discovery set of N addresses. Stated because the earlier text claimed a bound of one
+            // `connect_timeout`, which a caller sizing its own deadline around this would have
+            // believed.
             let mut candidates = Vec::new();
             while let Some(result) = dials.next().await {
                 match result {
                     Ok((connection, handshake)) => candidates.push(DialCandidate {
                         origin: connection.3,
+                        address: connection.1,
                         handshake,
                         connection,
                     }),
@@ -301,24 +352,36 @@ impl PeerPool {
                 }
             }
 
-            let offered = candidates.len();
-            let mut admitted = 0usize;
-            for candidate in most_credible(candidates, wanted) {
-                let (peer, addr, receiver, origin) = candidate.connection;
-                if self.admit_and_follow(peer, addr, receiver, origin).await {
-                    admitted += 1;
-                }
-            }
-            if offered > admitted {
-                log::debug!(
-                    "dial round kept {admitted} of {offered} candidates for {wanted} slots"
-                );
-            }
-
-            if admitted == 0 {
+            if self.admit_most_credible(candidates, wanted).await == 0 {
                 return;
             }
         }
+    }
+
+    /// Judge one completed round and admit its winners, returning how many were admitted.
+    ///
+    /// Separated from [`fill_toward_capacity`](Self::fill_toward_capacity) because it is the whole
+    /// of the round's SELECTION — rank, deduplicate, truncate, admit — and the surrounding function
+    /// cannot be exercised without a live network. The defect this addresses (#43) lived precisely
+    /// in the join between the ranking and the admission, where a unit test of the ranking alone
+    /// could not see it.
+    async fn admit_most_credible(
+        &self,
+        candidates: Vec<DialCandidate<Connected>>,
+        wanted: usize,
+    ) -> usize {
+        let offered = candidates.len();
+        let mut admitted = 0usize;
+        for candidate in most_credible(candidates, wanted) {
+            let (peer, addr, receiver, origin) = candidate.connection;
+            if self.admit_and_follow(peer, addr, receiver, origin).await {
+                admitted += 1;
+            }
+        }
+        if offered > admitted {
+            log::debug!("dial round kept {admitted} of {offered} candidates for {wanted} slots");
+        }
+        admitted
     }
 
     /// Admit a connection and, if it was admitted, start following its frames.
@@ -615,12 +678,16 @@ impl PeerPool {
             .collect();
 
         // No independent voice has spoken, so there is no bar to judge anyone against, and the
-        // pool evicts NOTHING. Stated rather than left to the arithmetic: this is now reachable
-        // in ordinary operation - a host that connected its priority addresses before discovery
-        // holds entries that all announce and none of which may vote - and the alternative
-        // readings are both worse. Evicting on a bar set by non-voices is the defect above;
-        // evicting everyone against a reference of zero would destroy the pool on the first
-        // maintenance pass after start-up.
+        // pool evicts NOTHING. This branch is reachable in ordinary operation - a host that
+        // connected its priority addresses before discovery holds entries that all announce and
+        // none of which may vote - and it says so IN ITS OWN VOICE rather than relying on the
+        // retain below.
+        //
+        // It is deliberately not load-bearing, and claiming otherwise would be false: replacing it
+        // with `unwrap_or(0)` leaves every test green, because `reference.saturating_sub(peak)`
+        // floors at zero and a reference of zero can never exceed `PEAK_LAG_EVICTION`. The two
+        // spellings agree. What the early return adds is that "there is no bar" and "the bar is
+        // zero" are different statements about the pool, and only one of them is true here.
         let Some(reference) = reference_peak(&announced) else {
             return Vec::new();
         };
@@ -1002,6 +1069,18 @@ impl PeerPool {
         origin: connect::PeerOrigin,
     ) -> bool {
         self.admit_and_follow(peer, address, receiver, origin).await
+    }
+
+    /// Judge and admit one completed round, exactly as [`fill_toward_capacity`] would.
+    ///
+    /// The round is the unit under test: a dial cannot be made offline, but the candidates a dial
+    /// produces can be, and everything the pool decides about them happens after the dial returns.
+    pub(crate) async fn admit_most_credible_for_tests(
+        &self,
+        candidates: Vec<DialCandidate<Connected>>,
+        wanted: usize,
+    ) -> usize {
+        self.admit_most_credible(candidates, wanted).await
     }
 
     /// Run only the dead-session half of [`maintain`](Self::maintain), which does not dial.
@@ -2331,6 +2410,7 @@ mod tests {
             .enumerate()
             .map(|(i, ms)| DialCandidate {
                 origin: PeerOrigin::Discovered,
+                address: address(i as u8 + 1),
                 handshake: Duration::from_millis(*ms),
                 connection: i,
             })
@@ -2402,6 +2482,139 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // A round's budget is a budget of DISTINCT peers (#43)
+    // -----------------------------------------------------------------------
+
+    /// One candidate as a completed dial would produce it, carrying a REAL connection.
+    ///
+    /// The receiver is held by the candidate and dropped with it, so a discarded candidate closes
+    /// exactly as a discarded dial does.
+    async fn candidate_at(
+        peer: &Peer,
+        addr: SocketAddr,
+        origin: PeerOrigin,
+        ms: u64,
+    ) -> DialCandidate<Connected> {
+        let (_tx, rx) = mpsc::channel(1);
+        DialCandidate {
+            origin,
+            address: addr,
+            handshake: Duration::from_millis(ms),
+            connection: (peer.clone(), addr, rx, origin),
+        }
+    }
+
+    /// **Proves (#43), at ROUND level:** a round's slots are spent on DISTINCT peers, so duplicate
+    /// winners cannot consume the budget the pool's independent voices need.
+    ///
+    /// **The fixture is an ordinary start-up round with no attacker in it.** Every dial in a round
+    /// shares one `held` snapshot and every dial offers the priority addresses first, so when one
+    /// priority address is reachable each dial returns it — eight copies — and the dials that were
+    /// refused by that node's inbound limit fall through to discovery and return distinct peers.
+    /// Sorting priority-first then by ascending handshake gathers all eight copies at the head,
+    /// which is exactly what a truncate to eight slots keeps.
+    ///
+    /// **It asserts DISTINCT admitted addresses, not the admitted count**, because
+    /// [`PeerPool::admit`] already rejects a duplicate address: a round that offers eight copies
+    /// admits one of them either way and the pool never HOLDS a duplicate. What the defect costs is
+    /// the seven slots the copies occupied in the budget, and only a distinct count can see that.
+    /// Measured before the fix, this round admitted 1 distinct peer of 8 slots.
+    ///
+    /// **And it runs the round, not the ranker.** `most_credible` in isolation cannot show this:
+    /// the loss is in the join between ranking and admission, which is why the ranker was provably
+    /// ordered while the round it fed was not.
+    #[tokio::test]
+    async fn a_round_of_duplicate_winners_still_spends_its_slots_on_distinct_peers() {
+        const SLOTS: usize = 8;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+        let reachable_priority = address(1);
+
+        let mut round = Vec::new();
+        // Eight dials all reached the one reachable priority address, fastest-first at the head.
+        for i in 0..8u64 {
+            round.push(candidate_at(&peer, reachable_priority, PeerOrigin::Priority, i).await);
+        }
+        // Eight dials fell through to discovery and reached eight distinct peers, every one of
+        // them slower than every copy above - so nothing but distinctness can save them.
+        for octet in 10..18u8 {
+            round.push(candidate_at(&peer, address(octet), PeerOrigin::Discovered, 500).await);
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let distinct: std::collections::HashSet<_> = held.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            SLOTS,
+            "a round of {SLOTS} slots must admit {SLOTS} DISTINCT peers, not {} (held: {held:?})",
+            distinct.len()
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            SLOTS - 1,
+            "the one priority entry costs one slot; the rest must be independent voices"
+        );
+    }
+
+    /// The control: deduplication must not cost a round that had no duplicates in it.
+    ///
+    /// Without this, collapsing the candidate set to one entry — or to one per origin — would
+    /// satisfy the test above while emptying every ordinary round.
+    #[tokio::test]
+    async fn a_round_of_distinct_peers_is_unaffected_by_deduplication() {
+        const SLOTS: usize = 8;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for octet in 1..=8u8 {
+            round.push(candidate_at(&peer, address(octet), PeerOrigin::Discovered, 100).await);
+        }
+
+        let admitted = pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        assert_eq!(
+            admitted, SLOTS,
+            "eight distinct candidates fill eight slots"
+        );
+        assert_eq!(pool.independent_peer_count().await, SLOTS);
+    }
+
+    /// **Proves:** the survivor of a duplicate group is its FASTEST member, not an arbitrary one.
+    ///
+    /// Deduplicating before the sort — or keeping the last occurrence — would keep a slower copy of
+    /// the same peer, which is a different and worse ranking wearing the same distinct count. The
+    /// slow copy is FIRST in the round so a dedup that ran on the unsorted list keeps it.
+    #[test]
+    fn deduplication_keeps_the_fastest_copy_of_a_repeated_address() {
+        let repeated = address(1);
+        let round = vec![
+            DialCandidate {
+                origin: PeerOrigin::Discovered,
+                address: repeated,
+                handshake: Duration::from_millis(900),
+                connection: 0usize,
+            },
+            DialCandidate {
+                origin: PeerOrigin::Discovered,
+                address: repeated,
+                handshake: Duration::from_millis(10),
+                connection: 1usize,
+            },
+        ];
+
+        let kept = most_credible(round, 4);
+
+        assert_eq!(kept.len(), 1, "one address is one candidate");
+        assert_eq!(
+            kept[0].connection, 1,
+            "the fastest copy of the address must be the one retained"
+        );
+    }
+
     /// **Proves:** a priority candidate is never crowded out by a faster stranger.
     ///
     /// The priority entry is the SLOWEST in the round, so any ranking that considered only latency
@@ -2413,6 +2626,7 @@ mod tests {
         let mut round = round_over(&[1, 2, 3], 3);
         round.push(DialCandidate {
             origin: PeerOrigin::Priority,
+            address: address(99),
             handshake: Duration::from_millis(999),
             connection: 99,
         });
