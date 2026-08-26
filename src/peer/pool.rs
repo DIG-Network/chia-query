@@ -479,11 +479,27 @@ impl PeerPool {
     /// just-admitted peer has had no chance to speak, and its `last_peak` of 0 would otherwise read
     /// as the furthest-behind peer in the pool. Session death and age own that peer's fate.
     ///
-    /// # Only DISCOVERED peers, and no floor exemption
+    /// # Only DISCOVERED peers — both as CANDIDATES and as VOTERS
     ///
-    /// Discovered entries are exactly the set whose count this defect corrupts — a priority entry
-    /// is the operator's own node and is not an independent voice in the first place — and
-    /// re-dialling one would only reach the same address.
+    /// `Priority` entries are exempt from being evicted, and they are also excluded from the
+    /// `announced` set the reference is taken over. **These are two separate properties and the
+    /// second is the one that has security content** (#42): exempting a peer decides only its own
+    /// fate, while letting it vote hands it a say over everyone else's.
+    ///
+    /// A priority entry is the operator's own or co-resident node — precisely the source a local
+    /// attacker can supply (dig_ecosystem#2648) — so `independent_peer_count` already refuses to
+    /// count it as a voice. Counting its announced peak in the median granted it back, through the
+    /// side door, the authority the origin was introduced to deny: with `PRIORITY_SLOTS` such
+    /// entries the median rests on them whenever the pool holds one discovered peer, and two
+    /// fabricated heights evict it, taking the independent count to zero.
+    ///
+    /// The consequence is stated on the empty case below: once only discovered peaks vote, a pool
+    /// holding no independent voice has no reference and evicts NOTHING.
+    ///
+    /// # No floor exemption
+    ///
+    /// Discovered entries are exactly the set whose count this defect corrupts, and re-dialling a
+    /// priority address would only reach the same address.
     ///
     /// Eviction is NOT capped to keep the pool at [`CORROBORATION_FLOOR`]. Keeping a lagging peer
     /// so the arithmetic still reaches the floor would preserve precisely the inflated denominator
@@ -496,9 +512,18 @@ impl PeerPool {
 
         let announced: Vec<u32> = entries
             .iter()
+            .filter(|e| e.origin == connect::PeerOrigin::Discovered)
             .map(|e| e.last_peak.load(Ordering::Relaxed))
             .filter(|peak| *peak > 0)
             .collect();
+
+        // No independent voice has spoken, so there is no bar to judge anyone against, and the
+        // pool evicts NOTHING. Stated rather than left to the arithmetic: this is now reachable
+        // in ordinary operation - a host that connected its priority addresses before discovery
+        // holds entries that all announce and none of which may vote - and the alternative
+        // readings are both worse. Evicting on a bar set by non-voices is the defect above;
+        // evicting everyone against a reference of zero would destroy the pool on the first
+        // maintenance pass after start-up.
         let Some(reference) = reference_peak(&announced) else {
             return Vec::new();
         };
@@ -2092,5 +2117,129 @@ mod tests {
     fn a_single_outlier_cannot_move_the_reference_peak() {
         assert_eq!(reference_peak(&[100, 100, 100, u32::MAX]), Some(100));
         assert_eq!(reference_peak(&[100, 100, 100, 1]), Some(100));
+    }
+
+    // -----------------------------------------------------------------------
+    // Who VOTES in the reference peak (#42)
+    // -----------------------------------------------------------------------
+
+    /// Admit `entries` as `(origin, announced peak)` at `address(i + 1)`.
+    ///
+    /// [`pool_at_peaks`] cannot express these fixtures: its peers are all `Discovered`, and the
+    /// property under test is precisely what changes when the origins DIFFER.
+    async fn pool_of(max_peers: usize, entries: &[(PeerOrigin, u32)]) -> PeerPool {
+        let pool = empty_pool(max_peers);
+        for (i, (origin, peak)) in entries.iter().enumerate() {
+            assert!(
+                pool.admit_at_peak_for_tests(
+                    loopback_peer().await,
+                    address(i as u8 + 1),
+                    *origin,
+                    *peak,
+                )
+                .await,
+                "fixture entry {i} must be admitted"
+            );
+        }
+        pool
+    }
+
+    /// **Proves (#42):** hostile `Priority` entries cannot VOTE the only independent peer out of
+    /// the pool.
+    ///
+    /// `Priority` entries are already exempt from BEING evicted. That is a different property from
+    /// whether they COUNT toward the reference the eviction is measured against, and granting the
+    /// second is what let two co-resident entries — the exact pair a local attacker supplies
+    /// (dig_ecosystem#2648) — carry the median to a fabricated height and take
+    /// `independent_peer_count` from 1 to 0.
+    ///
+    /// **The fixture is the minimum that can express the failure and is sized from the crate's own
+    /// bound.** The attack needs the priority voices to be at least as many as the discovered ones
+    /// — at two discovered peers the median already sits on an honest voice — so the worst case
+    /// reachable in production is `PRIORITY_SLOTS` hostile entries against ONE discovered peer.
+    /// That is not an arbitrarily small fixture; it is the whole of what the dialler can produce.
+    #[tokio::test]
+    async fn hostile_priority_entries_cannot_vote_the_only_independent_peer_out() {
+        let inflated = CURRENT + 1_000_000;
+        let pool = pool_of(
+            5,
+            &[
+                (PeerOrigin::Priority, inflated),
+                (PeerOrigin::Priority, inflated),
+                (PeerOrigin::Discovered, CURRENT),
+            ],
+        )
+        .await;
+        assert_eq!(pool.independent_peer_count().await, 1);
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "peers that are not independent voices must not set the bar that evicts one"
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            1,
+            "the pool must not be emptied of independent voices by entries that never were any"
+        );
+    }
+
+    /// **The control, and the placement proof.** The filter must narrow WHOSE peak is counted, not
+    /// switch the eviction off.
+    ///
+    /// Here the priority entries are far BELOW the chain rather than above it, which drags an
+    /// unfiltered median down onto the lagging peer and shields it. Counting only the discovered
+    /// peaks puts the reference back on the honest majority and the lagger goes. So this fixture
+    /// fails both for an implementation that stopped evicting and for one that kept the priority
+    /// votes — and its verdict is the OPPOSITE of the test above, which no "evict less" change can
+    /// satisfy at the same time.
+    #[tokio::test]
+    async fn priority_entries_below_the_chain_cannot_shield_a_lagging_discovered_peer() {
+        let stale = CURRENT - 500_000;
+        let behind = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = pool_of(
+            8,
+            &[
+                (PeerOrigin::Priority, stale),
+                (PeerOrigin::Priority, stale),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, CURRENT),
+                (PeerOrigin::Discovered, behind),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address(6)],
+            "the reference follows the independent peers, so the lagger is still evicted"
+        );
+    }
+
+    /// **Proves:** with no independent voice having spoken, the pool evicts NOTHING — stated, not
+    /// left to fall out of the arithmetic.
+    ///
+    /// This is the decision the filter forces: once only `Discovered` peaks vote, a pool that holds
+    /// none — a just-started host whose priority addresses connected first — has no reference at
+    /// all. Refusing to evict is the fail-safe direction: `corroboration_readiness` already REFUSES
+    /// below its floor, so a pool that keeps a peer it cannot judge downgrades a read, while a pool
+    /// that evicts on a bar set by non-voices destroys the very peers it needs.
+    #[tokio::test]
+    async fn a_pool_whose_only_speakers_are_priority_entries_evicts_nothing() {
+        let pool = pool_of(
+            5,
+            &[
+                (PeerOrigin::Priority, CURRENT + 1_000_000),
+                (PeerOrigin::Priority, CURRENT - 1_000_000),
+                (PeerOrigin::Discovered, 0),
+            ],
+        )
+        .await;
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "no independent voice has spoken, so there is no bar to evict against"
+        );
+        assert_eq!(pool.held_addresses_for_tests().await.len(), 3);
     }
 }
