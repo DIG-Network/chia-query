@@ -330,6 +330,23 @@ signal a peer has produced by the moment the pool must judge it. The sort MUST b
 keep discovery's shuffle rather than an address ordering an adversary could sort early into.
 Discarded candidates' connections are closed.
 
+A round MUST deduplicate its candidates by address, retaining each address's FASTEST occurrence,
+AFTER the ranking and BEFORE the truncate to the available slots. A round's budget is therefore a
+budget of DISTINCT peers. This is not an edge case: every dial in a round shares one snapshot of the
+held addresses, every dial offers the priority addresses ahead of discovery, and every dial returns
+the first address in its chunk to complete a handshake — so a reachable priority address is returned
+by as many dials as the round opened, and an ascending-handshake ranking gathers those copies at the
+head, exactly where a truncate keeps them. Admission already rejects a duplicate address, so the
+pool never holds one; what duplicates consume without this rule is the SLOTS, which lowers the
+independent peer count that `corroboration_readiness` arms on and pushes reads onto the centralized
+fallback.
+
+A round's wait is bounded by one dial's worst case, since the dials of a round run concurrently. One
+dial is NOT one `peer_connect_timeout`: it tries the priority addresses sequentially, then performs a
+DNS introducer lookup, then tries the discovered addresses in sequential batches of 10, each step
+bounded by `peer_connect_timeout` separately — `(PRIORITY_SLOTS + 1 + ceil(N / 10)) *
+peer_connect_timeout` for a discovery set of N addresses.
+
 Oversubscription is NOT a term in the capacity derivation. `max_peers` remains `default_max_peers()`,
 derived from `QUORUM_SAMPLE` above; this widens the CANDIDATE set only, so the number of independent
 voices the pool holds is unchanged and only their identity differs. The factor is deliberately small:
