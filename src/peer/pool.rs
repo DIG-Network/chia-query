@@ -18,9 +18,7 @@ use super::connect;
 use super::frames::{
     FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
 };
-use super::plurality::{
-    CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PRIORITY_SLOTS,
-};
+use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PRIORITY_SLOTS};
 
 /// How many dial rounds [`PeerPool::fill_toward_capacity`] may spend reaching capacity.
 ///
@@ -242,7 +240,13 @@ impl PeerPool {
         let source = self.fanout.allocate_session(address);
         let last_peak = Arc::new(AtomicU32::new(0));
         if !self
-            .admit(peer, address, origin, source.session, Arc::clone(&last_peak))
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::clone(&last_peak),
+            )
             .await
         {
             return false;
@@ -1990,7 +1994,9 @@ mod tests {
             "an IPv6 lagger is evicted"
         );
         assert!(
-            pool.held_addresses_for_tests().await.contains(&address_v6(1)),
+            pool.held_addresses_for_tests()
+                .await
+                .contains(&address_v6(1)),
             "a current IPv6 peer is kept"
         );
     }
@@ -2058,8 +2064,16 @@ mod tests {
     fn the_reference_peak_is_the_lower_median_and_is_unknown_when_nobody_has_spoken() {
         assert_eq!(reference_peak(&[]), None);
         assert_eq!(reference_peak(&[7]), Some(7));
-        assert_eq!(reference_peak(&[10, 20]), Some(10), "the LOWER of two middles");
-        assert_eq!(reference_peak(&[30, 10, 20]), Some(20), "order does not matter");
+        assert_eq!(
+            reference_peak(&[10, 20]),
+            Some(10),
+            "the LOWER of two middles"
+        );
+        assert_eq!(
+            reference_peak(&[30, 10, 20]),
+            Some(20),
+            "order does not matter"
+        );
     }
 
     /// **Proves:** one outlier in either direction cannot move the reference — the property the
@@ -2070,5 +2084,4 @@ mod tests {
         assert_eq!(reference_peak(&[100, 100, 100, u32::MAX]), Some(100));
         assert_eq!(reference_peak(&[100, 100, 100, 1]), Some(100));
     }
-
 }

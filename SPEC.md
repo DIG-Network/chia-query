@@ -357,6 +357,25 @@ half: a fixed set is a set an attacker only has to capture once, and a captured 
 so failure-driven ejection cannot substitute for it. `Priority` entries are NOT rotated — re-dialling
 the same operator address spends a handshake to change nothing.
 
+#### Lag: peers are evicted when they stop following the chain
+
+`evict_lagging_peers()` removes every `Discovered` entry whose own announced peak trails the pool
+reference peak by more than `PEAK_LAG_EVICTION` (6 blocks, twice `PEAK_LAG_TOLERANCE`), and
+`maintain()` then refills. This is the pool FOURTH removal and it is the only one that reaches a
+peer which answers correctly about an older chain: such a peer fails no request, holds a live
+session, and may have minutes of `PEER_LIFETIME` left, so the other three never see it.
+
+The reference peak is the MEDIAN of the peaks the held peers have announced, and MUST NOT be the
+maximum. A maximum is settable by a single voice, so one peer announcing an inflated peak would
+evict every honest peer and leave itself holding the pool. A peer entry that has announced NOTHING
+is never evicted here — silence is not lag — and `Priority` entries are exempt for the same reason
+cycling exempts them.
+
+Eviction is NOT capped to preserve `CORROBORATION_FLOOR`. Holding a lagging peer so the arithmetic
+still reaches the floor preserves exactly the inflated denominator this removal exists to correct;
+`corroboration_readiness` refuses rather than degrading, so falling under the floor declines the
+read, which is the fail-safe direction.
+
 #### Frame fan-out
 
 A pooled session's inbound frames are fanned out to subscribers over BOUNDED per-subscriber
@@ -582,6 +601,7 @@ struct ChiaQueryConfig {
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
 5. **Pool size invariant**: The pool always targets `max_peers` connections. The `PeerBackend::read` path maintains the pool on every request, refilling it if below target
 5b. **Cycling invariant**: A `Discovered` peer held for `PEER_LIFETIME` or longer MUST be rotated out on AGE, independently of whether any request to it has failed
+5f. **Lag invariant**: A `Discovered` peer whose announced peak trails the pool median peak by more than `PEAK_LAG_EVICTION` MUST be evicted on the next maintenance pass, independently of whether any request to it has failed and independently of its age. The reference peak MUST be a median, never a maximum, so that no single peer claim can decide which peers are evicted
 5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
 5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
 5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
