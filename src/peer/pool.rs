@@ -18,7 +18,7 @@ use super::connect;
 use super::frames::{
     FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
 };
-use super::plurality::{CORROBORATION_FLOOR, PEER_LIFETIME, PRIORITY_SLOTS};
+use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PRIORITY_SLOTS};
 
 /// How many dial rounds [`PeerPool::fill_toward_capacity`] may spend reaching capacity.
 ///
@@ -52,6 +52,16 @@ struct PeerEntry {
     /// How this peer was reached. Held so a caller counting independent opinions can tell a
     /// preferred local node from a discovered one - see [`connect::PeerOrigin`].
     origin: connect::PeerOrigin,
+    /// The highest peak THIS peer has announced, or 0 before it has announced any.
+    ///
+    /// The pool's shared `peak_height` is a `fetch_max` across every session, so it answers "how
+    /// high is the chain" and can never say which peer is behind. Lag is a per-peer fact and needs
+    /// a per-peer number.
+    ///
+    /// An `Arc<AtomicU32>` because the only writer is the entry's receiver-handler task, which
+    /// runs detached and cannot take the pool's write lock. It is cloned into that task at
+    /// admission and dies with the entry, so nothing accumulates.
+    last_peak: Arc<AtomicU32>,
     /// When this connection entered the pool, so it can be rotated out on a TIMER.
     ///
     /// The pool's other eviction is failure-driven, and failure is not the risk this guards: a set
@@ -228,11 +238,21 @@ impl PeerPool {
         origin: connect::PeerOrigin,
     ) -> bool {
         let source = self.fanout.allocate_session(address);
-        if !self.admit(peer, address, origin, source.session).await {
+        let last_peak = Arc::new(AtomicU32::new(0));
+        if !self
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::clone(&last_peak),
+            )
+            .await
+        {
             return false;
         }
         self.fanout.open_session(source).await;
-        self.spawn_receiver_handler(source, receiver);
+        self.spawn_receiver_handler(source, receiver, last_peak);
         true
     }
 
@@ -428,12 +448,88 @@ impl PeerPool {
         Some(address)
     }
 
-    /// One maintenance pass: rotate out an over-age peer, then refill toward capacity.
+    /// Evict the discovered peers that have fallen too far behind the chain the pool sees.
+    ///
+    /// Returns the addresses removed. This is the pool's FOURTH eviction reason, and a
+    /// connected-but-lagging peer escapes all three of the others: it fails no request, so
+    /// [`eject_peer`](Self::eject_peer) never fires; its session is alive, so
+    /// [`eject_dead_sessions`](Self::eject_dead_sessions) never sees it; and it may have minutes
+    /// of [`PEER_LIFETIME`] left, so [`cycle_expired_peers`](Self::cycle_expired_peers) is not due.
+    /// Until now it therefore counted as an armed corroborating voice in
+    /// [`corroboration_readiness`](Self::corroboration_readiness) while answering about an older
+    /// chain — a denominator that overstated how many CURRENT voices the pool held (#40).
+    ///
+    /// # The reference peak is a MEDIAN, never a maximum, and that is the security of it
+    ///
+    /// Lag is measured against [`reference_peak`], the median of what the held peers have
+    /// announced. A maximum would hand the bar to whichever peer claims the highest number, so one
+    /// hostile peer announcing an inflated peak would evict every honest peer in the pool and
+    /// leave itself — turning an eviction written for NC-12 into the cleanest possible attack on
+    /// it. A median moves UPWARD — the direction that evicts honest peers — only if MORE THAN HALF
+    /// the held peers agree to move it: 5 of 8, 3 of 4, 2 of 3, measured. A pool whose majority is
+    /// hostile has already lost, so no eviction policy can rescue it.
+    ///
+    /// Moving it DOWNWARD is cheaper — at an even size exactly half suffices, 4 of 8 — and that
+    /// asymmetry is deliberate rather than a gap. Lag is `reference - peak > PEAK_LAG_EVICTION`, so
+    /// a lower reference can only evict FEWER peers; the worst a colluding half achieves is the
+    /// no-eviction status quo, which it could reach more cheaply by announcing the true peak. The
+    /// bar is guarded in the only direction where crossing it costs anything.
+    ///
+    /// A peer that has announced NOTHING yet is never evicted here. Silence is not lag: a
+    /// just-admitted peer has had no chance to speak, and its `last_peak` of 0 would otherwise read
+    /// as the furthest-behind peer in the pool. Session death and age own that peer's fate.
+    ///
+    /// # Only DISCOVERED peers, and no floor exemption
+    ///
+    /// Discovered entries are exactly the set whose count this defect corrupts — a priority entry
+    /// is the operator's own node and is not an independent voice in the first place — and
+    /// re-dialling one would only reach the same address.
+    ///
+    /// Eviction is NOT capped to keep the pool at [`CORROBORATION_FLOOR`]. Keeping a lagging peer
+    /// so the arithmetic still reaches the floor would preserve precisely the inflated denominator
+    /// this exists to remove, and would do it in the marginal case where it matters most.
+    /// `corroboration_readiness` REFUSES rather than degrading, so falling under the floor makes
+    /// the read decline and fall back — the fail-safe direction — and
+    /// [`maintain`](Self::maintain) refills immediately afterwards.
+    pub async fn evict_lagging_peers(&self) -> Vec<SocketAddr> {
+        let mut entries = self.entries.write().await;
+
+        let announced: Vec<u32> = entries
+            .iter()
+            .map(|e| e.last_peak.load(Ordering::Relaxed))
+            .filter(|peak| *peak > 0)
+            .collect();
+        let Some(reference) = reference_peak(&announced) else {
+            return Vec::new();
+        };
+
+        let mut evicted = Vec::new();
+        entries.retain(|entry| {
+            let peak = entry.last_peak.load(Ordering::Relaxed);
+            let lagging = entry.origin == connect::PeerOrigin::Discovered
+                && peak > 0
+                && reference.saturating_sub(peak) > PEAK_LAG_EVICTION;
+            if lagging {
+                log::debug!(
+                    "peer {} evicted: peak {peak} trails the pool's reference {reference} by more \
+                     than {PEAK_LAG_EVICTION} blocks",
+                    entry.address
+                );
+                evicted.push(entry.address);
+            }
+            !lagging
+        });
+        evicted
+    }
+
+    /// One maintenance pass: drop what the pool no longer truly holds, then refill toward capacity.
     ///
     /// Cycling before refilling is deliberate. Refilling first would find the pool at capacity and
-    /// do nothing, so the rotation would leave a permanently smaller pool.
+    /// do nothing, so the rotation would leave a permanently smaller pool. Lag eviction runs in
+    /// the same window and for the same reason.
     pub async fn maintain(&self) {
         self.eject_dead_sessions().await;
+        self.evict_lagging_peers().await;
         self.cycle_expired_peers().await;
         self.try_refill().await;
     }
@@ -493,6 +589,7 @@ impl PeerPool {
         address: SocketAddr,
         origin: connect::PeerOrigin,
         session: SessionId,
+        last_peak: Arc<AtomicU32>,
     ) -> bool {
         let mut entries = self.entries.write().await;
 
@@ -510,6 +607,7 @@ impl PeerPool {
             address,
             origin,
             session,
+            last_peak,
             admitted_at: Instant::now(),
         });
         log::debug!("peer admitted: {address} ({origin:?})");
@@ -573,6 +671,7 @@ impl PeerPool {
         &self,
         source: FrameSource,
         mut receiver: mpsc::Receiver<Message>,
+        last_peak: Arc<AtomicU32>,
     ) {
         let peak = Arc::clone(&self.peak_height);
         let fanout = Arc::clone(&self.fanout);
@@ -593,6 +692,7 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
+                        last_peak.fetch_max(new_peak.height, Ordering::Relaxed);
                         let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
                         if new_peak.height > prev {
                             log::debug!(
@@ -642,6 +742,28 @@ impl PeerPool {
     pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
         self.fanout.subscribe(capacity).await
     }
+}
+
+/// The peak the pool treats as the chain's, given what its held peers have announced.
+///
+/// The LOWER MEDIAN of `announced`, and `None` when nobody has announced anything.
+///
+/// A median rather than a maximum because this number decides which peers are evicted for lag, and
+/// a maximum is settable by a single voice: one peer claiming an absurd height would make every
+/// honest peer look hopelessly behind. Raising a median requires more than half the held peers to
+/// agree, which is the plurality NC-12 already rests on. Lowering it takes only half at an even
+/// size, which is harmless: a lower reference evicts fewer peers, never more.
+///
+/// The LOWER median on an even-sized set — the smaller of the two middles — so the bar is the more
+/// forgiving of the two candidates. Eviction is destructive and a redial is not free, so where the
+/// pool is genuinely split between two heights the tie is resolved toward keeping peers.
+fn reference_peak(announced: &[u32]) -> Option<u32> {
+    if announced.is_empty() {
+        return None;
+    }
+    let mut sorted = announced.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[(sorted.len() - 1) / 2])
 }
 
 /// Translate a decoded `CoinStateUpdate` into the frame its subscribers see.
@@ -707,10 +829,49 @@ impl PeerPool {
         origin: connect::PeerOrigin,
     ) -> bool {
         let session = self.fanout.allocate_session(address).session;
-        self.admit(peer, address, origin, session).await
+        self.admit(peer, address, origin, session, Arc::new(AtomicU32::new(0)))
+            .await
+    }
+
+    /// Admit a connection that has already announced `peak`.
+    ///
+    /// A peer's peak is otherwise only reachable by feeding a real `NewPeakWallet` down a live
+    /// session, which a membership test has no reason to build. Wrapping the private field rather
+    /// than widening it keeps production code on exactly one admission path.
+    pub(crate) async fn admit_at_peak_for_tests(
+        &self,
+        peer: Peer,
+        address: SocketAddr,
+        origin: connect::PeerOrigin,
+        peak: u32,
+    ) -> bool {
+        let session = self.fanout.allocate_session(address).session;
+        self.admit(
+            peer,
+            address,
+            origin,
+            session,
+            Arc::new(AtomicU32::new(peak)),
+        )
+        .await
+    }
+
+    /// The peak this pool has recorded for `address`, if it holds it.
+    pub(crate) async fn recorded_peak_for_tests(&self, address: SocketAddr) -> Option<u32> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| e.last_peak.load(Ordering::Relaxed))
     }
 
     /// Admit a connection AND follow `receiver`, exactly as a real dial would.
+    /// Run only the lag half of [`maintain`](Self::maintain), which does not dial.
+    pub(crate) async fn evict_lagging_peers_for_tests(&self) -> Vec<SocketAddr> {
+        self.evict_lagging_peers().await
+    }
+
     pub(crate) async fn admit_and_follow_for_tests(
         &self,
         peer: Peer,
@@ -764,7 +925,7 @@ mod tests {
     use super::*;
     use crate::peer::connect::{create_generated_tls, PeerOrigin};
     use crate::peer::plurality::{default_max_peers, QUORUM_SAMPLE};
-    use crate::peer::test_support::{address, loopback_peer};
+    use crate::peer::test_support::{address, address_v6, loopback_peer};
 
     use super::PeerPool as _Pool;
     fn empty_pool(max_peers: usize) -> PeerPool {
@@ -1640,5 +1801,296 @@ mod tests {
             got_items, items,
             "the coin states are the payload; a frame without them tells subscribers nothing about their coins"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lag eviction: the peer that answers fine, about an older chain (#40)
+    // -----------------------------------------------------------------------
+
+    /// The reference height every lag fixture is written against. Arbitrary, but far enough above
+    /// `PEAK_LAG_EVICTION` that "behind by more than the bar" never has to saturate at zero.
+    const CURRENT: u32 = 9_196_851;
+
+    /// A pool holding `peaks` as discovered peers at `address(i + 1)`, one per entry.
+    async fn pool_at_peaks(max_peers: usize, peaks: &[u32]) -> PeerPool {
+        let pool = empty_pool(max_peers);
+        for (i, peak) in peaks.iter().enumerate() {
+            assert!(
+                pool.admit_at_peak_for_tests(
+                    loopback_peer().await,
+                    address(i as u8 + 1),
+                    PeerOrigin::Discovered,
+                    *peak,
+                )
+                .await,
+                "fixture peer {i} must be admitted"
+            );
+        }
+        pool
+    }
+
+    /// **Proves (#40):** a peer that stays connected and merely falls behind is EVICTED, with no
+    /// request having failed, no session having ended, and no lifetime having elapsed — the three
+    /// removals it previously escaped.
+    ///
+    /// **The fixture varies exactly ONE actor.** Three peers stay current and one falls behind, so
+    /// a sweep that removed everything, or an eviction that fired on something other than lag,
+    /// changes the outcome and fails. An all-lagging fixture could not see this at all: the median
+    /// would move down with the pool and nobody would be behind it.
+    ///
+    /// The readiness assertion is the point of the ticket rather than a bonus — the harm was an
+    /// `Armed { corroborators }` that counted a peer answering about an older chain.
+    #[tokio::test]
+    async fn a_lagging_peer_is_evicted_though_nothing_failed_and_no_session_ended() {
+        let lagging = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, lagging]).await;
+
+        let asked = address(9);
+        assert_eq!(
+            pool.corroboration_readiness(asked).await,
+            CorroborationReadiness::Armed { corroborators: 4 },
+            "the lagging peer is counted as a current voice until the eviction runs"
+        );
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address(4)],
+            "only the peer behind the reference is evicted"
+        );
+        assert_eq!(
+            pool.held_addresses_for_tests().await,
+            vec![address(1), address(2), address(3)],
+            "the three current peers are untouched"
+        );
+        assert_eq!(
+            pool.corroboration_readiness(asked).await,
+            CorroborationReadiness::Armed { corroborators: 3 },
+            "the corroboration denominator now counts only peers on the current chain"
+        );
+    }
+
+    /// **Proves:** the eviction bar is `PEAK_LAG_EVICTION`, pinned from BOTH sides.
+    ///
+    /// A bound tested only from below can only confirm itself: an implementation that evicted
+    /// everything, or that used `>=` where the doc says "more than", passes a one-sided test. So
+    /// exactly-at-the-bar must be KEPT and one block further must be EVICTED, and the two peers
+    /// sit in the SAME pool so no other difference between the fixtures can explain the split.
+    #[tokio::test]
+    async fn the_eviction_bar_keeps_a_peer_at_it_and_drops_the_one_past_it() {
+        let at_bar = CURRENT - PEAK_LAG_EVICTION;
+        let past_bar = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, at_bar, past_bar]).await;
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address(5)],
+            "at the bar is current; one block past it is not"
+        );
+        assert!(
+            pool.held_addresses_for_tests().await.contains(&address(4)),
+            "a peer exactly at the tolerance must survive"
+        );
+    }
+
+    /// **Proves (NC-12):** ONE peer claiming an inflated peak cannot evict the honest majority.
+    ///
+    /// This is the security property of the whole eviction, and it is the assertion that fails if
+    /// the reference peak is ever changed from a median to a maximum: against a maximum the three
+    /// honest peers are a million blocks behind the liar and all three are evicted, leaving the
+    /// pool holding nothing but the hostile peer. A peer claim about the chain is not evidence
+    /// (NC-12), and a bar one voice can set is a bar one voice controls.
+    #[tokio::test]
+    async fn one_peer_claiming_an_inflated_peak_cannot_evict_the_honest_majority() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, CURRENT + 1_000_000]).await;
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "a single inflated claim must not make the honest peers look behind"
+        );
+        assert_eq!(
+            pool.held_addresses_for_tests().await,
+            vec![address(1), address(2), address(3), address(4)],
+            "every honest peer is still held"
+        );
+    }
+
+    /// **Proves:** silence is not lag. A peer admitted moments ago has announced nothing, and its
+    /// recorded peak of zero must not read as the furthest-behind entry in the pool.
+    ///
+    /// Without this the eviction would remove every peer on the maintenance pass that follows its
+    /// own admission — the pool destroying its refill as fast as it dials it.
+    #[tokio::test]
+    async fn a_peer_that_has_announced_nothing_is_never_evicted_as_lagging() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, 0]).await;
+
+        assert!(
+            pool.evict_lagging_peers_for_tests().await.is_empty(),
+            "a peer that has not spoken has not fallen behind"
+        );
+        assert!(
+            pool.held_addresses_for_tests().await.contains(&address(3)),
+            "the silent peer is still held"
+        );
+    }
+
+    /// **Proves:** a lagging PRIORITY peer is not evicted, for the same reason cycling spares one —
+    /// re-dialling reaches the same address, and it is not an independent voice whose count this
+    /// eviction exists to correct.
+    ///
+    /// The discovered lagger in the same pool, at the SAME peak, IS evicted — so the test cannot
+    /// pass by evicting nothing, and origin is the only difference that can explain the split.
+    #[tokio::test]
+    async fn a_lagging_priority_peer_is_kept_while_a_lagging_discovered_peer_goes() {
+        let behind = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = empty_pool(5);
+        for (i, peak) in [CURRENT, CURRENT, CURRENT, behind].iter().enumerate() {
+            assert!(
+                pool.admit_at_peak_for_tests(
+                    loopback_peer().await,
+                    address(i as u8 + 1),
+                    PeerOrigin::Discovered,
+                    *peak,
+                )
+                .await
+            );
+        }
+        assert!(
+            pool.admit_at_peak_for_tests(
+                loopback_peer().await,
+                address(5),
+                PeerOrigin::Priority,
+                behind,
+            )
+            .await
+        );
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address(4)],
+            "the discovered lagger goes and the priority one at the same peak stays"
+        );
+    }
+
+    /// **Proves (§5.2):** the eviction is address-family agnostic — an IPv6 lagger is removed on
+    /// the same terms as an IPv4 one, and a current IPv6 peer is kept.
+    ///
+    /// The peer tier is IPv6-first and the fleet that motivated this held a `2806:2f0::/32` peer. A
+    /// policy proven only against the documentation-range IPv4 addresses every other fixture uses
+    /// is proven against half the network; that is the same defect with a smaller number.
+    #[tokio::test]
+    async fn lag_eviction_treats_an_ipv6_peer_exactly_as_it_treats_an_ipv4_one() {
+        let behind = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = empty_pool(5);
+        for (addr, peak) in [
+            (address_v6(1), CURRENT),
+            (address(1), CURRENT),
+            (address_v6(2), behind),
+        ] {
+            assert!(
+                pool.admit_at_peak_for_tests(
+                    loopback_peer().await,
+                    addr,
+                    PeerOrigin::Discovered,
+                    peak,
+                )
+                .await
+            );
+        }
+
+        assert_eq!(
+            pool.evict_lagging_peers_for_tests().await,
+            vec![address_v6(2)],
+            "an IPv6 lagger is evicted"
+        );
+        assert!(
+            pool.held_addresses_for_tests()
+                .await
+                .contains(&address_v6(1)),
+            "a current IPv6 peer is kept"
+        );
+    }
+
+    /// **Proves the WIRING**, not the policy: `maintain` — the one pass a request actually drives —
+    /// runs the lag eviction. A unit test of `evict_lagging_peers` alone cannot see whether
+    /// anything calls it, and an eviction nothing calls is indistinguishable from no eviction.
+    ///
+    /// `maintain` ends with `try_refill`, which dials, so the call is bounded by a timeout and the
+    /// assertion is made afterwards regardless of how the refill went. Eviction runs BEFORE the
+    /// refill, so it has already happened either way — the timeout can cost the test the refill,
+    /// never its subject.
+    #[tokio::test]
+    async fn maintain_runs_the_lag_eviction() {
+        let lagging = CURRENT - PEAK_LAG_EVICTION - 1;
+        let pool = pool_at_peaks(4, &[CURRENT, CURRENT, CURRENT, lagging]).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(20), pool.maintain()).await;
+
+        assert!(
+            !pool.held_addresses_for_tests().await.contains(&address(4)),
+            "the lagging peer must be gone after a maintenance pass"
+        );
+    }
+
+    /// **Proves:** a peer own `NewPeakWallet` is what sets its recorded peak — the PRODUCTION write
+    /// path, not the test seam. Without this the eviction would be measured entirely against
+    /// numbers tests injected, and a handler that recorded nothing would leave every peer at zero
+    /// and therefore permanently un-evictable.
+    #[tokio::test]
+    async fn a_peers_recorded_peak_comes_from_the_peak_it_announces() {
+        let pool = empty_pool(2);
+        let mut subscription = pool.subscribe_frames(8).await;
+        let addr = address(1);
+        let (session, _source) = followed_session(&pool, addr).await;
+
+        session.send(peak_message(4242)).await.expect("send a peak");
+        drain_at_least(&mut subscription, 1).await;
+
+        // The handler writes the peak and then publishes, both from its own detached task, so the
+        // write is ordered before the frame this test just saw. The poll is for the scheduler, not
+        // for the ordering: it bounds the wait rather than granting the handler extra chances.
+        for _ in 0..200 {
+            if pool.recorded_peak_for_tests(addr).await == Some(4242) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            pool.recorded_peak_for_tests(addr).await,
+            Some(4242),
+            "the announced peak must be recorded against the peer that announced it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The reference peak itself
+    // -----------------------------------------------------------------------
+
+    /// **Proves:** the reference is the LOWER median, so an even split resolves toward keeping
+    /// peers, and it is `None` when nobody has spoken — never a zero, which every peer is above and
+    /// which would evict the entire pool.
+    #[test]
+    fn the_reference_peak_is_the_lower_median_and_is_unknown_when_nobody_has_spoken() {
+        assert_eq!(reference_peak(&[]), None);
+        assert_eq!(reference_peak(&[7]), Some(7));
+        assert_eq!(
+            reference_peak(&[10, 20]),
+            Some(10),
+            "the LOWER of two middles"
+        );
+        assert_eq!(
+            reference_peak(&[30, 10, 20]),
+            Some(20),
+            "order does not matter"
+        );
+    }
+
+    /// **Proves:** one outlier in either direction cannot move the reference — the property the
+    /// hostile-peak test rests on, stated on the pure function so a change to it is caught here
+    /// rather than only through the pool.
+    #[test]
+    fn a_single_outlier_cannot_move_the_reference_peak() {
+        assert_eq!(reference_peak(&[100, 100, 100, u32::MAX]), Some(100));
+        assert_eq!(reference_peak(&[100, 100, 100, 1]), Some(100));
     }
 }

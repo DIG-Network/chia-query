@@ -53,3 +53,17 @@ pub(crate) fn address(last_octet: u8) -> SocketAddr {
         8444,
     )
 }
+
+/// A documentation-range IPv6 address (RFC 3849), distinct per `last_group`.
+///
+/// The peer tier is IPv6-first (CLAUDE.md §5.2) and the fleet that motivated the lag eviction held
+/// `[2806:2f0:...]:8444`, so any policy that enumerates or evicts peers has to be shown working on
+/// a v6 entry. A policy proven only against [`address`] is proven only against half the network.
+pub(crate) fn address_v6(last_group: u16) -> SocketAddr {
+    SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0x0db8, 0, 0, 0, 0, 0, last_group,
+        )),
+        8444,
+    )
+}

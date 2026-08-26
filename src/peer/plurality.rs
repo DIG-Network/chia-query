@@ -54,6 +54,26 @@ pub const CORROBORATION_FLOOR: usize = 2;
 /// plurality half, and neither substitutes for the other.
 pub const PEER_LIFETIME: Duration = Duration::from_secs(300);
 
+/// How far a peer's announced peak may trail the pool's reference peak and still be CURRENT.
+///
+/// Three blocks, matching the bar Sage applies when it decides whether two peers are talking about
+/// the same chain. This is the canonical home for that number: dig-node applies the same tolerance
+/// inside a corroboration round, and two crates each carrying their own `3` is a drift waiting to
+/// happen, so a consumer adopts THIS rather than restating it.
+pub const PEAK_LAG_TOLERANCE: u32 = 3;
+
+/// How far a peer must trail the reference peak before the pool stops HOLDING it.
+///
+/// Twice [`PEAK_LAG_TOLERANCE`], and derived from it rather than chosen: a peer just outside the
+/// round tolerance may simply be one propagation hop late, and evicting on that would spend a
+/// handshake on ordinary jitter. At twice the tolerance the peer has missed roughly six blocks —
+/// about two minutes of mainnet — which is not jitter; it is a peer that is no longer following.
+///
+/// Membership and round tolerance are deliberately different bars for the same reason they are
+/// derived from one constant: a lagging peer's ANSWER must be excluded immediately, while its
+/// CONNECTION is worth keeping a little longer in case it catches up.
+pub const PEAK_LAG_EVICTION: u32 = 2 * PEAK_LAG_TOLERANCE;
+
 /// How many pool slots the PRIORITY path can occupy.
 ///
 /// Two, because the dialler tries two priority addresses before discovery — an operator's
