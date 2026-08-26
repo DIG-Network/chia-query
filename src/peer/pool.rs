@@ -1075,6 +1075,10 @@ impl PeerPool {
     ///
     /// The round is the unit under test: a dial cannot be made offline, but the candidates a dial
     /// produces can be, and everything the pool decides about them happens after the dial returns.
+    ///
+    /// `DialCandidate` stays module-private deliberately — this helper exists for the round test in
+    /// this file and nothing else, so the type is not widened to `pub(crate)` to satisfy the lint.
+    #[allow(private_interfaces)]
     pub(crate) async fn admit_most_credible_for_tests(
         &self,
         candidates: Vec<DialCandidate<Connected>>,
@@ -2515,10 +2519,12 @@ mod tests {
     /// Sorting priority-first then by ascending handshake gathers all eight copies at the head,
     /// which is exactly what a truncate to eight slots keeps.
     ///
-    /// **It asserts DISTINCT admitted addresses, not the admitted count**, because
-    /// [`PeerPool::admit`] already rejects a duplicate address: a round that offers eight copies
-    /// admits one of them either way and the pool never HOLDS a duplicate. What the defect costs is
-    /// the seven slots the copies occupied in the budget, and only a distinct count can see that.
+    /// **It asserts DISTINCT admitted addresses.** A plain count would be equally sensitive here —
+    /// [`PeerPool::admit`] already rejects a duplicate address, so `held.len()` is identically the
+    /// distinct count and both read 1 before the fix and 8 after. Distinctness is asserted because
+    /// it names the property the pool must have, not because a count is blind to it: what the
+    /// defect costs is the seven slots the copies occupied in the budget, and an assertion that
+    /// says so survives a future change to what `admit` deduplicates.
     /// Measured before the fix, this round admitted 1 distinct peer of 8 slots.
     ///
     /// **And it runs the round, not the ranker.** `most_credible` in isolation cannot show this:
