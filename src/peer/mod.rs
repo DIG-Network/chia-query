@@ -1076,7 +1076,7 @@ impl PeerBackend {
             .map_err(|_| ChiaQueryError::PeerConnection("request timed out".into()))?
             .map_err(|e| ChiaQueryError::PeerConnection(e.to_string()))?;
 
-        Ok(translate::ack_to_tx_status(ack.status))
+        Ok(translate::ack_to_tx_status(ack.status, ack.error))
     }
 
     // -- full block by height (RequestBlock / RespondBlock) -------------------

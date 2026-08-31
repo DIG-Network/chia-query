@@ -116,6 +116,32 @@ All methods are `async` and return `Result<Response, ChiaQueryError>`.
 | `get_puzzle_and_solution_with_conditions(coin_id, height)` | `coin_id: Bytes32, height: Option<u32>` | `CoinSpendWithConditions` |
 | `push_tx(spend_bundle)` | `spend_bundle: SpendBundle` | `TxStatus` |
 
+#### Transaction submission semantics
+
+`push_tx` returns a `TxStatus` whose fields mean exactly this:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | The source's own label — `"SUCCESS"`, `"PENDING"`, `"FAILED"`, `"UNKNOWN"` |
+| `success` | The bundle was **admitted to a mempool**. True for Chia ack status `1` ONLY |
+| `inclusion` | `Admitted` / `NotAdmitted` / `Failed` / `Unknown` — the same verdict as a three-state |
+| `error` | The source's own reason for a refusal, carried through verbatim; `None` if it gave none |
+
+Chia's `MempoolInclusionStatus` value `2` (`PENDING`) is the full node **declining to admit** the
+bundle — holding it for an unknown parent, or refusing it below the mempool fee floor — and it MAY
+never be admitted. `success` MUST therefore be false for status `2`, and an unrecognised status
+byte MUST fail closed (`Unknown`, `success: false`).
+
+The reason MUST be preserved as its own field, unparsed. A caller MUST NOT have to recover it from
+prose in `status`.
+
+The peer tier (`send_transaction` ack) and the coinset tier (`push_tx` REST response) MUST agree on
+this reading; a refusal served by either route is a refusal.
+
+The light client's write path (`ChiaLightClient::submit_spend`) returns the same distinction as a
+`SubmitOutcome`: `is_accepted()` is true for admission alone, and `reason()` exposes the node's own
+words.
+
 #### Fees
 
 | Method | Request Fields | Response |

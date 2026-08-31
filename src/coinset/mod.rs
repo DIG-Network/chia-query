@@ -24,6 +24,27 @@ pub type DefaultTransport = transport::ReqwestTransport;
 #[cfg(all(target_arch = "wasm32", feature = "coinset", not(feature = "native")))]
 pub type DefaultTransport = transport::FetchTransport;
 
+/// Translate the coinset.org `push_tx` response into a [`TxStatus`].
+///
+/// The REST tier speaks the same `MempoolInclusionStatus` vocabulary as the peer tier, just as a
+/// label rather than a byte, so it gets the same reading: `"SUCCESS"` is admission and everything
+/// else is not. This previously returned `success: true` for EVERY answer the endpoint gave,
+/// including a refusal (#48).
+pub fn coinset_status_to_tx_status(status: &str, error: Option<String>) -> TxStatus {
+    let inclusion = match status {
+        "SUCCESS" => MempoolInclusion::Admitted,
+        "PENDING" => MempoolInclusion::NotAdmitted,
+        "FAILED" => MempoolInclusion::Failed,
+        _ => MempoolInclusion::Unknown,
+    };
+    TxStatus {
+        status: status.to_string(),
+        success: inclusion.is_admitted(),
+        inclusion,
+        error,
+    }
+}
+
 /// A thin, transport-generic client over the coinset.org REST API.
 ///
 /// Every endpoint is a `POST`-JSON / parse-JSON round-trip; the only cleverness
@@ -450,11 +471,9 @@ impl<T: HttpTransport> CoinsetClient<T> {
     pub async fn push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
         let body = json!({ "spend_bundle": bundle });
         let json = self.post("push_tx", &body).await?;
-        let status = json["status"].as_str().unwrap_or("UNKNOWN").to_string();
-        Ok(TxStatus {
-            status,
-            success: true,
-        })
+        let status = json["status"].as_str().unwrap_or("UNKNOWN");
+        let error = json["error"].as_str().map(str::to_string);
+        Ok(coinset_status_to_tx_status(status, error))
     }
 
     // =======================================================================
@@ -722,5 +741,29 @@ mod tests {
         let envelope = json!({ "success": true, "coin_record": "not-an-object" });
         let result: Result<Option<CoinRecord>, _> = optional_field(&envelope, "coin_record");
         assert!(result.is_err());
+    }
+
+    /// #48. The REST tier set `success: true` on EVERY answer, so a coinset-served refusal was
+    /// reported as an acceptance -- the same wrong answer as the peer tier's, arriving by a
+    /// different route. Both labels are asserted because a fix that merely inverted the constant
+    /// would satisfy the refusal case alone.
+    #[test]
+    fn coinset_refusal_is_not_reported_as_admission() {
+        assert!(coinset_status_to_tx_status("SUCCESS", None).success);
+        assert!(!coinset_status_to_tx_status("PENDING", None).success);
+        assert!(!coinset_status_to_tx_status("FAILED", None).success);
+        assert!(!coinset_status_to_tx_status("UNKNOWN", None).success);
+    }
+
+    /// #48. The endpoint's own reason survives to the caller, verbatim and distinguishable.
+    #[test]
+    fn coinset_carries_two_different_reasons_distinctly() {
+        let a = coinset_status_to_tx_status("FAILED", Some("DOUBLE_SPEND".into()));
+        let b = coinset_status_to_tx_status("PENDING", Some("UNKNOWN_UNSPENT".into()));
+        assert_eq!(a.error.as_deref(), Some("DOUBLE_SPEND"));
+        assert_eq!(b.error.as_deref(), Some("UNKNOWN_UNSPENT"));
+        assert_ne!(a.error, b.error);
+        assert_eq!(a.inclusion, MempoolInclusion::Failed);
+        assert_eq!(b.inclusion, MempoolInclusion::NotAdmitted);
     }
 }
