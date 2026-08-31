@@ -50,10 +50,56 @@ pub struct SpendBundle {
 // Transaction status
 // ---------------------------------------------------------------------------
 
+/// The full node's own verdict on a pushed bundle, as a three-state rather than a boolean.
+///
+/// Chia's `MempoolInclusionStatus` distinguishes admission from a refusal to admit, and the two
+/// have different operator actions: an `Admitted` bundle is in a mempool and will be mined, a
+/// `NotAdmitted` one is being held (unknown parent) or declined (fee below the floor) and may never
+/// be admitted at all. Collapsing them loses the only distinction a caller pushing money cares
+/// about (DIG-Network/chia-query#48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MempoolInclusion {
+    /// The node took the bundle into its mempool. Chia ack status 1.
+    Admitted,
+    /// The node did NOT take the bundle. Chia ack status 2 (`PENDING`) -- held or declined.
+    NotAdmitted,
+    /// The node rejected the bundle outright. Chia ack status 3 (`FAILED`).
+    Failed,
+    /// The source produced a verdict this crate does not recognise. Never read as admission.
+    #[default]
+    Unknown,
+}
+
+impl MempoolInclusion {
+    /// True only for [`MempoolInclusion::Admitted`] -- the single state in which the bundle is in
+    /// a mempool. Every other state, including an unrecognised one, fails closed.
+    pub fn is_admitted(self) -> bool {
+        matches!(self, MempoolInclusion::Admitted)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxStatus {
+    /// The source's own label for the verdict (`"SUCCESS"`, `"PENDING"`, `"FAILED"`, ...).
     pub status: String,
+    /// Whether the bundle was ADMITTED to a mempool.
+    ///
+    /// This is true for Chia ack status 1 alone. It formerly also covered status 2, which is the
+    /// node declining to admit -- so a caller asking "is my transaction in the mempool" was told
+    /// yes about a bundle no mempool held (#48).
     pub success: bool,
+    /// The verdict as a three-state, for callers that need more than the boolean.
+    #[serde(default)]
+    pub inclusion: MempoolInclusion,
+    /// The source's OWN words for a refusal, carried through verbatim and unparsed.
+    ///
+    /// A full node names the reason it would not admit a bundle -- `BAD_AGGREGATE_SIGNATURE`,
+    /// `MEMPOOL_CONFLICT`, an unknown parent -- and those are different problems with different
+    /// operator actions. Discarding it left an operator with a refusal and no cause; recovering it
+    /// during a live incident cost hours (#48).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

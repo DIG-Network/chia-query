@@ -8,7 +8,12 @@ pub enum ChiaQueryError {
     #[error("peer connection error: {0}")]
     PeerConnection(String),
 
-    #[error("all sources failed")]
+    /// Every source was tried and every source failed. Both causes are NAMED: a flat "all sources
+    /// failed" tells an operator nothing about whether the peer tier was unreachable, the coinset
+    /// tier rejected the request, or both said the same thing -- and the answers were already in
+    /// hand when the variant was built (#48).
+    #[error("all sources failed (peer: {peer_error}; coinset: {})",
+        .coinset_error.as_ref().map_or_else(|| "not attempted".to_string(), |e| e.to_string()))]
     AllSourcesFailed {
         peer_error: Box<ChiaQueryError>,
         coinset_error: Option<Box<ChiaQueryError>>,
@@ -68,4 +73,50 @@ pub enum ChiaQueryError {
     /// about the sources and belongs with the caller (NC-12).
     #[error("sources disagree: {0}")]
     SourcesDisagree(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #48, defect 3. `AllSourcesFailed` rendered as a flat "all sources failed", so the two causes
+    /// it was CARRYING never reached anyone -- the answer was in hand and thrown away.
+    ///
+    /// The fixture builds two failures that differ only in their inner causes and requires the two
+    /// renderings to differ. A test asserting the message merely mentions one cause would pass
+    /// against an implementation that named the peer error alone; requiring both texts to appear,
+    /// and two different pairs to render differently, cannot be satisfied that way.
+    #[test]
+    fn all_sources_failed_names_both_of_its_causes() {
+        let both = ChiaQueryError::AllSourcesFailed {
+            peer_error: Box::new(ChiaQueryError::PeerConnection("request timed out".into())),
+            coinset_error: Some(Box::new(ChiaQueryError::CoinsetHttp("503 from edge".into()))),
+        };
+        let rendered = both.to_string();
+        assert!(
+            rendered.contains("request timed out"),
+            "peer cause missing from: {rendered}"
+        );
+        assert!(
+            rendered.contains("503 from edge"),
+            "coinset cause missing from: {rendered}"
+        );
+
+        // A different pair of causes must read differently -- the pre-fix message was identical
+        // for every failure, which is exactly why it carried no information.
+        let other = ChiaQueryError::AllSourcesFailed {
+            peer_error: Box::new(ChiaQueryError::PeerRejection("bad request".into())),
+            coinset_error: Some(Box::new(ChiaQueryError::CoinsetApiError("rate limited".into()))),
+        };
+        assert_ne!(rendered, other.to_string());
+
+        // A tier that was never reached is said to be so, rather than silently omitted.
+        let peer_only = ChiaQueryError::AllSourcesFailed {
+            peer_error: Box::new(ChiaQueryError::PeerConnection("no route".into())),
+            coinset_error: None,
+        };
+        let peer_only = peer_only.to_string();
+        assert!(peer_only.contains("no route"));
+        assert!(peer_only.contains("not attempted"), "got: {peer_only}");
+    }
 }

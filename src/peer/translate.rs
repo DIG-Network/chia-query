@@ -5,7 +5,7 @@ use chia_protocol::{Bytes32, CoinState, HeaderBlock, Program, RespondAdditions, 
 
 use crate::types::{
     AdditionsAndRemovals, BlockRecord, ChiaQueryError, Coin, CoinRecord, CoinSpend, FeeEstimate,
-    TxStatus,
+    MempoolInclusion, TxStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,16 +98,26 @@ pub fn make_fee_estimate(estimates: Vec<f64>, target_times: Vec<u64>) -> FeeEsti
 // TransactionAck -> TxStatus
 // ---------------------------------------------------------------------------
 
-pub fn ack_to_tx_status(status: u8) -> TxStatus {
-    let label = match status {
-        1 => "SUCCESS",
-        2 => "PENDING",
-        3 => "FAILED",
-        _ => "UNKNOWN",
+/// Translate a `TransactionAck` into a [`TxStatus`], preserving BOTH the verdict and the node's
+/// own reason for it.
+///
+/// `status` is Chia's `MempoolInclusionStatus` byte and `error` is the ack's `error` field --
+/// the mempool's words for a refusal, which the caller cannot reconstruct from anything else.
+///
+/// Status 2 is `PENDING`, which is the node declining to admit the bundle, so it maps to
+/// [`MempoolInclusion::NotAdmitted`] and `success: false` (#48).
+pub fn ack_to_tx_status(status: u8, error: Option<String>) -> TxStatus {
+    let (label, inclusion) = match status {
+        1 => ("SUCCESS", MempoolInclusion::Admitted),
+        2 => ("PENDING", MempoolInclusion::NotAdmitted),
+        3 => ("FAILED", MempoolInclusion::Failed),
+        _ => ("UNKNOWN", MempoolInclusion::Unknown),
     };
     TxStatus {
         status: label.to_string(),
-        success: status == 1 || status == 2,
+        success: inclusion.is_admitted(),
+        inclusion,
+        error,
     }
 }
 
@@ -220,5 +230,75 @@ mod tests {
         assert_ne!(placeholder_spend.coin.puzzle_hash, spend.coin.puzzle_hash);
         assert_ne!(placeholder_spend.coin.amount, spend.coin.amount);
     }
-}
 
+    /// #48 regression, defect 1. Chia status 2 is `MempoolInclusionStatus::PENDING`, which means
+    /// the full node did NOT admit the bundle: it is holding it for an unknown parent, or refusing
+    /// it below the fee floor, and it may never be admitted at all. `success` is the field a caller
+    /// branches on to answer "is my transaction in a mempool", so reporting `true` here is a
+    /// money-shaped wrong answer.
+    ///
+    /// Status 2 is the ONLY byte on which the pre-fix reading (`status == 1 || status == 2`) and
+    /// the honest one differ, so a suite without this case passes against the defect. The
+    /// SUCCESS and FAILED assertions beside it are the control: they hold under both readings, and
+    /// their presence is what proves the fix narrowed `success` rather than inverting it.
+    #[test]
+    fn pending_ack_is_not_admitted_to_the_mempool() {
+        assert!(
+            ack_to_tx_status(1, None).success,
+            "status 1 (SUCCESS) IS admission -- the fix must not invert the flag"
+        );
+        assert!(
+            !ack_to_tx_status(2, None).success,
+            "status 2 (PENDING) is a REFUSAL to admit; success must not claim otherwise"
+        );
+        assert!(!ack_to_tx_status(3, None).success);
+        assert!(!ack_to_tx_status(9, None).success);
+    }
+
+    /// #48 regression, defect 2. The node names the reason it refused, and that string is the most
+    /// useful thing an operator can be shown -- during a live incident the cause was
+    /// `BAD_AGGREGATE_SIGNATURE`, which the node said plainly and which reached no log or caller.
+    ///
+    /// The fixture deliberately pushes TWO DIFFERENT reasons through the same status byte and
+    /// requires two different observable results. A test asserting only that `error` is `Some` or
+    /// non-empty would pass against an implementation that hard-codes one string, or that reports
+    /// the label a second time; requiring the two to differ, and each to equal its own input
+    /// verbatim, can only be satisfied by carrying the node's actual words.
+    #[test]
+    fn two_different_ack_reasons_produce_two_different_results() {
+        let sig = ack_to_tx_status(3, Some("BAD_AGGREGATE_SIGNATURE".into()));
+        let dust = ack_to_tx_status(2, Some("INVALID_FEE_TOO_CLOSE_TO_ZERO".into()));
+
+        assert_eq!(sig.error.as_deref(), Some("BAD_AGGREGATE_SIGNATURE"));
+        assert_eq!(dust.error.as_deref(), Some("INVALID_FEE_TOO_CLOSE_TO_ZERO"));
+        assert_ne!(sig.error, dust.error, "two refusals must not read alike");
+
+        // Structured, not formatted: the reason lives in its own field, so a caller reads it
+        // without parsing it back out of a prose label.
+        assert_eq!(sig.status, "FAILED");
+        assert_eq!(dust.status, "PENDING");
+        assert!(!sig.status.contains("SIGNATURE"));
+
+        // A node that gave no reason must not gain an invented one.
+        assert_eq!(ack_to_tx_status(1, None).error, None);
+    }
+
+    /// #48. The three-state must actually distinguish the three verdicts. `success` alone cannot:
+    /// it is false for both a held bundle and a rejected one, which are different problems, and an
+    /// implementation that narrowed the boolean while collapsing the states would satisfy the
+    /// admission test above and still leave a caller unable to tell them apart.
+    #[test]
+    fn each_ack_byte_maps_to_its_own_inclusion_state() {
+        assert_eq!(ack_to_tx_status(1, None).inclusion, MempoolInclusion::Admitted);
+        assert_eq!(
+            ack_to_tx_status(2, None).inclusion,
+            MempoolInclusion::NotAdmitted
+        );
+        assert_eq!(ack_to_tx_status(3, None).inclusion, MempoolInclusion::Failed);
+        assert_eq!(ack_to_tx_status(7, None).inclusion, MempoolInclusion::Unknown);
+
+        // An unrecognised byte fails CLOSED -- it is not admission.
+        assert!(!MempoolInclusion::Unknown.is_admitted());
+        assert!(!MempoolInclusion::NotAdmitted.is_admitted());
+    }
+}
