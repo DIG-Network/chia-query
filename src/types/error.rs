@@ -90,7 +90,9 @@ mod tests {
     fn all_sources_failed_names_both_of_its_causes() {
         let both = ChiaQueryError::AllSourcesFailed {
             peer_error: Box::new(ChiaQueryError::PeerConnection("request timed out".into())),
-            coinset_error: Some(Box::new(ChiaQueryError::CoinsetHttp("503 from edge".into()))),
+            coinset_error: Some(Box::new(ChiaQueryError::CoinsetHttp(
+                "503 from edge".into(),
+            ))),
         };
         let rendered = both.to_string();
         assert!(
@@ -106,7 +108,9 @@ mod tests {
         // for every failure, which is exactly why it carried no information.
         let other = ChiaQueryError::AllSourcesFailed {
             peer_error: Box::new(ChiaQueryError::PeerRejection("bad request".into())),
-            coinset_error: Some(Box::new(ChiaQueryError::CoinsetApiError("rate limited".into()))),
+            coinset_error: Some(Box::new(ChiaQueryError::CoinsetApiError(
+                "rate limited".into(),
+            ))),
         };
         assert_ne!(rendered, other.to_string());
 

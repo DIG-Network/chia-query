@@ -289,13 +289,22 @@ mod tests {
     /// admission test above and still leave a caller unable to tell them apart.
     #[test]
     fn each_ack_byte_maps_to_its_own_inclusion_state() {
-        assert_eq!(ack_to_tx_status(1, None).inclusion, MempoolInclusion::Admitted);
+        assert_eq!(
+            ack_to_tx_status(1, None).inclusion,
+            MempoolInclusion::Admitted
+        );
         assert_eq!(
             ack_to_tx_status(2, None).inclusion,
             MempoolInclusion::NotAdmitted
         );
-        assert_eq!(ack_to_tx_status(3, None).inclusion, MempoolInclusion::Failed);
-        assert_eq!(ack_to_tx_status(7, None).inclusion, MempoolInclusion::Unknown);
+        assert_eq!(
+            ack_to_tx_status(3, None).inclusion,
+            MempoolInclusion::Failed
+        );
+        assert_eq!(
+            ack_to_tx_status(7, None).inclusion,
+            MempoolInclusion::Unknown
+        );
 
         // An unrecognised byte fails CLOSED -- it is not admission.
         assert!(!MempoolInclusion::Unknown.is_admitted());
