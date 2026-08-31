@@ -390,15 +390,50 @@ fn the_light_client_sets_no_trusted_flag() {
 // Submit-outcome mapping (ported behaviour, kept green through the move)
 // ---------------------------------------------------------------------------
 
+/// #48. The `is_accepted` assertion on status 2 used to read `assert!(Pending.is_accepted())` —
+/// a test that ENCODED the defect, so the write path could not be corrected without it going red.
+/// Status 2 is the node declining to admit the bundle, and the light client is a second, separate
+/// implementation of the same ack mapping the peer tier does, so it carried the same wrong answer.
 #[test]
 fn submit_outcome_maps_ack_status() {
-    assert_eq!(SubmitOutcome::from_status(1), SubmitOutcome::Accepted);
-    assert_eq!(SubmitOutcome::from_status(2), SubmitOutcome::Pending);
-    assert_eq!(SubmitOutcome::from_status(3), SubmitOutcome::Failed);
-    assert_eq!(SubmitOutcome::from_status(9), SubmitOutcome::Unknown(9));
+    assert_eq!(SubmitOutcome::from_ack(1, None), SubmitOutcome::Accepted);
+    assert_eq!(
+        SubmitOutcome::from_ack(2, None),
+        SubmitOutcome::NotAdmitted { reason: None }
+    );
+    assert_eq!(
+        SubmitOutcome::from_ack(3, None),
+        SubmitOutcome::Failed { reason: None }
+    );
+    assert_eq!(
+        SubmitOutcome::from_ack(9, None),
+        SubmitOutcome::Unknown {
+            status: 9,
+            reason: None
+        }
+    );
+
     assert!(SubmitOutcome::Accepted.is_accepted());
-    assert!(SubmitOutcome::Pending.is_accepted());
-    assert!(!SubmitOutcome::Failed.is_accepted());
+    assert!(
+        !SubmitOutcome::from_ack(2, None).is_accepted(),
+        "a bundle the node declined to admit is not accepted"
+    );
+    assert!(!SubmitOutcome::from_ack(3, None).is_accepted());
+    assert!(!SubmitOutcome::from_ack(9, None).is_accepted());
+}
+
+/// #48. Two different refusals must be tellable apart on the write path too. Asserting only that
+/// `reason()` is `Some` would pass against an implementation echoing one canned string, so the
+/// fixture requires each reason to equal its own input and the two to differ.
+#[test]
+fn submit_outcome_carries_the_nodes_own_reason() {
+    let held = SubmitOutcome::from_ack(2, Some("unknown parent coin".into()));
+    let bad_sig = SubmitOutcome::from_ack(3, Some("BAD_AGGREGATE_SIGNATURE".into()));
+
+    assert_eq!(held.reason(), Some("unknown parent coin"));
+    assert_eq!(bad_sig.reason(), Some("BAD_AGGREGATE_SIGNATURE"));
+    assert_ne!(held.reason(), bad_sig.reason());
+    assert_eq!(SubmitOutcome::Accepted.reason(), None);
 }
 
 /// `address` is the fixture helper the attribution tests key on; if two octets ever collided the

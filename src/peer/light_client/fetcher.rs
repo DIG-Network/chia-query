@@ -208,7 +208,8 @@ impl PooledFetcher {
         self.backend.genesis_challenge()
     }
 
-    /// Submits `bundle` to the network, returning the ack `status` byte (`1` = success/pending).
+    /// Submits `bundle` to the network, returning the ack's `status` byte and the node's own
+    /// error text where it gave one (`1` = admitted to the mempool; every other byte is not).
     ///
     /// A WRITE, so it goes to the anchor: the light client's cache follows that session, and
     /// pushing a bundle to a peer whose `CoinStateUpdate`s it discards would leave the spend
@@ -216,14 +217,14 @@ impl PooledFetcher {
     pub(super) async fn send_transaction(
         &self,
         bundle: SpendBundle,
-    ) -> Result<u8, LightClientError> {
+    ) -> Result<(u8, Option<String>), LightClientError> {
         let (peer, address) = self.session(true).await?;
         let result = self
             .with_timeout(peer.send_transaction(bundle))
             .await
             .and_then(|r| r.map_err(|e| LightClientError::Transport(e.to_string())));
         match result {
-            Ok(ack) => Ok(ack.status),
+            Ok(ack) => Ok((ack.status, ack.error)),
             Err(e) => {
                 self.discard(address).await;
                 Err(e)

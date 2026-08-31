@@ -71,32 +71,52 @@ pub const DEFAULT_PROVIDER_PRIORITY: i32 = 20;
 /// far below anything that would make a slow consumer's backlog a memory problem.
 const FRAME_BUFFER: usize = 1024;
 
-/// The outcome of submitting a spend bundle, mapped from the node's `TransactionAck` status byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The outcome of submitting a spend bundle, mapped from the node's `TransactionAck`.
+///
+/// Each refusal carries the node's OWN reason where it gave one, because the reasons are not
+/// interchangeable: an unknown parent resolves itself, a fee below the floor never will, and a bad
+/// aggregate signature means the bundle must be rebuilt (#48).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    /// Accepted into the mempool (ack status `1`) — pending block confirmation.
+    /// Admitted to the mempool (ack status `1`) — pending block confirmation.
     Accepted,
-    /// Held pending by the node (ack status `2`).
-    Pending,
+    /// NOT admitted (ack status `2`, Chia's `PENDING`): held for an unknown parent, or declined
+    /// below the fee floor. The node is not holding this bundle in its mempool and may never
+    /// admit it.
+    NotAdmitted { reason: Option<String> },
     /// Rejected by the node (ack status `3`).
-    Failed,
-    /// An unrecognised ack status byte.
-    Unknown(u8),
+    Failed { reason: Option<String> },
+    /// An unrecognised ack status byte. Never read as admission.
+    Unknown { status: u8, reason: Option<String> },
 }
 
 impl SubmitOutcome {
-    fn from_status(status: u8) -> Self {
+    fn from_ack(status: u8, reason: Option<String>) -> Self {
         match status {
             1 => SubmitOutcome::Accepted,
-            2 => SubmitOutcome::Pending,
-            3 => SubmitOutcome::Failed,
-            other => SubmitOutcome::Unknown(other),
+            2 => SubmitOutcome::NotAdmitted { reason },
+            3 => SubmitOutcome::Failed { reason },
+            status => SubmitOutcome::Unknown { status, reason },
         }
     }
 
-    /// Whether the node took custody of the bundle (accepted or pending), rather than rejecting it.
-    pub fn is_accepted(self) -> bool {
-        matches!(self, SubmitOutcome::Accepted | SubmitOutcome::Pending)
+    /// Whether the bundle was ADMITTED to the mempool.
+    ///
+    /// True for ack status 1 alone. This formerly also covered status 2, which is the node
+    /// declining to admit — so a caller was told its spend was taken when no mempool held it
+    /// (#48).
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, SubmitOutcome::Accepted)
+    }
+
+    /// The node's own words for a refusal, where it gave any.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            SubmitOutcome::Accepted => None,
+            SubmitOutcome::NotAdmitted { reason }
+            | SubmitOutcome::Failed { reason }
+            | SubmitOutcome::Unknown { reason, .. } => reason.as_deref(),
+        }
     }
 }
 
@@ -175,8 +195,8 @@ impl ChiaLightClient {
         &self,
         bundle: SpendBundle,
     ) -> Result<SubmitOutcome, LightClientError> {
-        let status = self.fetcher.send_transaction(bundle).await?;
-        Ok(SubmitOutcome::from_status(status))
+        let (status, reason) = self.fetcher.send_transaction(bundle).await?;
+        Ok(SubmitOutcome::from_ack(status, reason))
     }
 
     /// The current peak `(height, header_hash)` as observed on the followed session, if known.
