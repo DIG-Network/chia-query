@@ -221,3 +221,4 @@ mod tests {
         assert_ne!(placeholder_spend.coin.amount, spend.coin.amount);
     }
 }
+
