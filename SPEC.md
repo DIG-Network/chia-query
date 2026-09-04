@@ -724,6 +724,16 @@ struct ChiaQueryConfig {
 5b. **Cycling invariant**: A `Discovered` peer held for `PEER_LIFETIME` or longer MUST be rotated out on AGE, independently of whether any request to it has failed
 5f. **Lag invariant**: A `Discovered` peer whose announced peak trails the pool median peak by more than `PEAK_LAG_EVICTION` MUST be evicted on the next maintenance pass, independently of whether any request to it has failed and independently of its age. The reference peak MUST be a median, never a maximum, so that no single peer claim can decide which peers are evicted
 5c. **Corroboration invariant**: An answer MUST NOT be reported as corroborated — `Found` or `CorroboratedAbsent` — unless at least `CORROBORATION_FLOOR` independent peers other than the answering one AGREED with it. A pool holding fewer than `CORROBORATION_FLOOR` such peers MUST NOT attempt corroboration at all
+5k. **Set-agreement invariant**: A population read MUST NOT be reported as corroborated unless at
+    least `CORROBORATION_FLOOR` independent peers returned the IDENTICAL set once every answer has
+    been normalised to the round's common height. One contradiction MUST refuse the read; the
+    implementation MUST NOT resolve a disagreement by taking the larger set, the smaller set, or a
+    subset or union of them. The common height MUST be derived from the MINIMUM as-of height of the
+    sources that answered, never a maximum or an average, and it MUST never be defaulted to 0 for a
+    source that stated no height
+5l. **Projection-after-agreement invariant**: A caller's `start_height`, `include_spent` filter, or
+    item cap MUST be applied to the AGREED set, never to a source's answer before comparison, and the
+    wire request MUST ask for spent coins regardless of the caller's filter
 5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
 5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
 5g. **Single-dialler invariant**: `peer::connect` is the ONLY place this ecosystem opens a Chia
@@ -933,8 +943,8 @@ transport/timeout/parse error is NEVER reported as absence; absence is NEVER rep
 | Interface method | Router method | Absence handling |
 |---|---|---|
 | `coin_record(id)` | `get_coin_record_by_name_opt` | corroborated absence -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
-| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` (start=end=None) | successful empty query -> `Ok(vec![])`; failure -> `Err` |
-| `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], None, None, true)` | successful empty query -> `Ok(vec![])`; failure -> `Err` |
+| `coin_records_by_puzzle_hash(ph, spent)` | `get_coin_records_by_puzzle_hash` (start=end=None) | corroborated empty set -> `Ok(vec![])`; disagreement, or a set nobody will second -> `Err` |
+| `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], None, None, true)` | corroborated empty set -> `Ok(vec![])`; disagreement, or a set nobody will second -> `Err` |
 | `coin_spend(id)` | `get_coin_spend_opt` | corroborated unspent/unknown -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
 | `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | gap mid-walk -> `Ok(None)`; failure -> `Err` |
 | `resolve_singleton_lineage(launcher)` | forward walk over `get_coin_spend_opt` | never launched / fully melted -> `Ok(None)`; failure -> `Err` |
@@ -965,8 +975,11 @@ walk requires to find the tip:
   A corroborator that CONTRADICTS the first peer (absent, then present) MUST fail the read with
   `SourcesDisagree`; the implementation MUST NOT choose between the two answers. A corroborator that
   fails to answer MUST leave the absence `UncorroboratedAbsent` -- silence is not agreement.
-  Corroboration of an ABSENCE is sought from exactly ONE further peer, never from the whole pool: a
-  single slow peer MUST NOT be able to stall a read.
+  Corroboration of an ABSENCE is sought from EVERY independent peer, CONCURRENTLY, and graded
+  against `CORROBORATION_FLOOR` -- exactly as a presence is. Asking one further peer would let
+  whichever peer happened to be asked settle a claim about the chain, and which peer that is, is not
+  a property the reader controls. It is not an N-of-N barrier: a peer that fails to answer is ejected
+  and does not hold the read up, so a single slow peer cannot stall it.
 
   **A POSITIVE answer is corroborated too, and differently.** The coin-id binding
   `SHA256(parent_coin_info || puzzle_hash || amount)` authenticates the coin's IDENTITY and nothing
@@ -1002,6 +1015,97 @@ walk requires to find the tip:
   **Stated limit:** when NO peer answers at all, the coinset tier is the only source there is and
   its absence is returned as `Ok(None)` on its own -- unchanged behaviour for a coinset-only client.
   What this contract removes is absence resting on an anonymous, unauthenticated peer.
+
+**Population reads are graded by height-normalised SET agreement.** A read that returns a set --
+`coin_records_by_puzzle_hash`, `_puzzle_hashes`, `_hint`, `_hints`, `_names`, and the children read
+behind `coin_records_by_parent_ids` -- cannot be graded by the scalar rule above, because two HONEST
+sources at different peaks legitimately return different sets: a coin created in the last block
+appears on one and not the other, and a coin spent in the last block is dropped by one and kept by
+the other. `Vec` equality would therefore produce a permanent `SourcesDisagree` on any active puzzle
+hash, while subset or union would let a source omit a coin unchallenged -- and omission is the
+direction that costs the network money, since a source drops a coin by staying quiet while ADDING
+one requires somebody to have posted real collateral on chain.
+
+**The rule.** Two population answers AGREE if and only if, after both are normalised to the same
+common height `H`, they are equal as sets keyed by coin identity, with an equal `ChainClaim` per
+coin.
+
+- **Each source states an as-of height.** For the puzzle-state reads it is the `height` field of the
+  FINAL `RespondPuzzleState` of that source's page walk -- the block the source says its answer is a
+  snapshot of. `RespondCoinState` and `RespondChildren` carry no such field, so for the by-names and
+  children reads the source's own announced peak (`NewPeakWallet`) is the anchor. A source that has
+  announced NO peak MUST NOT be treated as being at height 0; its answer MUST be refused, because a
+  zero anchor would normalise every set in the round to the empty set and report that emptiness as
+  corroborated.
+- **The common height** is `H = min(as-of height of every source that ANSWERED) - SETTLED_LAG`, then
+  clamped DOWN to the caller's `end_height` when one was given. `SETTLED_LAG` is 2, the same
+  constant with the same semantics as `dig-wallet`'s `sage::quorum::SETTLED_LAG`/`common_height`;
+  the two MUST NOT drift into rival definitions. A source that failed contributes no as-of height. A
+  chain shorter than `SETTLED_LAG` has no settled common height and MUST fail the read rather than
+  answer about height 0. `min` is normative: a hostile source can only drag `H` DOWN, which makes an
+  answer STALE and dated, never wrong; a maximum would let one inflated claim win outright.
+- **Normalising at `H`** drops every coin created above `H`, and DEMOTES every coin spent above `H`
+  to unspent. Demoting rather than dropping is required: a coin spent at `H + 1` was owned at `H`,
+  and dropping it under-reports exactly the way an omission does.
+- **The wire request MUST be made with `include_spent = true`** whatever the caller asked for.
+  Otherwise a source one block ahead silently omits a coin spent at `H + 1` and normalisation cannot
+  recover it.
+- **The caller's projection -- `start_height`, `include_spent`, and any item cap -- is applied to the
+  AGREED set, AFTER the verdict, never per source before comparison.** A projection applied per
+  source turns two honest truncations into a false `SourcesDisagree`, and one applied to a single
+  side turns a truncation into an omission nobody notices. `end_height` is not a separate filter: it
+  is folded into `H`.
+- **Comparison** is over the normalised sets. Any difference -- an extra coin, a missing coin, or the
+  same coin with a different `created_height` or `spent_height <= H` -- is a contradiction, and ONE
+  contradiction MUST outrank any amount of agreement.
+- **Grading** uses the same primitives as the scalar path and MUST NOT introduce a second notion of
+  an independent voice: readiness is read BEFORE the round, corroborators are drawn by the same
+  predicate, all are asked CONCURRENTLY, a corroborator that fails is ejected and is not agreement,
+  and `Armed` plus at least `CORROBORATION_FLOOR` agreeing sources is required for a corroborated
+  verdict.
+- **If the caller's `start_height` is above `H`**, nothing settled can be said about that window yet
+  and the answer MUST be `Uncorroborated` -- never a corroborated empty set.
+
+**The graded type.** The peer tier returns `SetAnswer<T>`, which is
+`Corroborated { items, as_of_height }` or `Uncorroborated { items, as_of_height }`. There is
+deliberately NO absence arm: **an empty set is a VALUE**, corroborated on the same terms as any
+other set. Disagreement is not an arm either -- it is `Err(SourcesDisagree)` -- so a consumer can
+never read a disagreement as "unknown" or as "none". The router returns
+`CorroboratedSet { items, as_of_height }` and has no uncorroborated form: by the time a set reaches a
+caller it has been agreed by peers, or seconded by the coinset tier, or the call returned `Err`.
+
+`as_of_height` is normative and MUST NOT be dropped by a source-level API: a set normalised to `H`
+is a TRUE statement about the chain at `H` and a FALSE one about the tip. (`ChainSource` cannot
+express it today; the `Vec`-returning router methods are documented as dropping it and consumers
+that need it call the `_graded` twin.)
+
+**Router settlement of an uncorroborated set.** The peer answer is put to the coinset tier, whose
+UNFILTERED answer is normalised to the SAME `H` and projected the same way before comparison --
+comparing coinset's answer at its own tip would manufacture a disagreement out of ordinary lag.
+Equal sets -> `Ok`; any difference -> `SourcesDisagree`; coinset unreachable or the fallback disabled
+-> `UncorroboratedPresence`. When NO peer answers at all, the coinset tier is the only source there
+is and its answer is returned on its own, anchored on coinset's own peak through the same
+`common_height` rule -- the same stated limit the scalar path carries.
+
+**Per-endpoint grading, stated so that silence is never read as an oversight:**
+
+| endpoint | grading |
+|---|---|
+| `coin_records_by_puzzle_hash` / `_puzzle_hashes` / `_hint` / `_hints` / `_names`, children | the set rule above |
+| `get_coin_record_by_name_opt`, `get_coin_spend_opt`, `get_puzzle_and_solution`, `get_block_record_by_height_opt` | the scalar `OptAnswer` rule |
+| `get_fee_estimate` | single-peer BY DESIGN: an estimate is one node's advice about a future mempool, not a claim about chain state, so there is no fact for a second source to agree with |
+| `push_tx` | single-peer BY DESIGN: a write has no pre-existing fact to corroborate |
+| `get_block` / `get_block_by_height` / `get_block_spends*` / `get_additions_and_removals*` | single-peer BY DESIGN: these feed CLVM parsing whose output is bound to the block's own hashes |
+| `get_block_records(start, end)` | single-peer BY DESIGN for the RANGE form only: grading it would run one corroboration round per height. The single-height read is graded |
+
+**Local refutation beats corroboration where it is available.** A spend reply names the coin it is
+answering for, and that name MUST be checked against the coin that was asked about. Where the real
+coin is in hand, the puzzle reveal MUST be checked against the coin's own puzzle hash
+(`tree_hash(puzzle_reveal) == coin.puzzle_hash`) and a mismatch refused outright, without a vote.
+The SOLUTION is not covered by anything the coin commits to, which is why the spend read is
+corroborated as well. `get_block_record_by_height_opt` is corroborated rather than verified because
+the field its caller reads -- `timestamp` -- is foliage and cannot be recomputed from the record;
+hash verification would authenticate the block's name and leave that field on one peer's word.
 
 ### `ChiaQueryError` -> `ChainSourceError` mapping
 

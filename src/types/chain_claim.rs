@@ -12,7 +12,7 @@
 //! coinset API returns both. Comparing whole records would make every peer/coinset pair
 //! "disagree" and turn the corroboration into a permanent error.
 
-use crate::types::{CoinRecord, CoinSpend};
+use crate::types::{BlockRecord, CoinRecord, CoinSpend};
 
 /// The chain-state claim inside an answer, rendered as a value two sources can be compared on.
 ///
@@ -59,6 +59,31 @@ impl ChainClaim for CoinSpend {
             self.coin.amount,
             self.puzzle_reveal,
             self.solution,
+        )
+    }
+}
+
+impl ChainClaim for BlockRecord {
+    /// The block's identity plus the one field a consumer reads that the record cannot prove about
+    /// itself.
+    ///
+    /// `height` and `header_hash` name WHICH block this is. `timestamp` is the reason the read is
+    /// made at all — `block_timestamp_opt` exists for it — and it is foliage data that cannot be
+    /// recomputed from the record, so it is the field a peer can fabricate without anything local
+    /// noticing. Leaving it out would corroborate the block's name while leaving its content on one
+    /// peer's word.
+    ///
+    /// Everything else the API may return is deliberately absent: `weight`, `total_iters`, `fees`
+    /// and the flattened extras are either tier-local colour or derivable, and including them would
+    /// make a peer answer and a coinset answer about the same block unconditionally unequal — the
+    /// same trap `timestamp` and `coinbase` are kept out of [`CoinRecord`]'s claim for.
+    fn chain_claim(&self) -> String {
+        format!(
+            "block({},{}) timestamp={}",
+            self.height,
+            self.header_hash,
+            self.timestamp
+                .map_or_else(|| "none".to_string(), |t| t.to_string()),
         )
     }
 }
