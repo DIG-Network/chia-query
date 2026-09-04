@@ -24,10 +24,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::connect::PeerOrigin;
-use super::plurality::SETTLED_LAG;
+use super::plurality::{PEAK_LAG_EVICTION, SETTLED_LAG};
 use super::pool::PeerPool;
-use super::set_agreement::{HeightedSet, SetAnswer, SetProjection};
-use super::test_support::loopback_peer;
+use super::set_agreement::{as_of_is_supported, HeightedSet, SetAnswer, SetProjection};
+use super::test_support::{loopback_peer, puzzle_state_peer};
 use super::PeerBackend;
 use crate::types::{ChiaQueryError, Coin, CoinRecord};
 use crate::NetworkType;
@@ -396,4 +396,146 @@ async fn a_corroborator_that_fails_does_not_count_towards_the_floor() {
         Err(ChiaQueryError::PeerConnection(_)) => {}
         other => panic!("silence must never read as agreement: got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The as-of height a peer states on the WIRE is held to what it has announced
+// ---------------------------------------------------------------------------
+
+/// **A peer cannot state an as-of height its own announcements do not support.**
+///
+/// Pinned from BOTH sides of the bar, because either alone passes a wrong implementation: a rule
+/// that refused everything satisfies the "too low" case, and one that accepted everything satisfies
+/// the "at the bar" case.
+#[test]
+fn the_supported_as_of_bar_is_pinned_from_both_sides() {
+    const PEAK: u32 = 9_000_000;
+
+    assert!(
+        as_of_is_supported(Some(PEAK), PEAK),
+        "answering as of the block it just announced is the ordinary case"
+    );
+    assert!(
+        as_of_is_supported(Some(PEAK), PEAK - PEAK_LAG_EVICTION),
+        "exactly at the bar is supported — a bound that starves the work it protects is a defect \
+         in its own right"
+    );
+    assert!(
+        !as_of_is_supported(Some(PEAK), PEAK - PEAK_LAG_EVICTION - 1),
+        "one block past the bar is not"
+    );
+    assert!(
+        !as_of_is_supported(Some(PEAK), 2),
+        "and the attack itself — a current peak beside an ancient answer — is refused"
+    );
+}
+
+/// **There is no UPPER bound, deliberately.**
+///
+/// A source overstating its as-of height cannot lower the round's `min`, so it cannot hide a coin
+/// behind a height nobody else reached; and its own set is normalised at the round's height like
+/// every other, so an answer short of what it claimed reads as a contradiction. Bounding above
+/// would refuse an honest peer whose long paged walk finished after its last announcement reached
+/// us — a stall bought for no security.
+#[test]
+fn a_source_may_answer_above_the_peak_it_last_announced() {
+    assert!(as_of_is_supported(Some(100), 100 + 10_000));
+}
+
+/// **A peer that has announced NOTHING supports no as-of height at all.**
+///
+/// Zero would read as a real height, drag the round's `min` to it, normalise every answer to the
+/// empty set, and report that emptiness as corroborated — which is the same under-report by a
+/// different door.
+#[test]
+fn a_peer_that_has_announced_nothing_supports_no_as_of_height() {
+    assert!(!as_of_is_supported(None, 0));
+    assert!(!as_of_is_supported(None, 9_000_000));
+}
+
+/// A backend holding exactly one peer that ANSWERS puzzle-state, admitted at `announced_peak`.
+async fn backend_over_answering_peer(
+    announced_peak: u32,
+    response: chia_protocol::RespondPuzzleState,
+) -> (PeerBackend, chia_wallet_sdk::client::Peer) {
+    let pool = PeerPool::for_tests(1);
+    let peer = puzzle_state_peer(response).await;
+    let addr = peer.socket_addr();
+    assert!(
+        pool.admit_at_peak_for_tests(peer.clone(), addr, PeerOrigin::Discovered, announced_peak)
+            .await
+    );
+    let backend = PeerBackend {
+        pool,
+        network: NetworkType::Mainnet,
+        request_timeout: Duration::from_secs(5),
+    };
+    (backend, peer)
+}
+
+fn finished_at(height: u32) -> chia_protocol::RespondPuzzleState {
+    chia_protocol::RespondPuzzleState::new(
+        vec![chia_protocol::Bytes32::new([9; 32])],
+        height,
+        chia_protocol::Bytes32::new([0xAB; 32]),
+        true,
+        Vec::new(),
+    )
+}
+
+const PUZZLE_HASH: &str = "0909090909090909090909090909090909090909090909090909090909090909";
+
+/// **THE DEFECT (chia-query#56): a peer's WIRE-reported as-of height, taken on its word, lets one
+/// peer drag the round's common height low enough to clip every honest answer to the empty set.**
+///
+/// The peer here announces a current peak — so the pool holds it, and lag eviction never looks at
+/// it — and answers as of block 2. `common_height` is a `min`, so that one number becomes the whole
+/// round's, `normalise_at` drops every coin created above it, and the resulting empty sets AGREE.
+/// The round then reports `Corroborated` emptiness: a peer that cannot forge a coin makes this
+/// crate confidently report NO coins, on the path a wallet balance is read through.
+///
+/// The read must REFUSE instead. Both fixtures answer over a real websocket through the production
+/// decode path, because the value under test only exists on that path — a scripted `HeightedSet`
+/// would bypass the very check this pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wire_as_of_height_the_peer_has_not_announced_is_refused() {
+    const PEAK: u32 = 9_000_000;
+    let (backend, peer) = backend_over_answering_peer(PEAK, finished_at(2)).await;
+
+    let answer = backend
+        .do_puzzle_hash_query(&peer, &[PUZZLE_HASH], false)
+        .await;
+
+    match answer {
+        Err(ChiaQueryError::PeerRejection(detail)) => {
+            assert!(
+                detail.contains("does not support"),
+                "the refusal must name the reason it refused: {detail}"
+            );
+        }
+        other => panic!(
+            "a peer answering as of block 2 while announcing {PEAK} must be refused, not believed: \
+             {other:?}"
+        ),
+    }
+}
+
+/// The control: a peer answering AT its announced peak is believed, and its as-of height survives.
+///
+/// Without this the test above passes against a read that refuses everything — which would take the
+/// balance path from a wrong answer to no answer at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wire_as_of_height_its_announcements_support_is_accepted() {
+    const PEAK: u32 = 9_000_000;
+    let (backend, peer) = backend_over_answering_peer(PEAK, finished_at(PEAK)).await;
+
+    let set = backend
+        .do_puzzle_hash_query(&peer, &[PUZZLE_HASH], false)
+        .await
+        .expect("a peer answering at the peak it announced must be believed");
+
+    assert_eq!(
+        set.as_of_height, PEAK,
+        "and the height it stated is carried through, not replaced by the pool's own"
+    );
 }

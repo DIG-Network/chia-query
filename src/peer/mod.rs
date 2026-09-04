@@ -36,7 +36,9 @@ pub use light_client::{ChiaLightClient, LightClientProvider, SubmitOutcome};
 use plurality::CORROBORATION_FLOOR;
 pub use pool::PeerRequirement;
 use pool::{CorroborationReadiness, PeerPool};
-use set_agreement::{common_height, contradiction, fingerprint, normalise_at, project, SetMember};
+use set_agreement::{
+    as_of_is_supported, common_height, contradiction, fingerprint, normalise_at, project, SetMember,
+};
 pub use set_agreement::{CorroboratedSet, HeightedSet, SetAnswer, SetProjection};
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1326,24 @@ impl PeerBackend {
             }
             prev_height = Some(response.height);
             prev_header = response.header_hash;
+        }
+
+        // `as_of_height` is the ONE anchor in this crate taken from an untrusted peer's wire
+        // response rather than from a number the pool already polices, and the round's common
+        // height is a `min` over it (chia-query#56). Held to the peer's own announced peak here,
+        // at the point the value enters, so a source whose answer its announcements do not support
+        // never reaches the round at all.
+        //
+        // Failing is the right shape rather than clamping: this peer's answer is unusable, and
+        // `read_set_corroborated` already ejects a source whose read errors and excludes it from
+        // the height vote. Clamping would keep a fabricated claim in the round under a nicer number.
+        let announced = self.pool.announced_peak(peer.socket_addr()).await;
+        if !as_of_is_supported(announced, as_of_height) {
+            return Err(ChiaQueryError::PeerRejection(format!(
+                "peer {} answered as of height {as_of_height}, which its own announced peak \
+                 ({announced:?}) does not support",
+                peer.socket_addr(),
+            )));
         }
 
         Ok(HeightedSet {

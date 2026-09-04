@@ -54,7 +54,7 @@ use std::collections::BTreeMap;
 
 use crate::types::{ChainClaim, CoinRecord};
 
-use super::plurality::SETTLED_LAG;
+use super::plurality::{PEAK_LAG_EVICTION, SETTLED_LAG};
 
 // ---------------------------------------------------------------------------
 // SetAnswer
@@ -247,6 +247,53 @@ pub fn common_height(as_of: &[u32], end_height: Option<u32>) -> Option<u32> {
         Some(end) => settled.min(end),
         None => settled,
     })
+}
+
+/// Whether a source may be held to an as-of height of `as_of`, given the peak it has ANNOUNCED.
+///
+/// # The hole this closes
+///
+/// `RespondPuzzleState` states the height its answer is a snapshot of, and that field is supplied
+/// by the peer. [`common_height`] takes the `min` over the round, so ONE source stating a low
+/// enough height drags every honest peer's answer down with it — and at a low enough height
+/// [`normalise_at`] clips every real coin away, leaving a set that is EMPTY at every source. Empty
+/// sets agree, so the round reports `Corroborated`: a peer that cannot forge a coin can still make
+/// this crate confidently report NO coins, on the path a wallet balance is read through
+/// (chia-query#56).
+///
+/// The other population reads are not exposed to it, and that asymmetry is the tell rather than a
+/// design: `RespondCoinState` and `RespondChildren` carry no height, so those reads anchor on
+/// [`PeerPool::announced_peak`](super::pool::PeerPool::announced_peak) — a number the pool already
+/// polices, because a peer whose announced peak trails the pool's reference median by more than
+/// [`PEAK_LAG_EVICTION`] is evicted. This holds the wire-supplied height to the same bar.
+///
+/// # The rule, and why it is one-sided
+///
+/// A peer that has announced NOTHING supports no as-of height at all, exactly as
+/// `announced_peak` already refuses to report `0` for it: zero would read as a real height, drag
+/// the round to it, and corroborate the resulting emptiness.
+///
+/// Otherwise the answer may sit at most [`PEAK_LAG_EVICTION`] blocks BELOW the peak the peer itself
+/// announced. Below that the peer is contradicting its own announcements — it claims to be at the
+/// tip while answering as of a block far behind it — and no honest walk ends there, because the
+/// walk terminates at the peer's own subscription height.
+///
+/// **There is deliberately no upper bound.** A source overstating its as-of height cannot lower the
+/// round's `min`, so it cannot hide a coin behind a height nobody else reached; and its own set is
+/// normalised at the round's height like everyone else's, so an answer short of what it claimed
+/// reads as a contradiction rather than as agreement. Bounding above would also refuse an honest
+/// peer whose long paged walk finished after its last announcement reached us — a stall bought for
+/// no security.
+///
+/// # Failure direction
+///
+/// Refusing a legitimately lagging peer costs a stall, which is survivable and visible. Accepting a
+/// fabricated low height produces a confidently empty balance, which is not. This fails CLOSED.
+pub fn as_of_is_supported(announced: Option<u32>, as_of: u32) -> bool {
+    match announced {
+        None => false,
+        Some(peak) => peak.saturating_sub(as_of) <= PEAK_LAG_EVICTION,
+    }
 }
 
 /// Hold `items` to the chain as it stood at `h`.
