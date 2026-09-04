@@ -20,6 +20,8 @@ use crate::types::*;
 mod absence_tests;
 #[cfg(test)]
 mod presence_tests;
+#[cfg(test)]
+mod set_settlement_tests;
 
 // ---------------------------------------------------------------------------
 // Puzzle condition extraction helper
@@ -116,6 +118,65 @@ fn settle_uncorroborated_presence<T: ChainClaim>(
         )),
         Some(Err(e)) => Err(ChiaQueryError::UncorroboratedPresence(format!(
             "one peer produced a record and the coinset API could not corroborate it: {e}"
+        ))),
+    }
+}
+
+/// What a population answer that only ONE peer will vouch for becomes.
+///
+/// The set counterpart of [`settle_uncorroborated_presence`], and it settles the same way: coinset
+/// is asked the SAME question, its answer is held to the SAME height `H` the peer answer was held
+/// to, and the two normalised sets must be equal. Comparing coinset's answer at its own tip against
+/// a peer answer at `H` would manufacture a disagreement out of ordinary lag — the exact trap the
+/// set rule exists to avoid.
+///
+/// `coinset` is `Some` only when the fallback tier was consulted; `None` means it is disabled, and
+/// a set nobody could be brought to agree with is never returned as one. `coinset` MUST be the
+/// UNFILTERED form of the question — every coin in range, spent ones included — because a filter
+/// applied to one side of a comparison turns a projection into an omission (chia-query#33).
+///
+/// | peer tier | coinset | result |
+/// |---|---|---|
+/// | one peer's set | the same set at `H` | `Ok` — two independent sources agree |
+/// | one peer's set | a different set at `H` | [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) |
+/// | one peer's set | unreachable or disabled | [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence) |
+///
+/// There is no arm that returns a set nobody would second. That is the point: the established
+/// behaviour returned exactly that, silently, from whichever source answered first.
+fn settle_uncorroborated_set(
+    items: Vec<CoinRecord>,
+    as_of_height: u32,
+    projection: SetProjection,
+    coinset: Option<Result<Vec<CoinRecord>, ChiaQueryError>>,
+) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+    let raw = match coinset {
+        None => {
+            return Err(ChiaQueryError::UncorroboratedPresence(
+                "one peer produced a set, no floor of independent peers agreed with it, and the                  coinset fallback is disabled"
+                    .into(),
+            ))
+        }
+        Some(Err(e)) => {
+            return Err(ChiaQueryError::UncorroboratedPresence(format!(
+                "one peer produced a set and the coinset API could not corroborate it: {e}"
+            )))
+        }
+        Some(Ok(raw)) => raw,
+    };
+
+    let theirs = project(normalise_at(&raw, as_of_height), projection);
+    match contradiction(
+        "the peer tier",
+        &fingerprint(&items),
+        "the coinset API",
+        &fingerprint(&theirs),
+    ) {
+        None => Ok(CorroboratedSet {
+            items,
+            as_of_height,
+        }),
+        Some(detail) => Err(ChiaQueryError::SourcesDisagree(format!(
+            "at height {as_of_height}: {detail}"
         ))),
     }
 }
@@ -258,80 +319,37 @@ impl QueryRouter {
         }
     }
 
-    /// Decide what a population answer nobody in the peer pool would second becomes.
+    /// Turn the peer tier's graded set answer into the router's contract, consulting coinset as a
+    /// second voice when — and only when — the peer tier could not find one itself.
     ///
-    /// The set counterpart of [`settle_peer_answer`](Self::settle_peer_answer), and it settles the
-    /// same way: coinset is asked the SAME question, its answer is held to the SAME height `H` the
-    /// peer answer was held to, and the two normalised sets must be equal. Comparing coinset's
-    /// answer at its own tip against a peer answer at `H` would manufacture a disagreement out of
-    /// ordinary lag, which is the trap the whole set rule exists to avoid.
-    ///
-    /// `coinset_raw` MUST be the unfiltered form of the question — every coin in range, spent ones
-    /// included — for the same reason the peer request is: a filter applied to one side of a
-    /// comparison turns a projection into an omission.
-    ///
-    /// | peer tier | coinset | result |
-    /// |---|---|---|
-    /// | corroborated set | not asked | `Ok` |
-    /// | one peer's set | the same set at `H` | `Ok` — two independent sources agree |
-    /// | one peer's set | a different set at `H` | [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) |
-    /// | one peer's set | unreachable or disabled | [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence) |
-    ///
-    /// There is no arm that returns a set nobody would second. That is the whole point: the
-    /// established behaviour returned exactly that, silently, from whichever source answered first.
+    /// The set counterpart of [`settle_peer_answer`](Self::settle_peer_answer). The decision
+    /// itself lives in [`settle_uncorroborated_set`], a free function, so it can be exercised
+    /// without a router; this method is the plumbing that fetches the second opinion.
     async fn settle_set_answer(
         &self,
         answer: SetAnswer<CoinRecord>,
         projection: SetProjection,
         coinset_raw: impl std::future::Future<Output = Result<Vec<CoinRecord>, ChiaQueryError>>,
     ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
-        let (items, as_of_height) = match answer {
+        match answer {
             SetAnswer::Corroborated {
                 items,
                 as_of_height,
-            } => {
-                return Ok(CorroboratedSet {
-                    items,
-                    as_of_height,
-                })
-            }
-            SetAnswer::Uncorroborated {
-                items,
-                as_of_height,
-            } => (items, as_of_height),
-        };
-
-        if !self.coinset_fallback_enabled {
-            return Err(ChiaQueryError::UncorroboratedPresence(
-                "one peer produced a set, no floor of independent peers agreed with it, and the \
-                 coinset fallback is disabled"
-                    .into(),
-            ));
-        }
-
-        let raw = match coinset_raw.await {
-            Ok(raw) => raw,
-            Err(e) => {
-                return Err(ChiaQueryError::UncorroboratedPresence(format!(
-                    "one peer produced a set and the coinset API could not corroborate it: {e}"
-                )))
-            }
-        };
-
-        let theirs = project(normalise_at(&raw, as_of_height), projection);
-        match contradiction(
-            "the peer tier",
-            &fingerprint(&items),
-            "the coinset API",
-            &fingerprint(&theirs),
-        ) {
-            None => Ok(CorroboratedSet {
+            } => Ok(CorroboratedSet {
                 items,
                 as_of_height,
             }),
-            Some(detail) => Err(ChiaQueryError::SourcesDisagree(format!(
-                "at height {as_of_height}: {detail}"
-            ))),
+            SetAnswer::Uncorroborated {
+                items,
+                as_of_height,
+            } => {
+                let coinset = if self.coinset_fallback_enabled {
+                    Some(coinset_raw.await)
+                } else {
+                    None
+                };
+                settle_uncorroborated_set(items, as_of_height, projection, coinset)
+            }
         }
     }
 

@@ -11,6 +11,8 @@ pub mod translate;
 #[cfg(test)]
 mod corroboration_tests;
 #[cfg(test)]
+mod set_corroboration_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::net::SocketAddr;
