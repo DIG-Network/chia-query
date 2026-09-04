@@ -213,7 +213,10 @@ fn spread_across_subnets<T>(candidates: Vec<DialCandidate<T>>) -> Vec<DialCandid
         if !buckets.contains_key(&key) {
             order.push(key);
         }
-        buckets.entry(SubnetKey::of(candidate.address)).or_default().push(candidate);
+        buckets
+            .entry(SubnetKey::of(candidate.address))
+            .or_default()
+            .push(candidate);
     }
 
     let mut spread = priority;
@@ -3164,8 +3167,13 @@ mod tests {
         let mut round = Vec::new();
         for host in 1..=8u8 {
             round.push(
-                candidate_at(&peer, address_in(9, host), PeerOrigin::Discovered, 10 + host as u64)
-                    .await,
+                candidate_at(
+                    &peer,
+                    address_in(9, host),
+                    PeerOrigin::Discovered,
+                    10 + host as u64,
+                )
+                .await,
             );
         }
 
