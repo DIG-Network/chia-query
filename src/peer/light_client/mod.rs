@@ -42,7 +42,6 @@ pub mod fetcher;
 pub mod provider;
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,13 +127,6 @@ impl SubmitOutcome {
 pub struct ChiaLightClient {
     fetcher: PooledFetcher,
     cache: Arc<RwLock<CoinStateCache>>,
-    /// Set by the drive-loop when the anchor session ends, so a caller can tell a quiet chain from
-    /// a stream that stopped. Cleared by [`reconnect`](Self::reconnect).
-    ///
-    /// Signalled rather than acted on: re-arming needs the caller's runtime and its error handling,
-    /// and a drive-loop that re-subscribed itself would retry forever against a peer set it cannot
-    /// see, with nothing able to observe that it was failing.
-    rearm_needed: Arc<AtomicBool>,
     drive: Option<JoinHandle<()>>,
 }
 
@@ -151,17 +143,10 @@ impl ChiaLightClient {
         // to follow and is handed a subscription by each anchoring.
         let (subscriptions_tx, subscriptions_rx) = mpsc::unbounded_channel();
         let fetcher = PooledFetcher::new(backend.clone(), request_timeout, subscriptions_tx);
-        let rearm_needed = Arc::new(AtomicBool::new(false));
-        let drive = spawn_drive_loop(
-            subscriptions_rx,
-            cache.clone(),
-            fetcher.clone(),
-            rearm_needed.clone(),
-        );
+        let drive = spawn_drive_loop(subscriptions_rx, cache.clone(), fetcher.clone());
         Self {
             fetcher,
             cache,
-            rearm_needed,
             drive: Some(drive),
         }
     }
@@ -226,12 +211,19 @@ impl ChiaLightClient {
         Ok(())
     }
 
-    /// Whether the followed session has ENDED, so the subscription set is no longer armed anywhere.
+    /// Whether the subscription set is no longer armed on a session this client is following.
     ///
     /// A consumer polling this can tell a chain with nothing to say from a stream that stopped
     /// talking — the distinction a silent light client otherwise hides.
+    ///
+    /// True after ANY loss of the anchor, not only after the followed session announced its own
+    /// end: a read that fails unpins the anchor too, and from that moment the drive-loop is
+    /// applying nothing (chia-query#59). Signalled rather than acted on — re-arming needs the
+    /// caller's runtime and its error handling, and a drive-loop that re-subscribed itself would
+    /// retry forever against a peer set it cannot see, with nothing able to observe that it was
+    /// failing.
     pub fn needs_rearm(&self) -> bool {
-        self.rearm_needed.load(Ordering::Acquire)
+        self.fetcher.needs_rearm()
     }
 
     /// Re-anchors on a live pooled session and re-arms the existing subscription set, so a dropped
@@ -253,7 +245,7 @@ impl ChiaLightClient {
         }
         // Cleared only once every re-subscription has SUCCEEDED. Clearing first would report an
         // armed subscription set after a rearm that failed halfway.
-        self.rearm_needed.store(false, Ordering::Release);
+        self.fetcher.clear_rearm();
         Ok(())
     }
 
@@ -322,6 +314,18 @@ fn all_coin_states() -> CoinStateFilters {
     }
 }
 
+/// What one turn of the drive-loop's wait resolved to.
+///
+/// Named rather than folded into the `select!` arms so the borrow of the subscription being read
+/// ends with the `select!` expression itself — the arm that ADOPTS a new subscription has to be
+/// free to replace the one the other arm is reading from.
+enum Turn {
+    /// A newly pinned anchor's subscription, or `None` once no further anchoring can arrive.
+    Anchored(Option<FrameSubscription>),
+    /// A frame from the followed session, or `None` once that subscription has ended.
+    Received(Option<SourcedFrame>),
+}
+
 /// Spawns the background task that keeps `cache` current from the anchor session's frames.
 ///
 /// It follows ONE session at a time — the anchor — and is handed a fresh subscription over
@@ -330,40 +334,88 @@ fn all_coin_states() -> CoinStateFilters {
 /// frames, so a peer this client never chose can neither be applied to the cache nor fill the queue
 /// and end the subscription.
 ///
-/// [`follows`] remains as the second half of that guarantee, and it is not redundant. A subscription
-/// outlives the anchoring that created it: an anchor released by a FAILED READ leaves its
-/// subscription live until the connection actually closes, and the frames still arriving on it
-/// answer questions this client is no longer relying on that peer for.
+/// # Why the two waits are a `select!` and not nested loops
+///
+/// A newly pinned anchor must be adopted while the PREVIOUS subscription is still open, because
+/// nothing forces that one shut. Read failure unpins the anchor
+/// ([`discard`](fetcher::PooledFetcher)) but ejecting a peer removes a bookkeeping entry only: it
+/// publishes no [`PoolFrame::SessionEnded`], the session's reader task holds a raw message receiver
+/// rather than the pooled `Peer`, and `recv` has no deadline. So a peer that simply goes QUIET after
+/// one failed read used to hold this loop on its own subscription for as long as its transport
+/// stayed open, at no cost to itself — an untrusted dialled peer imposing an indefinite denial by
+/// doing nothing (chia-query#59, NC-12). Worse than a stall: the cache froze while every consumer
+/// surface still reported it healthy.
+///
+/// Adopting the newer subscription DROPS the superseded one, which is the correct direction of
+/// error here. Re-anchoring a turn too eagerly costs one redundant subscription; waiting on a dead
+/// session costs a silently stale cache. The dropped subscription's remaining frames were already
+/// unusable — its source is no longer the anchor, so [`follows`] rejects every one of them.
+///
+/// [`follows`] remains as the second half of chia-query#34's guarantee, and it is not redundant. A
+/// subscription outlives the anchoring that created it: between a failed read unpinning the anchor
+/// and the next read pinning a new one, this loop is still reading the OLD subscription, and the
+/// frames still arriving on it answer questions this client is no longer relying on that peer for.
 fn spawn_drive_loop(
     mut subscriptions: mpsc::UnboundedReceiver<FrameSubscription>,
     cache: Arc<RwLock<CoinStateCache>>,
     fetcher: PooledFetcher,
-    rearm_needed: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(mut subscription) = subscriptions.recv().await {
-            let followed = subscription.source();
-            while let Some(sourced) = subscription.recv().await {
-                if !follows(fetcher.anchor_source().await, sourced.source) {
-                    continue;
+        let mut followed: Option<FrameSubscription> = None;
+        // Cleared if the anchoring channel ever closes. The loop keeps draining the session it is
+        // already following rather than returning, because abandoning a live subscription is the
+        // silent freeze this whole function exists to avoid.
+        let mut anchorings_open = true;
+
+        loop {
+            let Some(subscription) = followed.as_mut() else {
+                if !anchorings_open {
+                    return;
                 }
-                if let AfterFrame::Resubscribe = apply_frame(&cache, sourced).await {
-                    // Order matters: unpin FIRST, so a caller woken by the flag re-anchors on a
-                    // live session rather than re-arming against the one that just died.
-                    fetcher.release_anchor(followed).await;
-                    rearm_needed.store(true, Ordering::Release);
+                match subscriptions.recv().await {
+                    Some(next) => followed = Some(next),
+                    None => return,
+                }
+                continue;
+            };
+            let source = subscription.source();
+
+            let turn = tokio::select! {
+                // Biased towards adopting a new anchor, so the switch happens at the first
+                // opportunity rather than a pseudo-random fraction of the time. It cannot starve
+                // the frame arm: an anchoring is one message per re-anchor, driven by this client's
+                // own reads, and an empty channel resolves to pending immediately. Both `recv`s are
+                // cancel-safe, so the arm that loses drops without consuming a message.
+                biased;
+                anchored = subscriptions.recv(), if anchorings_open => Turn::Anchored(anchored),
+                frame = subscription.recv() => Turn::Received(frame),
+            };
+
+            match turn {
+                Turn::Anchored(Some(next)) => followed = Some(next),
+                Turn::Anchored(None) => anchorings_open = false,
+                Turn::Received(Some(sourced)) => {
+                    if !follows(fetcher.anchor_source().await, sourced.source) {
+                        continue;
+                    }
+                    if let AfterFrame::Resubscribe = apply_frame(&cache, sourced).await {
+                        fetcher.release_anchor(source).await;
+                    }
+                }
+                // This subscription ended — the session stopped, the pool was dropped, or this
+                // client fell behind the peer it CHOSE and was terminated rather than silently
+                // skipped. Either way the cache can no longer be trusted to be current, and saying
+                // so is the point (see `frames::FrameSubscription`).
+                //
+                // Release is guarded on the followed session, so a subscription ending after the
+                // client has already re-anchored elsewhere does not unpin the healthy anchor — and
+                // it is `release_anchor` that raises the re-arm signal, for exactly the sessions
+                // whose loss really left the subscription set unarmed.
+                Turn::Received(None) => {
+                    fetcher.release_anchor(source).await;
+                    followed = None;
                 }
             }
-            // This subscription ended — the session stopped, the pool was dropped, or this client
-            // fell behind the peer it CHOSE and was terminated rather than silently skipped. Either
-            // way the cache can no longer be trusted to be current, and saying so is the point (see
-            // `frames::FrameSubscription`).
-            //
-            // Release is guarded on the followed session, so a subscription ending after the client
-            // has already re-anchored elsewhere does not unpin the healthy anchor; the flag is set
-            // regardless, because a stream that stopped is exactly what the caller polls for.
-            fetcher.release_anchor(followed).await;
-            rearm_needed.store(true, Ordering::Release);
         }
     })
 }

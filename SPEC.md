@@ -66,15 +66,16 @@ let light = client.light_client(Duration::from_secs(30)).await;
 light.subscribe_coins(vec![coin_id]).await?;             // arms a subscription on the pinned session
 let peak = light.peak().await;                            // (height, header_hash) from that session
 let provider = light.as_chain_source_provider(handle).await;  // ChainSource at priority 20
-if light.needs_rearm() { light.reconnect().await?; }      // the followed session ended
+if light.needs_rearm() { light.reconnect().await?; }      // the anchor was lost, however it was lost
 ```
 
 - `subscribe_coins` / `subscribe_puzzle_hashes` — arm a subscription and seed the cache.
 - `submit_spend` — a WRITE, deliberately outside the reads-only `ChainSource` surface.
 - `peak` — the FOLLOWED session's peak, not `peer_peak_height` (the MEDIAN of what the held peers
   claim).
-- `needs_rearm` / `reconnect` — a followed session that ends is REPORTED, so a stopped stream is
-  never read as a chain with nothing to say.
+- `needs_rearm` / `reconnect` — losing the pinned session is REPORTED, so a stopped stream is never
+  read as a chain with nothing to say. Any loss counts, not only a session announcing its own end: a
+  failed read unpins the anchor too, and from that moment the client is following nobody.
 - `as_chain_source_provider` — registers as `ProviderKind::LocalNode` when the pinned session was
   reached from a configured or co-resident address, `Custom` when discovered, `trustless = false`
   always. Call after subscribing; with nothing pinned it reports the conservative `Custom`.
@@ -777,7 +778,14 @@ struct ChiaQueryConfig {
     delivers a subscription only the frames of the session it was opened on — so this rule is what
     the consumer owes on top of it, not a substitute for it. A consumer that PINS a session MUST
     identify it by its whole `FrameSource`, address AND session id: an address alone cannot separate
-    a session from a replacement dialled to the same address, and a reconnect commonly is one.
+    a session from a replacement dialled to the same address, and a reconnect commonly is one. A
+    subscriber that RE-PINS MUST begin following the new session without waiting on the superseded
+    one, and MUST report the loss of a pin (`needs_rearm`) whether the session announced its own end
+    or a failed read unpinned it. Nothing forces a superseded session shut — ejecting a peer removes
+    a bookkeeping entry and publishes no `SessionEnded`, and a frame receive has no deadline — so a
+    subscriber that waits for the old stream to close is held there for as long as that peer's
+    transport lives, which a peer achieves by saying nothing at all. Re-pinning one turn early costs
+    a redundant subscription; waiting costs a cache that is stale while reporting itself current
 5i. **Paired-peak invariant**: A peak height and its header hash MUST reach a subscriber from the
     SAME message. `PoolFrame::CoinStates` therefore carries `peak_hash`; pairing a new height with a
     previously-held hash names a block that never existed at that height.
