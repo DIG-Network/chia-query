@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chia_query::coinset::CoinsetClient;
 use chia_query::peer::connect::create_generated_tls;
-use chia_query::peer::PeerBackend;
+use chia_query::peer::{OptAnswer, PeerBackend};
 use chia_query::types::*;
 use chia_query::NetworkType;
 
@@ -417,6 +417,10 @@ async fn parity_all() {
         )
         .await
         .unwrap();
+        // The peer answer is held to a settled height (chia-query#35/#47), so it can legitimately
+        // lack a coin the coinset tier has already seen. Parity is judged on the fields of the
+        // coins BOTH tiers report, which is what `assert_coin_records_eq` compares.
+        let pr = pr.into_items();
 
         assert_coin_records_eq("puzzle_hash", &cs, &pr);
         eprintln!("  PASS (count={})", cs.len());
@@ -440,7 +444,8 @@ async fn parity_all() {
             peer.try_get_coin_records_by_puzzle_hashes(&hashes, start, end, true),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_items();
 
         assert_coin_records_eq("puzzle_hashes", &cs, &pr);
         eprintln!("  PASS (count={})", cs.len());
@@ -458,11 +463,12 @@ async fn parity_all() {
             .await
             .unwrap();
         let pr = retry(
-            peer.try_get_coin_records_by_names(&names),
-            peer.try_get_coin_records_by_names(&names),
+            peer.try_get_coin_records_by_names(&names, None, None, true),
+            peer.try_get_coin_records_by_names(&names, None, None, true),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_items();
 
         assert_coin_records_eq("names", &cs, &pr);
         eprintln!("  PASS (count={})", cs.len());
@@ -480,11 +486,12 @@ async fn parity_all() {
             .await
             .unwrap();
         let pr = retry(
-            peer.try_get_children(&parent_coin_id),
-            peer.try_get_children(&parent_coin_id),
+            peer.try_get_children(&parent_coin_id, None, None, true),
+            peer.try_get_children(&parent_coin_id, None, None, true),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_items();
 
         assert_coin_records_eq("parent_ids", &cs, &pr);
         eprintln!("  PASS (count={})", cs.len());
@@ -506,6 +513,13 @@ async fn parity_all() {
         )
         .await
         .unwrap();
+        // The read is graded now, so the answer arrives as an `OptAnswer`. Parity is a comparison
+        // of FIELDS between two tiers, not a corroboration test, so either positive grade is taken
+        // and an absence is a genuine failure of this fixture's assumptions.
+        let pr = match pr {
+            OptAnswer::Found(spend) | OptAnswer::UncorroboratedFound(spend) => spend,
+            other => panic!("expected the peer tier to produce the spend, got {other:?}"),
+        };
 
         assert_eq!(
             norm(&cs.puzzle_reveal),

@@ -124,6 +124,25 @@ impl<T> SetAnswer<T> {
     }
 }
 
+/// A population read the ROUTER has settled — a set that two independent sources agree on, and
+/// the height they agree about.
+///
+/// There is no uncorroborated arm, deliberately: by the time a set reaches a caller of the router
+/// it has either been agreed by [`CORROBORATION_FLOOR`](super::plurality::CORROBORATION_FLOOR)
+/// peers or seconded by the coinset tier, or the call returned `Err`. A caller cannot be handed a
+/// set nobody would second and be left to notice.
+///
+/// `as_of_height` travels WITH the set rather than beside it, because the set is a true statement
+/// about the chain at that height and a false one about the tip. Dropping it is how a settled
+/// answer becomes a stale claim nobody can date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorroboratedSet<T> {
+    /// The agreed set, with the caller's projection applied.
+    pub items: Vec<T>,
+    /// The height the agreeing sources were held to.
+    pub as_of_height: u32,
+}
+
 /// One source's RAW answer to a population read, together with the height it is a snapshot of.
 ///
 /// "Raw" means: every coin the source knows about in range, spent ones included, with no client

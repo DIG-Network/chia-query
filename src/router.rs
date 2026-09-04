@@ -10,7 +10,10 @@ use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
 use serde_json::Value;
 
 use crate::coinset::CoinsetClient;
-use crate::peer::{OptAnswer, PeerBackend};
+use crate::peer::set_agreement::{
+    common_height, contradiction, fingerprint, normalise_at, project,
+};
+use crate::peer::{CorroboratedSet, OptAnswer, PeerBackend, SetAnswer, SetProjection};
 use crate::types::*;
 
 #[cfg(test)]
@@ -255,6 +258,167 @@ impl QueryRouter {
         }
     }
 
+    /// Decide what a population answer nobody in the peer pool would second becomes.
+    ///
+    /// The set counterpart of [`settle_peer_answer`](Self::settle_peer_answer), and it settles the
+    /// same way: coinset is asked the SAME question, its answer is held to the SAME height `H` the
+    /// peer answer was held to, and the two normalised sets must be equal. Comparing coinset's
+    /// answer at its own tip against a peer answer at `H` would manufacture a disagreement out of
+    /// ordinary lag, which is the trap the whole set rule exists to avoid.
+    ///
+    /// `coinset_raw` MUST be the unfiltered form of the question — every coin in range, spent ones
+    /// included — for the same reason the peer request is: a filter applied to one side of a
+    /// comparison turns a projection into an omission.
+    ///
+    /// | peer tier | coinset | result |
+    /// |---|---|---|
+    /// | corroborated set | not asked | `Ok` |
+    /// | one peer's set | the same set at `H` | `Ok` — two independent sources agree |
+    /// | one peer's set | a different set at `H` | [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) |
+    /// | one peer's set | unreachable or disabled | [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence) |
+    ///
+    /// There is no arm that returns a set nobody would second. That is the whole point: the
+    /// established behaviour returned exactly that, silently, from whichever source answered first.
+    async fn settle_set_answer(
+        &self,
+        answer: SetAnswer<CoinRecord>,
+        projection: SetProjection,
+        coinset_raw: impl std::future::Future<Output = Result<Vec<CoinRecord>, ChiaQueryError>>,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let (items, as_of_height) = match answer {
+            SetAnswer::Corroborated {
+                items,
+                as_of_height,
+            } => {
+                return Ok(CorroboratedSet {
+                    items,
+                    as_of_height,
+                })
+            }
+            SetAnswer::Uncorroborated {
+                items,
+                as_of_height,
+            } => (items, as_of_height),
+        };
+
+        if !self.coinset_fallback_enabled {
+            return Err(ChiaQueryError::UncorroboratedPresence(
+                "one peer produced a set, no floor of independent peers agreed with it, and the \
+                 coinset fallback is disabled"
+                    .into(),
+            ));
+        }
+
+        let raw = match coinset_raw.await {
+            Ok(raw) => raw,
+            Err(e) => {
+                return Err(ChiaQueryError::UncorroboratedPresence(format!(
+                    "one peer produced a set and the coinset API could not corroborate it: {e}"
+                )))
+            }
+        };
+
+        let theirs = project(normalise_at(&raw, as_of_height), projection);
+        match contradiction(
+            "the peer tier",
+            &fingerprint(&items),
+            "the coinset API",
+            &fingerprint(&theirs),
+        ) {
+            None => Ok(CorroboratedSet {
+                items,
+                as_of_height,
+            }),
+            Some(detail) => Err(ChiaQueryError::SourcesDisagree(format!(
+                "at height {as_of_height}: {detail}"
+            ))),
+        }
+    }
+
+    /// Population-read counterpart of [`peer_then_coinset_opt`](Self::peer_then_coinset_opt).
+    ///
+    /// Same shape: one peer attempt, one retry on a different peer, and only then the coinset tier
+    /// on its own. The difference is what happens when a peer DOES answer — the answer is graded
+    /// and settled rather than returned, so "the first responsive source wins" stops being the
+    /// contract (chia-query#47).
+    async fn peer_then_coinset_set(
+        &self,
+        peer_fn: impl std::future::Future<Output = Result<SetAnswer<CoinRecord>, ChiaQueryError>>,
+        peer_retry: impl std::future::Future<Output = Result<SetAnswer<CoinRecord>, ChiaQueryError>>,
+        coinset_raw: impl std::future::Future<Output = Result<Vec<CoinRecord>, ChiaQueryError>>,
+        projection: SetProjection,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let first = match peer_fn.await {
+            Ok(answer) => Some(answer),
+            Err(e) => {
+                log::debug!("peer set attempt 1 failed: {e}");
+                None
+            }
+        };
+
+        if let Some(answer) = first {
+            return self.settle_set_answer(answer, projection, coinset_raw).await;
+        }
+
+        match peer_retry.await {
+            Ok(answer) => self.settle_set_answer(answer, projection, coinset_raw).await,
+            Err(peer_err) => {
+                if !self.coinset_fallback_enabled {
+                    return Err(peer_err);
+                }
+                self.coinset_only_set(coinset_raw, projection, peer_err)
+                    .await
+            }
+        }
+    }
+
+    /// The coinset tier answering ALONE, because no peer answered at all.
+    ///
+    /// **The stated limit, unchanged from the scalar path**: with no peer reachable the coinset API
+    /// is the only source there is, so this is one source's word. What the crate removes is a set
+    /// resting on an *anonymous, unauthenticated* peer, not the weaker claim that a single named
+    /// HTTPS endpoint is infallible.
+    ///
+    /// It still gets a height. Coinset states no as-of height with its answers, so its own peak is
+    /// read and put through the SAME `common_height` rule — a coinset answer is a source's answer,
+    /// and a source that cannot be dated cannot be compared to anything later.
+    async fn coinset_only_set(
+        &self,
+        coinset_raw: impl std::future::Future<Output = Result<Vec<CoinRecord>, ChiaQueryError>>,
+        projection: SetProjection,
+        peer_err: ChiaQueryError,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let all_sources_failed = |ce: ChiaQueryError| ChiaQueryError::AllSourcesFailed {
+            peer_error: Box::new(peer_err),
+            coinset_error: Some(Box::new(ce)),
+        };
+
+        let peak = match self.coinset.get_blockchain_state().await {
+            Ok(state) => state.peak.map(|p| p.height),
+            Err(ce) => return Err(all_sources_failed(ce)),
+        };
+        let Some(peak) = peak else {
+            return Err(all_sources_failed(ChiaQueryError::CoinsetApiError(
+                "the coinset API reports no peak, so its answer cannot be held to a height".into(),
+            )));
+        };
+        let Some(as_of_height) = common_height(&[peak], projection.end_height) else {
+            return Err(all_sources_failed(ChiaQueryError::CoinsetApiError(format!(
+                "no settled common height exists below the coinset peak {peak}"
+            ))));
+        };
+
+        let raw = match coinset_raw.await {
+            Ok(raw) => raw,
+            Err(ce) => return Err(all_sources_failed(ce)),
+        };
+
+        Ok(CorroboratedSet {
+            items: project(normalise_at(&raw, as_of_height), projection),
+            as_of_height,
+        })
+    }
+
     /// For endpoints that have no peer protocol equivalent.
     fn require_coinset(&self, endpoint: &str) -> Result<(), ChiaQueryError> {
         if !self.coinset_fallback_enabled {
@@ -341,18 +505,21 @@ impl QueryRouter {
         self.coinset.get_block_record(header_hash).await
     }
 
-    /// Peer-backed via `RequestBlockHeader` / `RespondBlockHeader` (pattern
-    /// from chia-block-listener).
+    /// The block record at `height`, or an error when no source will second one.
+    ///
+    /// A fail-closed wrapper over
+    /// [`get_block_record_by_height_opt`](Self::get_block_record_by_height_opt) rather than a
+    /// second path to the same data: two readings of "is there a block here" would be a rival
+    /// implementation, and the ungraded one is the one that would win the race.
     pub async fn get_block_record_by_height(
         &self,
         height: u32,
     ) -> Result<BlockRecord, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_block_record_by_height(height),
-            self.peer.try_get_block_record_by_height(height),
-            self.coinset.get_block_record_by_height(height),
-        )
-        .await
+        self.get_block_record_by_height_opt(height)
+            .await?
+            .ok_or_else(|| {
+                ChiaQueryError::PeerRejection(format!("no block record at height {height}"))
+            })
     }
 
     pub async fn get_block_records(
@@ -502,38 +669,57 @@ impl QueryRouter {
         Ok(record.and_then(|r| r.timestamp))
     }
 
-    /// Absence-aware block-record read used by [`block_timestamp_opt`](Self::block_timestamp_opt).
-    async fn get_block_record_by_height_opt(
+    /// Absence-aware block-record read, GRADED.
+    ///
+    /// Used by [`block_timestamp_opt`](Self::block_timestamp_opt), which is the reason it is
+    /// corroborated rather than verified: a header block's hash is recomputable from its own
+    /// contents, but `timestamp` is foliage and is not — so hash verification would authenticate
+    /// the block's name while leaving the field the caller actually reads on one peer's word.
+    ///
+    /// It was single-peer and ungraded until chia-query#35: a successful peer read was taken on
+    /// ONE peer's word, and only a peer FAILURE fell through to coinset.
+    pub async fn get_block_record_by_height_opt(
         &self,
         height: u32,
     ) -> Result<Option<BlockRecord>, ChiaQueryError> {
-        // NOT corroborated, and deliberately narrower than the rest of this crate: a successful
-        // peer read is taken on ONE peer's word here, and only a peer FAILURE falls through to
-        // coinset, whose null block_record is provable absence. Corroboration currently covers the
-        // two absence-aware coin reads only (`read_opt_corroborated`); this endpoint, the
-        // puzzle-hash / hint / names reads and `try_get_puzzle_and_solution` are still
-        // single-peer and UNGRADED (dig_ecosystem#2761).
-        if let Ok(record) = self.peer.try_get_block_record_by_height(height).await {
-            return Ok(Some(record));
-        }
-        match self.peer.try_get_block_record_by_height(height).await {
-            Ok(record) => Ok(Some(record)),
-            Err(peer_err) => {
-                if self.coinset_fallback_enabled {
-                    self.coinset
-                        .get_block_record_by_height_opt(height)
-                        .await
-                        .map_err(|ce| ChiaQueryError::AllSourcesFailed {
-                            peer_error: Box::new(peer_err),
-                            coinset_error: Some(Box::new(ce)),
-                        })
-                } else {
-                    Err(peer_err)
-                }
-            }
-        }
+        self.peer_then_coinset_opt(
+            self.peer.try_get_block_record_by_height_opt(height),
+            self.peer.try_get_block_record_by_height_opt(height),
+            self.coinset.get_block_record_by_height_opt(height),
+        )
+        .await
     }
 
+    /// Every coin hinted at `hint`, GRADED, with the height the answer is true about.
+    pub async fn get_coin_records_by_hint_graded(
+        &self,
+        hint: &str,
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+        self.peer_then_coinset_set(
+            self.peer
+                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
+            self.peer
+                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
+            self.coinset.get_coin_records_by_hint(hint, None, None, true),
+            projection,
+        )
+        .await
+    }
+
+    /// Every coin hinted at `hint`.
+    ///
+    /// A fail-closed wrapper over
+    /// [`get_coin_records_by_hint_graded`](Self::get_coin_records_by_hint_graded) that drops
+    /// `as_of_height`. Prefer the graded twin when the answer's height matters — and it usually
+    /// does, because this set is a true statement about that height rather than about the tip.
     pub async fn get_coin_records_by_hint(
         &self,
         hint: &str,
@@ -541,29 +727,37 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_records_by_hint(
-                hint,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-            self.peer.try_get_coin_records_by_hint(
-                hint,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-            self.coinset.get_coin_records_by_hint(
-                hint,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
+        Ok(self
+            .get_coin_records_by_hint_graded(hint, start_height, end_height, include_spent_coins)
+            .await?
+            .items)
+    }
+
+    /// Every coin hinted at any of `hints`, GRADED, with the height the answer is true about.
+    pub async fn get_coin_records_by_hints_graded(
+        &self,
+        hints: &[String],
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+        self.peer_then_coinset_set(
+            self.peer
+                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
+            self.peer
+                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
+            self.coinset.get_coin_records_by_hints(hints, None, None, true),
+            projection,
         )
         .await
     }
 
+    /// Every coin hinted at any of `hints`. Fail-closed wrapper over the graded twin.
     pub async fn get_coin_records_by_hints(
         &self,
         hints: &[String],
@@ -571,29 +765,41 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_records_by_hints(
-                hints,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-            self.peer.try_get_coin_records_by_hints(
-                hints,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-            self.coinset.get_coin_records_by_hints(
-                hints,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
+        Ok(self
+            .get_coin_records_by_hints_graded(hints, start_height, end_height, include_spent_coins)
+            .await?
+            .items)
+    }
+
+    /// The coin records for `names`, GRADED, with the height the answer is true about.
+    pub async fn get_coin_records_by_names_graded(
+        &self,
+        names: &[String],
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+        self.peer_then_coinset_set(
+            self.peer
+                .try_get_coin_records_by_names(names, start_height, end_height, include_spent_coins),
+            self.peer
+                .try_get_coin_records_by_names(names, start_height, end_height, include_spent_coins),
+            self.coinset.get_coin_records_by_names(names, None, None, true),
+            projection,
         )
         .await
     }
 
+    /// The coin records for `names`. Fail-closed wrapper over the graded twin.
+    ///
+    /// The peer path used to ignore `start_height`, `end_height` and `include_spent_coins`
+    /// entirely while the coinset path honoured them, so the same call returned different sets
+    /// depending on which tier answered. Both tiers now go through one projection.
     pub async fn get_coin_records_by_names(
         &self,
         names: &[String],
@@ -601,22 +807,74 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_records_by_names(names),
-            self.peer.try_get_coin_records_by_names(names),
-            self.coinset.get_coin_records_by_names(
-                names,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-        )
-        .await
+        Ok(self
+            .get_coin_records_by_names_graded(names, start_height, end_height, include_spent_coins)
+            .await?
+            .items)
     }
 
-    /// Peer-backed via `RequestChildren` / `RespondChildren` which returns
-    /// child coin states for a given parent coin ID.  Falls back to coinset
-    /// for batched queries or when peers fail.
+    /// The children of every id in `parent_ids`, GRADED, with the height the answer is true about.
+    ///
+    /// Each parent is a separate graded round, and the combined answer is only as good as its
+    /// weakest part: the reported `as_of_height` is the LOWEST of the rounds, so the whole set is
+    /// dated by the oldest thing in it rather than by the freshest. Any round that disagrees fails
+    /// the whole call — a partial answer here would be an omission wearing a success.
+    pub async fn get_coin_records_by_parent_ids_graded(
+        &self,
+        parent_ids: &[String],
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+
+        let mut items = Vec::new();
+        let mut as_of_height = u32::MAX;
+        for parent_id in parent_ids {
+            let answer = self
+                .peer_then_coinset_set(
+                    self.peer.try_get_children(
+                        parent_id,
+                        start_height,
+                        end_height,
+                        include_spent_coins,
+                    ),
+                    self.peer.try_get_children(
+                        parent_id,
+                        start_height,
+                        end_height,
+                        include_spent_coins,
+                    ),
+                    self.coinset.get_coin_records_by_parent_ids(
+                        std::slice::from_ref(parent_id),
+                        None,
+                        None,
+                        true,
+                    ),
+                    projection,
+                )
+                .await?;
+            as_of_height = as_of_height.min(answer.as_of_height);
+            items.extend(answer.items);
+        }
+
+        Ok(CorroboratedSet {
+            items,
+            // An empty `parent_ids` asks nothing, so there is no round to be dated by. Reporting
+            // `u32::MAX` would claim the empty answer is true about a height nobody has reached.
+            as_of_height: if parent_ids.is_empty() {
+                0
+            } else {
+                as_of_height
+            },
+        })
+    }
+
+    /// The children of every id in `parent_ids`. Fail-closed wrapper over the graded twin.
     pub async fn get_coin_records_by_parent_ids(
         &self,
         parent_ids: &[String],
@@ -624,52 +882,70 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        // Try peer: query each parent ID via RequestChildren, combine results.
-        let peer_attempt = async {
-            let mut all_records = Vec::new();
-            for parent_id in parent_ids {
-                let children = self.peer.try_get_children(parent_id).await?;
-                all_records.extend(children);
-            }
-            // Apply client-side height and spent filters.
-            all_records.retain(|r| {
-                let height_ok = match (start_height, end_height) {
-                    (Some(s), Some(e)) => {
-                        r.confirmed_block_index >= s && r.confirmed_block_index <= e
-                    }
-                    (Some(s), None) => r.confirmed_block_index >= s,
-                    (None, Some(e)) => r.confirmed_block_index <= e,
-                    (None, None) => true,
-                };
-                let spent_ok = include_spent_coins || !r.spent;
-                height_ok && spent_ok
-            });
-            Ok(all_records)
-        };
-
-        match peer_attempt.await {
-            Ok(r) => Ok(r),
-            Err(peer_err) => {
-                if self.coinset_fallback_enabled {
-                    self.coinset
-                        .get_coin_records_by_parent_ids(
-                            parent_ids,
-                            start_height,
-                            end_height,
-                            include_spent_coins,
-                        )
-                        .await
-                        .map_err(|ce| ChiaQueryError::AllSourcesFailed {
-                            peer_error: Box::new(peer_err),
-                            coinset_error: Some(Box::new(ce)),
-                        })
-                } else {
-                    Err(peer_err)
-                }
-            }
-        }
+        Ok(self
+            .get_coin_records_by_parent_ids_graded(
+                parent_ids,
+                start_height,
+                end_height,
+                include_spent_coins,
+            )
+            .await?
+            .items)
     }
 
+    /// Every coin at `puzzle_hash`, GRADED, with the height the answer is true about.
+    ///
+    /// **This is the read a wallet balance and the collateral census are taken through.** It was
+    /// ungraded until chia-query#35/#47 — whatever the first responsive source said was the
+    /// answer — which made an omission free in exactly the direction that costs the network money
+    /// (dig-node#405).
+    ///
+    /// `as_of_height` is not optional decoration. The set is a TRUE statement about the chain at
+    /// that height and a FALSE one about the tip, and a consumer recording a balance or a census
+    /// count needs to know which it has.
+    pub async fn get_coin_records_by_puzzle_hash_graded(
+        &self,
+        puzzle_hash: &str,
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+        self.peer_then_coinset_set(
+            self.peer.try_get_coin_records_by_puzzle_hash(
+                puzzle_hash,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_puzzle_hash(
+                puzzle_hash,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset
+                .get_coin_records_by_puzzle_hash(puzzle_hash, None, None, true),
+            projection,
+        )
+        .await
+    }
+
+    /// Every coin at `puzzle_hash`.
+    ///
+    /// A fail-closed wrapper over
+    /// [`get_coin_records_by_puzzle_hash_graded`](Self::get_coin_records_by_puzzle_hash_graded)
+    /// that drops `as_of_height`. It keeps its signature and gains the
+    /// [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) and
+    /// [`UncorroboratedPresence`](ChiaQueryError::UncorroboratedPresence) outcomes, which mean
+    /// UNKNOWN and should be retried — never an empty or short set.
+    ///
+    /// Leaving this one on the ungraded path would have left the hole open under the name every
+    /// consumer already calls.
     pub async fn get_coin_records_by_puzzle_hash(
         &self,
         puzzle_hash: &str,
@@ -677,29 +953,51 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_records_by_puzzle_hash(
+        Ok(self
+            .get_coin_records_by_puzzle_hash_graded(
                 puzzle_hash,
                 start_height,
                 end_height,
                 include_spent_coins,
-            ),
-            self.peer.try_get_coin_records_by_puzzle_hash(
-                puzzle_hash,
+            )
+            .await?
+            .items)
+    }
+
+    /// Every coin at any of `puzzle_hashes`, GRADED, with the height the answer is true about.
+    pub async fn get_coin_records_by_puzzle_hashes_graded(
+        &self,
+        puzzle_hashes: &[String],
+        start_height: Option<u32>,
+        end_height: Option<u32>,
+        include_spent_coins: bool,
+    ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+        let projection = SetProjection {
+            start_height,
+            end_height,
+            include_spent: include_spent_coins,
+        };
+        self.peer_then_coinset_set(
+            self.peer.try_get_coin_records_by_puzzle_hashes(
+                puzzle_hashes,
                 start_height,
                 end_height,
                 include_spent_coins,
             ),
-            self.coinset.get_coin_records_by_puzzle_hash(
-                puzzle_hash,
+            self.peer.try_get_coin_records_by_puzzle_hashes(
+                puzzle_hashes,
                 start_height,
                 end_height,
                 include_spent_coins,
             ),
+            self.coinset
+                .get_coin_records_by_puzzle_hashes(puzzle_hashes, None, None, true),
+            projection,
         )
         .await
     }
 
+    /// Every coin at any of `puzzle_hashes`. Fail-closed wrapper over the graded twin.
     pub async fn get_coin_records_by_puzzle_hashes(
         &self,
         puzzle_hashes: &[String],
@@ -707,27 +1005,15 @@ impl QueryRouter {
         end_height: Option<u32>,
         include_spent_coins: bool,
     ) -> Result<Vec<CoinRecord>, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_records_by_puzzle_hashes(
+        Ok(self
+            .get_coin_records_by_puzzle_hashes_graded(
                 puzzle_hashes,
                 start_height,
                 end_height,
                 include_spent_coins,
-            ),
-            self.peer.try_get_coin_records_by_puzzle_hashes(
-                puzzle_hashes,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-            self.coinset.get_coin_records_by_puzzle_hashes(
-                puzzle_hashes,
-                start_height,
-                end_height,
-                include_spent_coins,
-            ),
-        )
-        .await
+            )
+            .await?
+            .items)
     }
 
     /// No peer equivalent -- always coinset.
@@ -736,27 +1022,38 @@ impl QueryRouter {
         self.coinset.get_memos_by_coin_name(name).await
     }
 
+    /// The spend that spent `coin_id`, or an error when no source will second one.
+    ///
+    /// Graded by the scalar corroboration path on both branches (chia-query#35). It was
+    /// single-peer and ungraded before: whichever peer answered first decided what program had
+    /// run.
+    ///
+    /// With no `height`, the read goes through
+    /// [`get_coin_spend_opt`](Self::get_coin_spend_opt), which resolves the spent height from a
+    /// graded coin-state read and verifies the puzzle reveal against the coin's own puzzle hash.
+    /// Routing it to the peer tier's `_auto` form instead would be a second, ungraded path to the
+    /// same answer.
     pub async fn get_puzzle_and_solution(
         &self,
         coin_id: &str,
         height: Option<u32>,
     ) -> Result<CoinSpend, ChiaQueryError> {
-        if let Some(h) = height {
-            self.peer_then_coinset(
+        let spend = if let Some(h) = height {
+            self.peer_then_coinset_opt(
                 self.peer.try_get_puzzle_and_solution(coin_id, h),
                 self.peer.try_get_puzzle_and_solution(coin_id, h),
-                self.coinset.get_puzzle_and_solution(coin_id, height),
+                self.coinset.get_puzzle_and_solution_opt(coin_id, height),
             )
-            .await
+            .await?
         } else {
-            // No height provided -- peer can resolve it via coin state.
-            self.peer_then_coinset(
-                self.peer.try_get_puzzle_and_solution_auto(coin_id),
-                self.peer.try_get_puzzle_and_solution_auto(coin_id),
-                self.coinset.get_puzzle_and_solution(coin_id, None),
-            )
-            .await
-        }
+            self.get_coin_spend_opt(coin_id).await?
+        };
+
+        spend.ok_or_else(|| {
+            ChiaQueryError::PeerRejection(format!(
+                "no spend for coin {coin_id}: it is unknown or unspent"
+            ))
+        })
     }
 
     /// Peer-backed: get puzzle & solution, then run puzzle(solution) to extract

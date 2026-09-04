@@ -635,6 +635,34 @@ impl PeerPool {
             .collect()
     }
 
+    /// The highest peak the peer at `address` has ANNOUNCED, or `None` when it has announced none.
+    ///
+    /// This is that ONE peer's own claim, never the pool's [`peak_height`](Self::peak_height)
+    /// median. A population read whose wire response carries no height of its own —
+    /// `RespondCoinState` and `RespondChildren` both lack one, unlike `RespondPuzzleState` — needs
+    /// a per-source as-of height to normalise against, and the pool's median is not that source's
+    /// position.
+    ///
+    /// **A peer that has announced nothing reports `None`, never `0`.** Zero would be read as a
+    /// real as-of height, drag the round's common height to zero, normalise every answer to the
+    /// empty set, and report that emptiness as CORROBORATED — the exact under-report this crate's
+    /// set agreement exists to refuse. The caller must treat `None` as "this source cannot be held
+    /// to a height", not as "height 0".
+    ///
+    /// A peer whose announcement UNDERSTATES where it really is, is safe: normalisation only ever
+    /// moves downwards, so a low as-of drops coins rather than inventing them. One that overstates
+    /// produces a set that looks short beside its peers, which the set rule reports as a
+    /// contradiction. Both directions fail closed.
+    pub async fn announced_peak(&self, address: SocketAddr) -> Option<u32> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| e.last_peak.load(Ordering::Relaxed))
+            .filter(|peak| *peak > 0)
+    }
+
     /// Remove a peer from the pool and asynchronously connect a replacement.
     pub async fn eject_peer(&self, addr: SocketAddr) {
         {
