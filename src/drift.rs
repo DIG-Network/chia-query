@@ -21,6 +21,28 @@ use serde_json::{Map, Value};
 ///
 /// The result is itself JSON so it serializes cleanly into the committed
 /// snapshot and diffs with the same machinery.
+///
+/// # Known false positive: `integer` vs `number` on a numerically variable field
+///
+/// The `integer`/`number` split is decided by `is_i64() || is_u64()`, which is a
+/// property of the VALUE that arrived, not of the API's contract. A field whose
+/// value is legitimately sometimes whole and sometimes fractional therefore flips
+/// tag with conditions and reports drift that is not drift.
+///
+/// Observed on `get_blockchain_state.blockchain_state.mempool_min_fees.cost_5000000`
+/// (a FEE, so whole whenever the mempool is uncongested): reported as
+/// `integer -> number` on 2026-08-28 and back to `integer` days later, with no API
+/// change either time. It was harmless in that instance because `mempool_min_fees`
+/// is typed `serde_json::Value` (`crate::types::response`), so neither form could
+/// fail to deserialize.
+///
+/// This is a value leaking into the shape, which is the one thing this module
+/// otherwise avoids by design. It is left in place deliberately: collapsing the two
+/// tags would also stop detecting a genuine `integer -> number` change on a field
+/// that IS decoded into an integer type, which is a real break. So the tag stays
+/// strict and the false positive is documented instead. Before acting on such a
+/// drift report, check whether the field is decoded into a numeric Rust type at all
+/// -- if it is a `serde_json::Value`, the report is noise.
 pub fn shape_of(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
