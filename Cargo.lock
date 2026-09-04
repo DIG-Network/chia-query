@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",

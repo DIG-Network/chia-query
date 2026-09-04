@@ -36,7 +36,9 @@ pub use light_client::{ChiaLightClient, LightClientProvider, SubmitOutcome};
 use plurality::CORROBORATION_FLOOR;
 pub use pool::PeerRequirement;
 use pool::{CorroborationReadiness, PeerPool};
-use set_agreement::{common_height, contradiction, fingerprint, normalise_at, project, SetMember};
+use set_agreement::{
+    as_of_is_supported, common_height, contradiction, fingerprint, normalise_at, project, SetMember,
+};
 pub use set_agreement::{CorroboratedSet, HeightedSet, SetAnswer, SetProjection};
 
 // ---------------------------------------------------------------------------
@@ -128,6 +130,19 @@ impl PeerBackend {
         }
     }
 
+    /// As [`for_tests_with_capacity`](Self::for_tests_with_capacity), with a request timeout long
+    /// enough for a scripted peer to answer over a real loopback websocket.
+    ///
+    /// The 1ms default is deliberate for a backend nothing answers; a test whose peer DOES answer
+    /// needs a budget for the round trip, or it measures the timeout rather than the answer.
+    pub(crate) fn for_tests_with_timeout(max_peers: usize, request_timeout: Duration) -> Self {
+        Self {
+            pool: pool::PeerPool::for_tests(max_peers),
+            network: NetworkType::Mainnet,
+            request_timeout,
+        }
+    }
+
     /// The pool underneath, so a test can admit peers into the backend it is exercising.
     pub(crate) fn pool_for_tests(&self) -> &pool::PeerPool {
         &self.pool
@@ -196,8 +211,16 @@ impl PeerBackend {
     ///
     /// Falling further behind than `capacity` ENDS the subscription rather than skipping a frame —
     /// see [`frames::FrameSubscription`].
-    pub async fn subscribe_frames(&self, capacity: usize) -> frames::FrameSubscription {
-        self.pool.subscribe_frames(capacity).await
+    ///
+    /// The subscription follows the session held at `address` and receives only that session's
+    /// frames, so no other held peer can end it (chia-query#34). `None` when no live session is
+    /// held there — see [`PeerPool::subscribe_frames`](pool::PeerPool::subscribe_frames).
+    pub async fn subscribe_frames(
+        &self,
+        address: SocketAddr,
+        capacity: usize,
+    ) -> Option<frames::FrameSubscription> {
+        self.pool.subscribe_frames(address, capacity).await
     }
 
     // -----------------------------------------------------------------------
@@ -500,6 +523,28 @@ impl PeerBackend {
     /// Silence is not agreement. A corroborator whose read FAILS is ejected and does not count
     /// towards the floor, so a pool that has been quietly reduced to one voice reports
     /// `Uncorroborated` rather than corroborating against itself.
+    ///
+    /// # A peer that CONTRADICTS is kept, while one that goes SILENT is ejected
+    ///
+    /// The asymmetry is deliberate and it is decided here rather than left to look like an
+    /// oversight (chia-query#27). It reads backwards — the pool appears to punish unreachability and
+    /// tolerate contradiction — but the two events are not the same kind of thing. Ejection is the
+    /// response to a FAILED REQUEST (rule 3), and it is indifferent to what the peer would have
+    /// said; a disagreement is a request that SUCCEEDED, answered by a peer this crate has no way to
+    /// judge.
+    ///
+    /// Ejecting on disagreement would make the pool's composition a function of what peers claim,
+    /// which hands any peer a way to evict the honest ones: contradict them, and they leave. That is
+    /// a limiter keyed on adversary-supplied input, the same denial primitive this crate refuses
+    /// elsewhere — and it would be a worse deal than it looks, because the attacker chooses which
+    /// honest peers to displace while the pool refills from a set the attacker may also be in.
+    ///
+    /// Nor is there a right party to eject. A contradiction says exactly one of two sources is
+    /// wrong and nothing about WHICH, so any eviction rule built on it is a coin flip that removes
+    /// the honest peer half the time. Refusing to resolve the disagreement — which
+    /// [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) does — is the only answer the evidence
+    /// supports, and carrying no pool-level memory of it is what keeps that refusal free of a side
+    /// effect an attacker would steer.
     async fn read_set_corroborated<T, F, Fut>(
         &self,
         read: F,
@@ -849,15 +894,66 @@ impl PeerBackend {
         res
     }
 
-    /// Push a signed bundle to the mempool.
+    /// Push a signed bundle to the mempool, on ONE peer.
     ///
-    /// **Single-peer by design, and stated here so the silence is not read as an oversight
-    /// (chia-query#35).** This is a WRITE, not a read: there is no existing fact for a second peer
-    /// to agree about, and the only thing corroboration could grade is whether other peers also
-    /// accepted the bundle — which is a question about propagation, answered by reading the coin
-    /// back afterwards through a read that IS graded.
+    /// **Each ATTEMPT is single-peer and nothing here is corroborated (chia-query#35).** This is a
+    /// WRITE, not a read: there is no existing fact for a second peer to agree about, and the only
+    /// thing corroboration could grade is whether other peers also accepted the bundle — which is a
+    /// question about propagation, answered by reading the coin back afterwards through a read that
+    /// IS graded.
+    ///
+    /// [`QueryRouter::push_tx`](crate::QueryRouter::push_tx) may make a SECOND attempt on one other
+    /// peer when the first REFUSES for a reason that depends on which node was asked
+    /// (chia-query#50). That is a second chance at admission, not a vote: neither attempt grades the
+    /// other, and a push is never transmitted to more than two peers.
     pub async fn try_push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
+        Ok(self.try_push_tx_attributed(bundle).await?.0)
+    }
+
+    /// [`try_push_tx`](Self::try_push_tx), reporting WHICH peer answered.
+    ///
+    /// The router needs the address to exclude it from a retry, and it cannot be recovered
+    /// afterwards: `pick` round-robins, so asking again would land on an arbitrary peer that may be
+    /// the same one. `TxStatus` deliberately does not carry it — `dig-wallet` builds that struct as
+    /// a literal, so a new field breaks its build for no consumer benefit.
+    pub(crate) async fn try_push_tx_attributed(
+        &self,
+        bundle: &SpendBundle,
+    ) -> Result<(TxStatus, SocketAddr), ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
+        match self.do_push_tx(&peer, bundle).await {
+            Ok(status) => Ok((status, addr)),
+            Err(e) => {
+                self.pool.eject_peer(addr).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Push a signed bundle to one peer that is NOT the one at `excluded`.
+    ///
+    /// `Err(PeerConnection)` when the pool holds no other peer, which is a real and ordinary state
+    /// — a pool of one — and is why the router treats it as "no second opinion available" rather
+    /// than as a failure of the push.
+    ///
+    /// **The refuser is not ejected**, here or by the caller. Ejection is for a FAILED request
+    /// (rule 3); a refusal is a COMPLETED request with an answer. Ejecting on refusal would let
+    /// anyone holding a badly-fee'd bundle churn the pool's composition at will — a limiter keyed
+    /// on caller input, which is a denial primitive.
+    pub async fn try_push_tx_excluding(
+        &self,
+        bundle: &SpendBundle,
+        excluded: SocketAddr,
+    ) -> Result<TxStatus, ChiaQueryError> {
+        let (peer, addr) = self
+            .pool
+            .select_peer_excluding(excluded)
+            .await
+            .ok_or_else(|| {
+                ChiaQueryError::PeerConnection(
+                    "no peer other than the one that refused is held".into(),
+                )
+            })?;
         let res = self.do_push_tx(&peer, bundle).await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;
@@ -1316,6 +1412,24 @@ impl PeerBackend {
             }
             prev_height = Some(response.height);
             prev_header = response.header_hash;
+        }
+
+        // `as_of_height` is the ONE anchor in this crate taken from an untrusted peer's wire
+        // response rather than from a number the pool already polices, and the round's common
+        // height is a `min` over it (chia-query#56). Held to the peer's own announced peak here,
+        // at the point the value enters, so a source whose answer its announcements do not support
+        // never reaches the round at all.
+        //
+        // Failing is the right shape rather than clamping: this peer's answer is unusable, and
+        // `read_set_corroborated` already ejects a source whose read errors and excludes it from
+        // the height vote. Clamping would keep a fabricated claim in the round under a nicer number.
+        let announced = self.pool.announced_peak(peer.socket_addr()).await;
+        if !as_of_is_supported(announced, as_of_height) {
+            return Err(ChiaQueryError::PeerRejection(format!(
+                "peer {} answered as of height {as_of_height}, which its own announced peak \
+                 ({announced:?}) does not support",
+                peer.socket_addr(),
+            )));
         }
 
         Ok(HeightedSet {

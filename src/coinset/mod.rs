@@ -434,6 +434,32 @@ impl<T: HttpTransport> CoinsetClient<T> {
 
     /// Absence-aware [`get_puzzle_and_solution`](Self::get_puzzle_and_solution): `Ok(None)` when the
     /// coin is provably unspent/unknown (coinset returns `coin_solution: null`), `Err` on failure.
+    /// The spend that spent `coin_id`, or `None` where the API answers with a null solution.
+    ///
+    /// # `Ok(None)` is UNREACHABLE from the live endpoint, and that is measured (chia-query#27)
+    ///
+    /// This is the corroborator behind `get_coin_spend_opt`, and the worry on that ticket was that
+    /// coinset might answer `success: true, coin_solution: null` for a coin with no spend — a
+    /// corroborator that cannot contradict, agreeing by construction, which is corroboration in
+    /// name only.
+    ///
+    /// **It does not.** Probed against `api.coinset.org` on 2026-09-04, `get_puzzle_and_solution`
+    /// with `height: null` answers:
+    ///
+    /// | coin | answer |
+    /// |---|---|
+    /// | spent | `success: true` with a real `coin_solution` — it CAN contradict |
+    /// | exists, unspent | `success: false`, `INVALID_HEIGHT_FOR_COIN` ("No block at height 0") |
+    /// | unknown | `success: false`, `COIN_RECORD_NOT_FOUND` |
+    ///
+    /// Both no-spend cases are `success: false`, which [`post`](Self::post) turns into an `Err`
+    /// before any null is ever read. So the feared shape does not occur and the path is fail-closed.
+    ///
+    /// The residue is worth knowing before relying on this: because the API reports "no spend" as an
+    /// ERROR rather than as a null, this method's `Ok(None)` branch is unreachable against the live
+    /// endpoint, and an unspent coin therefore yields `UncorroboratedAbsence` from
+    /// `get_coin_spend_opt` rather than a corroborated absence. Honest, and permanently so — do not
+    /// read a missing `Ok(None)` as a bug.
     pub async fn get_puzzle_and_solution_opt(
         &self,
         coin_id: &str,

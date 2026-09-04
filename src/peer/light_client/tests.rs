@@ -62,7 +62,7 @@ async fn cache_tracking(c: Coin, height: u32, peak_seed: u8) -> RwLock<CoinState
 #[test]
 fn a_frame_from_the_followed_session_is_applied() {
     assert!(
-        follows(Some(address(ANCHOR)), source(ANCHOR, 1)),
+        follows(Some(source(ANCHOR, 1)), source(ANCHOR, 1)),
         "the anchor's own frames must be applied, or the client learns nothing at all"
     );
 }
@@ -70,7 +70,7 @@ fn a_frame_from_the_followed_session_is_applied() {
 #[test]
 fn a_frame_from_another_held_peer_is_ignored() {
     assert!(
-        !follows(Some(address(ANCHOR)), source(IMPOSTOR, 2)),
+        !follows(Some(source(ANCHOR, 1)), source(IMPOSTOR, 2)),
         "a CoinStateUpdate carries no request id, so an unfollowed peer's push is \
          indistinguishable from the followed peer's and must never be applied"
     );
@@ -91,7 +91,20 @@ fn an_unanchored_client_follows_nothing() {
 /// every other attribution test here.
 #[test]
 fn attribution_is_by_address_not_by_session_id_alone() {
-    assert!(!follows(Some(address(ANCHOR)), source(IMPOSTOR, 1)));
+    assert!(!follows(Some(source(ANCHOR, 1)), source(IMPOSTOR, 1)));
+}
+
+/// **The same ADDRESS with a different session is a different peer too.**
+///
+/// This is the half an address-only filter cannot express, and it is the common case rather than an
+/// exotic one: a reconnect frequently lands on the same address. The dead session's parting
+/// `SessionEnded` would otherwise be read as the LIVE anchor's, unpinning a healthy connection.
+#[test]
+fn attribution_is_by_session_not_by_address_alone() {
+    assert!(
+        !follows(Some(source(ANCHOR, 2)), source(ANCHOR, 1)),
+        "a replaced session at the same address must not speak for its replacement"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -206,9 +219,17 @@ async fn a_session_ending_asks_for_a_resubscribe() {
     );
 }
 
-/// A `Reset` is a NEW connection at the followed address, whose subscription set is empty.
+/// **A `Reset` no longer asks for a re-subscribe, and that is the point of chia-query#34.**
+///
+/// A subscription names ONE session, so the only `Reset` this client can now see is the synthesised
+/// one that OPENS its own subscription — published as the anchor is pinned, while the subscribing
+/// reads that arm the session are still in flight. Treating it as a reason to re-arm would unpin a
+/// healthy anchor on every anchoring, and loop.
+///
+/// The fact it used to carry has not been lost: a session being REPLACED reaches this client as the
+/// `SessionEnded` of the subscription that is ending, which the test above pins.
 #[tokio::test]
-async fn a_reset_asks_for_a_resubscribe() {
+async fn the_reset_that_opens_a_subscription_does_not_ask_for_a_resubscribe() {
     let cache = RwLock::new(CoinStateCache::new());
     let after = apply_frame(
         &cache,
@@ -218,7 +239,11 @@ async fn a_reset_asks_for_a_resubscribe() {
         },
     )
     .await;
-    assert_eq!(after, AfterFrame::Resubscribe);
+    assert_eq!(
+        after,
+        AfterFrame::Continue,
+        "this subscription's own opening Reset must not tear down the anchor it just followed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -241,13 +266,25 @@ async fn backend_holding(peers: &[(u8, PeerOrigin)]) -> Arc<PeerBackend> {
     Arc::new(backend)
 }
 
-fn fetcher_over(backend: Arc<PeerBackend>) -> PooledFetcher {
-    PooledFetcher::new(backend, Duration::from_secs(1))
+/// A fetcher whose drive-loop channel is held open by the returned receiver.
+///
+/// The receiver is returned rather than dropped because `anchor` hands each newly pinned session's
+/// subscription to it: dropping it would close the channel and turn every anchoring into a logged
+/// "drive-loop has stopped", which is a different fixture from the one these tests mean.
+fn fetcher_over(
+    backend: Arc<PeerBackend>,
+) -> (
+    PooledFetcher,
+    tokio::sync::mpsc::UnboundedReceiver<crate::peer::frames::FrameSubscription>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (PooledFetcher::new(backend, Duration::from_secs(1), tx), rx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_anchor_is_pinned_once_and_reused() {
-    let fetcher = fetcher_over(backend_holding(&[(ANCHOR, PeerOrigin::Discovered)]).await);
+    let (fetcher, _subscriptions) =
+        fetcher_over(backend_holding(&[(ANCHOR, PeerOrigin::Discovered)]).await);
     let first = fetcher.anchor().await.expect("pin an anchor").address;
     let second = fetcher.anchor().await.expect("reuse the anchor").address;
     assert_eq!(
@@ -257,7 +294,7 @@ async fn the_anchor_is_pinned_once_and_reused() {
     );
 }
 
-/// Releasing is guarded on the address, not unconditional.
+/// Releasing is guarded on the SESSION, not unconditional.
 ///
 /// The nearest wrong version clears whatever is pinned. With one peer in the pool that version is
 /// indistinguishable from this one, so the fixture holds TWO and ends the session of the one that
@@ -269,32 +306,62 @@ async fn releasing_another_peers_session_leaves_the_anchor_pinned() {
         (IMPOSTOR, PeerOrigin::Discovered),
     ])
     .await;
-    let fetcher = fetcher_over(backend);
-    let pinned = fetcher.anchor().await.expect("pin an anchor").address;
-    let other = if pinned == address(ANCHOR) {
+    let (fetcher, _subscriptions) = fetcher_over(backend);
+    let pinned = fetcher.anchor().await.expect("pin an anchor").source;
+    let other_address = if pinned.address == address(ANCHOR) {
         address(IMPOSTOR)
     } else {
         address(ANCHOR)
+    };
+    let other = FrameSource {
+        address: other_address,
+        session: pinned.session,
     };
 
     fetcher.release_anchor(other).await;
 
     assert_eq!(
-        fetcher.anchor_address().await,
+        fetcher.anchor_source().await,
         Some(pinned),
         "another peer's session ending must not tear down a healthy anchor"
     );
 }
 
+/// **A dead session at the ANCHOR'S OWN ADDRESS does not unpin its replacement.**
+///
+/// The reconnect path re-anchors, and the pool frequently offers the same address again — so the
+/// predecessor's `SessionEnded`, which arrives whenever its transport finally closes, names an
+/// address that is once more the anchor's. An address-guarded release tears down a healthy
+/// connection here; a source-guarded one cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_session_at_the_anchors_address_does_not_unpin_its_replacement() {
+    let (fetcher, _subscriptions) =
+        fetcher_over(backend_holding(&[(ANCHOR, PeerOrigin::Discovered)]).await);
+    let pinned = fetcher.anchor().await.expect("pin an anchor").source;
+
+    let predecessor = FrameSource {
+        address: pinned.address,
+        session: SessionId(pinned.session.0.wrapping_sub(1)),
+    };
+    fetcher.release_anchor(predecessor).await;
+
+    assert_eq!(
+        fetcher.anchor_source().await,
+        Some(pinned),
+        "a replaced session must not unpin the connection that replaced it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn releasing_the_anchors_own_session_unpins_it() {
-    let fetcher = fetcher_over(backend_holding(&[(ANCHOR, PeerOrigin::Discovered)]).await);
-    let pinned = fetcher.anchor().await.expect("pin an anchor").address;
+    let (fetcher, _subscriptions) =
+        fetcher_over(backend_holding(&[(ANCHOR, PeerOrigin::Discovered)]).await);
+    let pinned = fetcher.anchor().await.expect("pin an anchor").source;
 
     fetcher.release_anchor(pinned).await;
 
     assert_eq!(
-        fetcher.anchor_address().await,
+        fetcher.anchor_source().await,
         None,
         "the pinned session is gone, so the next subscribing read must re-anchor"
     );

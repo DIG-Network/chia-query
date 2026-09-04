@@ -10,6 +10,7 @@ use chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
 use serde_json::Value;
 
 use crate::coinset::CoinsetClient;
+use crate::mempool_refusal;
 use crate::peer::set_agreement::{
     common_height, contradiction, fingerprint, normalise_at, project,
 };
@@ -20,6 +21,8 @@ use crate::types::*;
 mod absence_tests;
 #[cfg(test)]
 mod presence_tests;
+#[cfg(test)]
+mod push_tests;
 #[cfg(test)]
 mod set_settlement_tests;
 
@@ -1137,13 +1140,84 @@ impl QueryRouter {
         })
     }
 
+    /// Relay a signed bundle to the network.
+    ///
+    /// # One more peer, and never more than two transmissions (chia-query#50)
+    ///
+    /// A mempool refusal is not uniformly a property of the transaction. Some causes are — a bad
+    /// aggregate signature, a minting coin — and every honest node reaches the same verdict from
+    /// the same bytes. The rest are properties of the NODE that was asked: its mempool is full, its
+    /// fee floor is higher, it is behind the tip. Treating the second class as final lets one
+    /// unhealthy peer veto a spend every other peer would have admitted, and under NC-12 a single
+    /// dialled peer is untrusted and may simply be wrong.
+    ///
+    /// So a refusal naming a
+    /// [bundle-intrinsic reason](crate::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS) is FINAL, and
+    /// anything else gets exactly ONE more transmission to one other held peer. There is no third
+    /// peer, and coinset is never consulted about a refusal — it is a third mempool with its own
+    /// policy, and the bound is two transmissions.
+    ///
+    /// # Why one more is safe, from the protocol rather than from optimism
+    ///
+    /// - **A retry of the identical bundle is not a double-spend and cannot be mistaken for one.**
+    ///   A double-spend is a DIFFERENT bundle over the same coins; this re-sends the same bytes
+    ///   under the same `SpendBundle::name()`, and a node already holding it answers success.
+    /// - **A peer that answered `NotAdmitted` or `Failed` did not relay it.** A full node gossips a
+    ///   transaction only on admission, so after an explicit refusal nothing is in flight from that
+    ///   peer and the second peer's verdict is clean.
+    /// - **The one case where the bundle IS in flight without an admission is a TIMEOUT after
+    ///   transmit**, which is an `Err`, lives on the path below, and is deliberately unchanged.
+    ///
+    /// # Both abuses of the classifier are priced
+    ///
+    /// The reason text comes from the peer. One that wants its refusal to STICK emits an
+    /// allowlisted name and gets today's behaviour — no new capability, since those names are
+    /// public constants. One that wants to INDUCE a retry emits anything else, and it costs one
+    /// round trip to one other peer, once. There is no loop for it to drive.
     pub async fn push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_push_tx(bundle),
-            self.peer.try_push_tx(bundle),
-            self.coinset.push_tx(bundle),
-        )
-        .await
+        let (first, first_addr) = match self.peer.try_push_tx_attributed(bundle).await {
+            Ok(attempt) => attempt,
+            Err(peer_err) => {
+                // The transport failed rather than the mempool refusing, so nothing was answered
+                // and the ordinary retry-then-coinset ladder applies unchanged. The first attempt
+                // has already been made and its peer ejected, so it is fed in as the failure it was
+                // rather than being made a second time.
+                return self
+                    .peer_then_coinset(
+                        std::future::ready(Err(peer_err)),
+                        self.peer.try_push_tx(bundle),
+                        self.coinset.push_tx(bundle),
+                    )
+                    .await;
+            }
+        };
+
+        if mempool_refusal::is_final(&first) {
+            return Ok(first);
+        }
+
+        log::debug!(
+            "peer {first_addr} refused the push for a reason that depends on which node was asked              ({:?}); transmitting once more to one other peer",
+            first.error
+        );
+
+        let Ok(second) = self.peer.try_push_tx_excluding(bundle, first_addr).await else {
+            // No other peer is held, or the second transmission failed at the transport. The
+            // caller already has a real verdict from a peer that answered, so it is returned as
+            // it stands: surfacing the transport error instead would replace an answer with a
+            // failure.
+            return Ok(first);
+        };
+
+        // The second peer's answer wins when it is DEFINITIVE — admitted, or refused for a reason
+        // intrinsic to the bundle. Otherwise the answer to the caller's own original transmission
+        // stands: neither view-dependent refusal outranks the other, and picking deterministically
+        // is what stops the reported reason depending on dial order.
+        Ok(if mempool_refusal::is_final(&second) {
+            second
+        } else {
+            first
+        })
     }
 }
 

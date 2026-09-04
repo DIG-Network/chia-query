@@ -17,6 +17,7 @@ use crate::NetworkType;
 use super::connect;
 use super::frames::{
     FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
+    MAX_FRAME_COIN_STATES,
 };
 use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PRIORITY_SLOTS};
 
@@ -585,6 +586,32 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
+    /// Round-robin select a peer OTHER than the one at `excluded`.
+    ///
+    /// `None` when the pool holds no alternative, which is the honest answer that there is nobody
+    /// else to ask.
+    ///
+    /// **Deliberately NOT
+    /// [`select_corroborating_peers`](Self::select_corroborating_peers), and the difference is not
+    /// cosmetic.** That selector additionally excludes `Priority` peers because a co-resident node
+    /// cannot be an independent VOICE about a fact. This selector exists for a WRITE — a second
+    /// attempt to get a bundle admitted somewhere (chia-query#50) — where independence is not the
+    /// property being sought and the operator's own node is the single best destination there is.
+    /// Reusing the corroboration selector here would import a corroboration semantic into a
+    /// decision that is not corroboration, and would leave a solo node running its own full node
+    /// with no second attempt at all.
+    pub async fn select_peer_excluding(&self, excluded: SocketAddr) -> Option<(Peer, SocketAddr)> {
+        let entries = self.entries.read().await;
+        let candidates: Vec<&PeerEntry> =
+            entries.iter().filter(|e| e.address != excluded).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let entry = candidates[idx];
+        Some((entry.peer.clone(), entry.address))
+    }
+
     /// How the pool reached the peer currently held at `address`, or `None` if it holds none.
     ///
     /// Exists so a consumer that PINS one session can describe it honestly. A
@@ -610,8 +637,10 @@ impl PeerPool {
     ///
     /// A corroborating peer must be two things at once, and neither alone is enough:
     ///
-    /// - **A different address than `asked`.** Asking the same connection twice returns the same
-    ///   opinion twice, which reads as agreement while being one voice.
+    /// - **A different HOST than `asked`.** Asking the same connection twice returns the same
+    ///   opinion twice, which reads as agreement while being one voice — and so does asking one
+    ///   machine over two of its ports, which is why the test is on the IP rather than the whole
+    ///   socket address (chia-query#27). At most one peer per host is returned for the same reason.
     /// - **[`PeerOrigin::Discovered`](connect::PeerOrigin).** A peer reached from a preferred
     ///   address - an operator's node, or one on this machine - is an excellent peer to READ from
     ///   and is not evidence about the chain independent of this host, exactly as
@@ -626,11 +655,9 @@ impl PeerPool {
     /// Returns an empty vector when the pool holds nobody who qualifies, which is the honest
     /// answer that there is nobody to corroborate with.
     pub async fn select_corroborating_peers(&self, asked: SocketAddr) -> Vec<(Peer, SocketAddr)> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|e| Self::is_corroborator(e, asked))
+        let entries = self.entries.read().await;
+        Self::corroborators(&entries, asked)
+            .into_iter()
             .map(|e| (e.peer.clone(), e.address))
             .collect()
     }
@@ -704,18 +731,72 @@ impl PeerPool {
     /// deciding whether enough separate sources agree MUST use this number, because counting a
     /// co-resident node as an independent voice is the thing that made a single local process able
     /// to look like a full peer set (dig_ecosystem#2648).
+    /// Counted by distinct HOST, not by distinct connection: see [`is_corroborator`] for why the
+    /// key is the IP and not the whole socket address.
+    ///
+    /// [`is_corroborator`]: Self::is_corroborator
     pub async fn independent_peer_count(&self) -> usize {
-        self.entries
-            .read()
-            .await
+        let entries = self.entries.read().await;
+        let mut hosts = std::collections::HashSet::new();
+        entries
             .iter()
             .filter(|e| e.origin == connect::PeerOrigin::Discovered)
+            .filter(|e| hosts.insert(e.address.ip()))
             .count()
     }
 
-    /// Whether a peer entry qualifies as a corroborator: not the answering peer, and discovered.
+    /// Whether a peer entry qualifies as a corroborator: a DIFFERENT HOST than the answering peer,
+    /// and discovered.
+    ///
+    /// # The key is the IP, not the whole `SocketAddr` (chia-query#27)
+    ///
+    /// [`admit`](Self::admit) refuses a duplicate `SocketAddr`, which guarantees two entries are
+    /// never one CONNECTION. It does not guarantee they are not one MACHINE: a host listening on
+    /// two ports seats two entries that both count as `Discovered`, and independence is the entire
+    /// load-bearing property here — absence is believed when two peers AGREE, and a corroborator on
+    /// the same machine as the first is one peer agreeing with itself. The canonical entry records
+    /// the sibling lesson from dig_ecosystem#2648: *"N sockets to one address is one answer counted
+    /// N times."* This is that, one layer out.
+    ///
+    /// # Why NOT the `/24` + `/48` [`SubnetKey`] this crate already has
+    ///
+    /// Deliberate, and the asymmetry is the general principle rather than a preference. The prefix
+    /// proxy is cheap on a SELECTING gate and expensive on a REFUSING one. [`SubnetKey`] earns its
+    /// keep in [`most_credible`]'s dial spreading, where over-grouping costs nothing — the round
+    /// simply picks a different candidate. Here the gate REFUSES rather than degrading, and
+    /// [`CORROBORATION_FLOOR`] is measured against a small `max_peers`, so an over-grouping key does
+    /// not weaken a heuristic: it converts availability into refusal, and a refusing node falls back
+    /// to the CENTRALIZED coinset tier. That is strictly worse than the Sybil case a prefix key
+    /// defends against, because it routes every read through one source rather than making one
+    /// adversary's several voices count as one. It is the "bound that starves the work it protects"
+    /// shape, on the read path that matters most.
+    ///
+    /// # The limitation this does NOT close, stated rather than implied
+    ///
+    /// A DUAL-STACK host is two different IPs — and two different [`SubnetKey`]s — so neither key
+    /// separates it. Only an identity-based key (the peer id derived from the session's TLS SPKI)
+    /// can, and that is a larger change tracked separately. This closes the multi-PORT case that
+    /// chia-query#27 names; it does not make independence unforgeable.
+    ///
+    /// [`SubnetKey`]: SubnetKey
+    /// [`most_credible`]: most_credible
     fn is_corroborator(entry: &PeerEntry, asked: SocketAddr) -> bool {
-        entry.address != asked && entry.origin == connect::PeerOrigin::Discovered
+        entry.address.ip() != asked.ip() && entry.origin == connect::PeerOrigin::Discovered
+    }
+
+    /// The corroborators for an answer given by `asked`, at most ONE per host.
+    ///
+    /// Deduping here as well as in [`is_corroborator`] is what keeps the COUNT and the SET the same
+    /// thing. Without it, two entries on one machine would both be asked and both could agree,
+    /// producing an `agreed` tally above the number of independent voices the pool actually holds —
+    /// a floor cleared by one peer answering twice.
+    fn corroborators(entries: &[PeerEntry], asked: SocketAddr) -> Vec<&PeerEntry> {
+        let mut hosts = std::collections::HashSet::new();
+        entries
+            .iter()
+            .filter(|e| Self::is_corroborator(e, asked))
+            .filter(|e| hosts.insert(e.address.ip()))
+            .collect()
     }
 
     /// Whether the pool can honestly attempt a CORROBORATED read of an answer given by `asked`.
@@ -737,13 +818,8 @@ impl PeerPool {
     /// [`CorroborationReadiness::Insufficient`] must decline the read, not proceed with fewer
     /// voices.
     pub async fn corroboration_readiness(&self, asked: SocketAddr) -> CorroborationReadiness {
-        let corroborators = self
-            .entries
-            .read()
-            .await
-            .iter()
-            .filter(|e| Self::is_corroborator(e, asked))
-            .count();
+        let entries = self.entries.read().await;
+        let corroborators = Self::corroborators(&entries, asked).len();
         if corroborators >= CORROBORATION_FLOOR {
             CorroborationReadiness::Armed { corroborators }
         } else {
@@ -1085,6 +1161,20 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
+                        // Checked BEFORE the frame is built, so an oversized `items` is never
+                        // moved into a `PoolFrame` and never reaches a subscriber's queue
+                        // (chia-query#33). The peer chooses this length, so it is the one input
+                        // to this task an untrusted peer sizes.
+                        if update.items.len() > MAX_FRAME_COIN_STATES {
+                            log::warn!(
+                                "peer {} sent a CoinStateUpdate carrying {} coin states, above \
+                                 the {MAX_FRAME_COIN_STATES} a node's own subscription response \
+                                 may hold; ending the session",
+                                source.address,
+                                update.items.len(),
+                            );
+                            break SessionEndReason::OversizedFrame;
+                        }
                         fanout.publish(source, coin_states_frame(update)).await;
                     }
                     _ => {}
@@ -1101,12 +1191,36 @@ impl PeerPool {
         });
     }
 
-    /// Subscribe to this pool's frames, with room for `capacity` unread ones.
+    /// Follow the session currently held at `address`, with room for `capacity` unread frames.
     ///
-    /// Falling further behind than `capacity` ENDS the subscription - see
+    /// `None` when the pool holds no live, announced session at `address`.
+    ///
+    /// **The subscription binds a SESSION, not an address.** The session is resolved from the pool
+    /// entry under the read lock, so a subscriber attaches to exactly the connection whose
+    /// [`Peer`] handle it is about to send `subscribe = true` on — never to a replacement that was
+    /// dialled in the gap. When that session ends the subscription ends with it; following the
+    /// address across a reconnect would silently re-point a consumer at a different peer's claims.
+    ///
+    /// Only that session's frames are queued against `capacity`, so no other held peer can
+    /// terminate this subscription by talking fast (chia-query#34). Falling further behind than
+    /// `capacity` on the followed session's OWN frames still ENDS the subscription — see
     /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
-    pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
-        self.fanout.subscribe(capacity).await
+    pub async fn subscribe_frames(
+        &self,
+        address: SocketAddr,
+        capacity: usize,
+    ) -> Option<FrameSubscription> {
+        // The entries lock is held across the registration so the resolved session cannot be
+        // ejected and replaced between reading it and following it; `eject_peer` takes the write
+        // lock and therefore waits. Nothing takes `entries` while holding the fanout's lock, so
+        // the entries -> fanout order taken here is the only one in the crate.
+        let entries = self.entries.read().await;
+        let entry = entries.iter().find(|e| e.address == address)?;
+        let source = FrameSource {
+            address,
+            session: entry.session,
+        };
+        self.fanout.subscribe(source, capacity).await
     }
 }
 
@@ -1187,15 +1301,32 @@ impl PeerPool {
     /// Production admits through [`admit_and_follow`](Self::admit_and_follow), which also starts
     /// the session; a test that only cares about the pool's membership uses this so it does not
     /// have to invent a receiver it will never feed.
+    ///
+    /// It still ANNOUNCES the session, because production always does and a subscription can only
+    /// be opened on an announced one. A seam that admitted without announcing would put the pool in
+    /// a state a real dial never reaches — an entry nothing can follow — and every test built on it
+    /// would be measuring that state rather than the one that ships.
     pub(crate) async fn admitted(
         &self,
         peer: Peer,
         address: SocketAddr,
         origin: connect::PeerOrigin,
     ) -> bool {
-        let session = self.fanout.allocate_session(address).session;
-        self.admit(peer, address, origin, session, Arc::new(AtomicU32::new(0)))
+        let source = self.fanout.allocate_session(address);
+        if !self
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::new(AtomicU32::new(0)),
+            )
             .await
+        {
+            return false;
+        }
+        self.fanout.open_session(source).await;
+        true
     }
 
     /// Admit a connection that has already announced `peak`.
@@ -1210,15 +1341,21 @@ impl PeerPool {
         origin: connect::PeerOrigin,
         peak: u32,
     ) -> bool {
-        let session = self.fanout.allocate_session(address).session;
-        self.admit(
-            peer,
-            address,
-            origin,
-            session,
-            Arc::new(AtomicU32::new(peak)),
-        )
-        .await
+        let source = self.fanout.allocate_session(address);
+        if !self
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::new(AtomicU32::new(peak)),
+            )
+            .await
+        {
+            return false;
+        }
+        self.fanout.open_session(source).await;
+        true
     }
 
     /// The peak this pool has recorded for `address`, if it holds it.
@@ -1921,43 +2058,66 @@ mod tests {
         (sender, source)
     }
 
+    /// Admit a peer at `addr`, follow the channel the test feeds, and SUBSCRIBE to that session.
+    ///
+    /// The ordering is forced by the source-scoped fan-out: a subscription names the session it
+    /// follows, so it cannot be opened before that session exists (chia-query#34).
+    async fn followed_and_subscribed(
+        pool: &PeerPool,
+        addr: SocketAddr,
+    ) -> (mpsc::Sender<Message>, FrameSource, FrameSubscription) {
+        let (sender, source) = followed_session(pool, addr).await;
+        let subscription = pool
+            .subscribe_frames(addr, 32)
+            .await
+            .expect("a session just admitted is subscribable");
+        (sender, source, subscription)
+    }
+
     /// **A frame carries the address of the peer that sent it, all the way from the socket.**
     ///
-    /// TWO sessions are followed and each is fed a peak of its own. A handler that published
-    /// without attribution - or that attributed every frame to one session - gives both frames the
-    /// same source and fails here; a one-session fixture cannot tell those apart from correct
-    /// behaviour.
+    /// TWO sessions are followed and each is fed a peak of its own, through the real receiver
+    /// handler. A handler that published without attribution - or that attributed every frame to
+    /// one session - gives both frames the same source and fails here; a one-session fixture cannot
+    /// tell those apart from correct behaviour.
     ///
-    /// This is the property whose absence let any held peer's `CoinStateUpdate` reach a subscriber
-    /// as if it came from the peer that subscriber had chosen to follow.
+    /// Each subscription follows ONE session (chia-query#34), so the assertion is also that peer
+    /// 2's frames never reach peer 1's follower: the property whose absence let any held peer's
+    /// `CoinStateUpdate` reach a subscriber as if it came from the peer that subscriber chose.
     #[tokio::test]
     async fn a_frame_reaching_a_subscriber_names_the_session_it_came_from() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (first, first_source) = followed_session(&pool, address(1)).await;
-        let (second, second_source) = followed_session(&pool, address(2)).await;
+        let (first, first_source, mut following_first) =
+            followed_and_subscribed(&pool, address(1)).await;
+        let (second, second_source, mut following_second) =
+            followed_and_subscribed(&pool, address(2)).await;
 
         first.send(peak_message(100)).await.expect("send");
         second.send(peak_message(200)).await.expect("send");
 
-        let seen = drain_at_least(&mut subscription, 4).await;
+        let from_first = drain_at_least(&mut following_first, 2).await;
+        let from_second = drain_at_least(&mut following_second, 2).await;
 
-        let peaks: Vec<(SocketAddr, u32)> = seen
-            .iter()
-            .filter_map(|f| match f.frame {
-                PoolFrame::Peak { height, .. } => Some((f.source.address, height)),
-                _ => None,
-            })
-            .collect();
+        let peaks = |seen: &[SourcedFrame]| -> Vec<(SocketAddr, u32)> {
+            seen.iter()
+                .filter_map(|f| match f.frame {
+                    PoolFrame::Peak { height, .. } => Some((f.source.address, height)),
+                    _ => None,
+                })
+                .collect()
+        };
 
-        assert!(
-            peaks.contains(&(address(1), 100)),
-            "peer 1's peak must arrive under peer 1's address: {peaks:?}"
+        assert_eq!(
+            peaks(&from_first),
+            vec![(address(1), 100)],
+            "peer 1's follower sees peer 1's peak under peer 1's address, and NOTHING of peer \
+             2's: {from_first:?}"
         );
-        assert!(
-            peaks.contains(&(address(2), 200)),
-            "peer 2's peak must arrive under peer 2's address: {peaks:?}"
+        assert_eq!(
+            peaks(&from_second),
+            vec![(address(2), 200)],
+            "and symmetrically for peer 2: {from_second:?}"
         );
         assert_ne!(
             first_source.session, second_source.session,
@@ -1974,8 +2134,7 @@ mod tests {
     #[tokio::test]
     async fn an_undecodable_frame_ends_the_session_rather_than_being_skipped() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         sender.send(peak_message(100)).await.expect("send");
         sender.send(undecodable_peak_message()).await.expect("send");
@@ -2015,8 +2174,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_fed_only_valid_frames_stays_open() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         sender.send(peak_message(100)).await.expect("send");
         sender.send(peak_message(101)).await.expect("send");
@@ -2048,8 +2206,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_transport_ends_the_session_loudly() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         drop(sender);
 
@@ -2074,9 +2231,9 @@ mod tests {
     #[tokio::test]
     async fn a_peer_whose_session_ended_is_ejected_without_waiting_for_a_failure() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        let (dying, dying_source, mut subscription) =
+            followed_and_subscribed(&pool, address(1)).await;
         let (_surviving, _) = followed_session(&pool, address(2)).await;
 
         drop(dying);
@@ -2120,9 +2277,9 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_at_the_same_address_survives_its_predecessors_death() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        let (dying, dying_source, mut subscription) =
+            followed_and_subscribed(&pool, address(1)).await;
         drop(dying);
 
         let seen = drain_at_least(&mut subscription, 2).await;
@@ -2148,6 +2305,243 @@ mod tests {
             pool.held_addresses_for_tests().await,
             vec![address(1)],
             "the replacement session must survive its predecessor's death"
+        );
+    }
+
+    /// Two sockets on ONE host, which is what `admit`'s per-`SocketAddr` rule permits.
+    fn two_ports_on(last_octet: u8) -> (SocketAddr, SocketAddr) {
+        let host = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last_octet));
+        (SocketAddr::new(host, 8444), SocketAddr::new(host, 8445))
+    }
+
+    /// **One machine on two ports is ONE independent voice, not two (chia-query#27).**
+    ///
+    /// `admit` refuses a duplicate `SocketAddr`, which guarantees two entries are never one
+    /// CONNECTION — and says nothing about them being one MACHINE. Independence is the entire
+    /// load-bearing property of the corroboration floor: an absence is believed when two peers
+    /// AGREE, so a corroborator on the same host as the first is one peer agreeing with itself.
+    ///
+    /// The pool still HOLDS both, and that is deliberate. Two connections to one host are two
+    /// usable read sources; what they are not is two opinions. Asserting the peer count is
+    /// unchanged is what stops this fix from quietly becoming an admission rule.
+    #[tokio::test]
+    async fn one_host_on_two_ports_is_one_independent_voice() {
+        let pool = empty_pool(4);
+        let (first, second) = two_ports_on(7);
+
+        assert!(
+            pool.admit_for_tests(loopback_peer().await, first, PeerOrigin::Discovered)
+                .await
+        );
+        assert!(
+            pool.admit_for_tests(loopback_peer().await, second, PeerOrigin::Discovered)
+                .await,
+            "admission is per socket and stays that way: the second port is still a usable source"
+        );
+
+        assert_eq!(
+            pool.peer_count().await,
+            2,
+            "both connections are held — this is about counting VOICES, not about admission"
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            1,
+            "two ports on one machine are one independent opinion"
+        );
+        assert!(
+            pool.select_corroborating_peers(first).await.is_empty(),
+            "a peer on the SAME host cannot corroborate the answering one"
+        );
+        assert!(
+            matches!(
+                pool.corroboration_readiness(first).await,
+                CorroborationReadiness::Insufficient { .. }
+            ),
+            "and the readiness gate must refuse rather than arm on a voice counted twice"
+        );
+    }
+
+    /// The control: two DIFFERENT hosts are two voices.
+    ///
+    /// Without it, an independence count that answered 1 unconditionally — or a corroborator
+    /// selector that returned nothing — would satisfy the test above while disabling corroboration
+    /// entirely, which is the starving direction.
+    #[tokio::test]
+    async fn two_different_hosts_are_two_independent_voices() {
+        let pool = empty_pool(4);
+
+        for octet in [1u8, 2, 3] {
+            assert!(
+                pool.admit_for_tests(
+                    loopback_peer().await,
+                    address(octet),
+                    PeerOrigin::Discovered
+                )
+                .await
+            );
+        }
+
+        assert_eq!(pool.independent_peer_count().await, 3);
+        assert_eq!(
+            pool.select_corroborating_peers(address(1)).await.len(),
+            2,
+            "the other two hosts corroborate the one that answered"
+        );
+        assert!(matches!(
+            pool.corroboration_readiness(address(1)).await,
+            CorroborationReadiness::Armed { corroborators: 2 }
+        ));
+    }
+
+    /// **The selected SET and the counted number are the same thing.**
+    ///
+    /// Two ports on one host, beside one genuinely separate host. A selector that deduped while the
+    /// readiness count did not — or the reverse — would let a round ask two entries that are one
+    /// machine and tally two agreements, clearing a floor of two with a single voice answering
+    /// twice. That is the failure this pins, and a fixture with only distinct hosts cannot see it.
+    #[tokio::test]
+    async fn a_host_answering_twice_cannot_clear_the_floor_on_its_own() {
+        let pool = empty_pool(4);
+        let asked = address(1);
+        let (twin_a, twin_b) = two_ports_on(9);
+
+        for addr in [asked, twin_a, twin_b] {
+            assert!(
+                pool.admit_for_tests(loopback_peer().await, addr, PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        let selected = pool.select_corroborating_peers(asked).await;
+        assert_eq!(
+            selected.len(),
+            1,
+            "the two ports on one host must be offered as ONE corroborator: {selected:?}"
+        );
+        assert!(matches!(
+            pool.corroboration_readiness(asked).await,
+            CorroborationReadiness::Insufficient {
+                corroborators: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            pool.corroboration_readiness(asked).await,
+            match pool.select_corroborating_peers(asked).await.len() {
+                n if n >= CORROBORATION_FLOOR => CorroborationReadiness::Armed { corroborators: n },
+                n => CorroborationReadiness::Insufficient {
+                    corroborators: n,
+                    required: CORROBORATION_FLOOR,
+                },
+            },
+            "corroboration_readiness and select_corroborating_peers must still agree exactly"
+        );
+    }
+
+    /// A `CoinStateUpdate` message carrying `items` coin states, encoded as it arrives on the wire.
+    ///
+    /// Every state is the same coin because the CAP is about the LENGTH: what a hostile peer sizes
+    /// is how many entries it sends, and building distinct coins would spend the fixture's cost on
+    /// a property no assertion here reads.
+    fn coin_state_update_message(items: usize) -> Message {
+        let state = CoinState {
+            coin: Coin::new(Bytes32::new([7; 32]), Bytes32::new([8; 32]), 9),
+            created_height: Some(1),
+            spent_height: None,
+        };
+        let update = CoinStateUpdate::new(200, 199, Bytes32::new([0xBB; 32]), vec![state; items]);
+        Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: update
+                .to_bytes()
+                .expect("a CoinStateUpdate is streamable")
+                .into(),
+        }
+    }
+
+    /// **A frame carrying MORE than the cap ends the session, and its items never reach a
+    /// subscriber.**
+    ///
+    /// The end reason is asserted by name: folding this into `UndecodableFrame` would report "the
+    /// bytes could not be read" about a frame that decoded perfectly, and an operator deciding
+    /// whether to redial the address is reading exactly that distinction (chia-query#33).
+    ///
+    /// The oversized frame must also NOT be delivered. Ending the session AFTER publishing it would
+    /// leave the cost this cap exists to bound already paid.
+    #[tokio::test]
+    async fn a_frame_above_the_item_cap_ends_the_session_and_is_never_delivered() {
+        let pool = empty_pool(4);
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
+
+        sender
+            .send(coin_state_update_message(MAX_FRAME_COIN_STATES + 1))
+            .await
+            .expect("send");
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        assert!(
+            frames.contains(&&PoolFrame::SessionEnded {
+                reason: SessionEndReason::OversizedFrame
+            }),
+            "a frame above the cap must end the session, named as oversized rather than \
+             undecodable: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::CoinStates { .. })),
+            "the oversized frame must never be delivered: {frames:?}"
+        );
+    }
+
+    /// **The control, and the half that pins the bound from below.**
+    ///
+    /// A frame EXACTLY at the cap is honest and must be delivered in full. Without this, a `>=`
+    /// where the code has `>` — or any tighter number — passes the test above while terminating
+    /// sessions an honest peer opens. That is the starving direction, and it is the one this
+    /// bound's derivation deliberately errs away from.
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_item_cap_is_delivered_in_full() {
+        let pool = empty_pool(4);
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
+
+        sender
+            .send(coin_state_update_message(MAX_FRAME_COIN_STATES))
+            .await
+            .expect("send");
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        let delivered = frames
+            .iter()
+            .find_map(|f| match f {
+                PoolFrame::CoinStates { items, .. } => Some(items.len()),
+                _ => None,
+            })
+            .expect("a frame at the cap must be delivered");
+        assert_eq!(
+            delivered, MAX_FRAME_COIN_STATES,
+            "and delivered in full, not truncated to the bound"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::SessionEnded { .. })),
+            "a peer sending exactly what a node may send in one response is not misbehaving: \
+             {frames:?}"
         );
     }
 
@@ -2542,12 +2936,12 @@ mod tests {
     #[tokio::test]
     async fn a_peers_recorded_peak_comes_from_the_peak_it_announces() {
         let pool = empty_pool(2);
-        let mut subscription = pool.subscribe_frames(8).await;
         let addr = address(1);
-        let (session, _source) = followed_session(&pool, addr).await;
+        let (session, _source, mut subscription) = followed_and_subscribed(&pool, addr).await;
 
         session.send(peak_message(4242)).await.expect("send a peak");
-        drain_at_least(&mut subscription, 1).await;
+        // Two frames: this subscription's opening `Reset`, then the announced peak.
+        drain_at_least(&mut subscription, 2).await;
 
         // The handler writes the peak and then publishes, both from its own detached task, so the
         // write is ordered before the frame this test just saw. The poll is for the scheduler, not

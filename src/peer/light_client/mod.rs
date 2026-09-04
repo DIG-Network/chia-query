@@ -18,10 +18,15 @@
 //! # The subscription follows ONE session, and says which
 //!
 //! A subscription is server-side state on one connection, so this client PINS a pooled session as
-//! its anchor (see [`fetcher`]) and its drive-loop accepts frames from that source ALONE. The pool
-//! fans every held peer's frames into one subscription, and a `CoinStateUpdate` is an unsolicited
-//! push carrying no request id: accepting one from an unfollowed peer would let any held peer
-//! inject coin states this client never asked for, indistinguishable from the ones it did.
+//! its anchor (see [`fetcher`]) and its drive-loop accepts frames from that source ALONE. A
+//! `CoinStateUpdate` is an unsolicited push carrying no request id, so accepting one from an
+//! unfollowed peer would let any held peer inject coin states this client never asked for,
+//! indistinguishable from the ones it did.
+//!
+//! The pool enforces the same boundary one layer down: a frame subscription is opened ON a session
+//! and receives only that session's frames (chia-query#34). Before that, every held peer's frames
+//! landed in this client's queue — where an unfollowed peer talking fast could fill it and END the
+//! subscription this client was using to follow the peer it had chosen.
 //!
 //! # NC-12 is untouched
 //!
@@ -37,14 +42,13 @@ pub mod fetcher;
 pub mod provider;
 
 use std::borrow::Cow;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chia_protocol::{Bytes32, CoinStateFilters, SpendBundle};
 use dig_chainsource_interface::{ProviderId, ProviderInfo, ProviderKind};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::peer::connect::PeerOrigin;
@@ -142,11 +146,14 @@ impl ChiaLightClient {
     /// of them the first time it subscribes.
     pub async fn new(backend: Arc<PeerBackend>, request_timeout: Duration) -> Self {
         let cache = Arc::new(RwLock::new(CoinStateCache::new()));
-        let fetcher = PooledFetcher::new(backend.clone(), request_timeout);
+        // A frame subscription names ONE session (chia-query#34) and this client chooses its
+        // session lazily, on the first subscribing read. So the drive-loop is started with nothing
+        // to follow and is handed a subscription by each anchoring.
+        let (subscriptions_tx, subscriptions_rx) = mpsc::unbounded_channel();
+        let fetcher = PooledFetcher::new(backend.clone(), request_timeout, subscriptions_tx);
         let rearm_needed = Arc::new(AtomicBool::new(false));
-        let subscription = backend.subscribe_frames(FRAME_BUFFER).await;
         let drive = spawn_drive_loop(
-            subscription,
+            subscriptions_rx,
             cache.clone(),
             fetcher.clone(),
             rearm_needed.clone(),
@@ -315,44 +322,63 @@ fn all_coin_states() -> CoinStateFilters {
     }
 }
 
-/// Spawns the background task that keeps `cache` current from the pool's frame fan-out.
+/// Spawns the background task that keeps `cache` current from the anchor session's frames.
 ///
-/// Only frames from the ANCHOR session are applied. Every other held peer's frames are dropped:
-/// they answer questions this client never asked, and a `CoinStateUpdate` carries no request id to
-/// tell the two apart.
+/// It follows ONE session at a time — the anchor — and is handed a fresh subscription over
+/// `subscriptions` each time one is pinned. The pool no longer delivers other peers' frames here at
+/// all (chia-query#34): a subscription is opened ON a session and receives only that session's
+/// frames, so a peer this client never chose can neither be applied to the cache nor fill the queue
+/// and end the subscription.
+///
+/// [`follows`] remains as the second half of that guarantee, and it is not redundant. A subscription
+/// outlives the anchoring that created it: an anchor released by a FAILED READ leaves its
+/// subscription live until the connection actually closes, and the frames still arriving on it
+/// answer questions this client is no longer relying on that peer for.
 fn spawn_drive_loop(
-    mut subscription: FrameSubscription,
+    mut subscriptions: mpsc::UnboundedReceiver<FrameSubscription>,
     cache: Arc<RwLock<CoinStateCache>>,
     fetcher: PooledFetcher,
     rearm_needed: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(sourced) = subscription.recv().await {
-            if !follows(fetcher.anchor_address().await, sourced.source) {
-                continue;
+        while let Some(mut subscription) = subscriptions.recv().await {
+            let followed = subscription.source();
+            while let Some(sourced) = subscription.recv().await {
+                if !follows(fetcher.anchor_source().await, sourced.source) {
+                    continue;
+                }
+                if let AfterFrame::Resubscribe = apply_frame(&cache, sourced).await {
+                    // Order matters: unpin FIRST, so a caller woken by the flag re-anchors on a
+                    // live session rather than re-arming against the one that just died.
+                    fetcher.release_anchor(followed).await;
+                    rearm_needed.store(true, Ordering::Release);
+                }
             }
-            let address = sourced.source.address;
-            if let AfterFrame::Resubscribe = apply_frame(&cache, sourced).await {
-                // Order matters: unpin FIRST, so a caller woken by the flag re-anchors on a live
-                // session rather than re-arming against the one that just died.
-                fetcher.release_anchor(address).await;
-                rearm_needed.store(true, Ordering::Release);
-            }
+            // This subscription ended — the session stopped, the pool was dropped, or this client
+            // fell behind the peer it CHOSE and was terminated rather than silently skipped. Either
+            // way the cache can no longer be trusted to be current, and saying so is the point (see
+            // `frames::FrameSubscription`).
+            //
+            // Release is guarded on the followed session, so a subscription ending after the client
+            // has already re-anchored elsewhere does not unpin the healthy anchor; the flag is set
+            // regardless, because a stream that stopped is exactly what the caller polls for.
+            fetcher.release_anchor(followed).await;
+            rearm_needed.store(true, Ordering::Release);
         }
-        // The subscription ended — the pool was dropped, or this client fell behind and was
-        // terminated rather than silently skipped. Either way the cache can no longer be trusted to
-        // be current, and saying so is the point (see `frames::FrameSubscription`).
-        rearm_needed.store(true, Ordering::Release);
     })
 }
 
-/// Whether a frame from `source` belongs to the session this client is following.
+/// Whether a frame from `source` belongs to the session this client is currently anchored to.
 ///
-/// `None` — nothing subscribed yet — follows NOTHING. Before the first subscription there is no
-/// push this client could have asked for, so treating an unanchored client as following everything
-/// would admit exactly the unsolicited coin states the anchor exists to exclude.
-fn follows(anchor: Option<SocketAddr>, source: FrameSource) -> bool {
-    anchor.is_some_and(|address| address == source.address)
+/// `None` — nothing pinned — follows NOTHING. Before the first subscription there is no push this
+/// client could have asked for, so treating an unanchored client as following everything would admit
+/// exactly the unsolicited coin states the anchor exists to exclude.
+///
+/// The comparison is on the whole [`FrameSource`], address AND session. An address-only test cannot
+/// separate a session from a replacement dialled to the same address after a reconnect, which is the
+/// common case rather than an exotic one.
+fn follows(anchor: Option<FrameSource>, source: FrameSource) -> bool {
+    anchor.is_some_and(|anchored| anchored == source)
 }
 
 /// What the drive-loop must do about the SESSION after a frame has been applied to the cache.
@@ -370,10 +396,15 @@ enum AfterFrame {
 /// Applies one attributed frame from the followed session to `cache`.
 async fn apply_frame(cache: &RwLock<CoinStateCache>, sourced: SourcedFrame) -> AfterFrame {
     match sourced.frame {
-        // A new session at the followed address is a DIFFERENT connection, whose subscription set
-        // is empty. Anything derived from its predecessor is stale, so the client re-arms rather
-        // than reading the replacement's silence as an unchanging chain.
-        PoolFrame::Reset => AfterFrame::Resubscribe,
+        // The `Reset` that OPENS this subscription, and the only one it can now see: a subscription
+        // names one session, so a new connection at the followed address is a different source that
+        // this subscription never receives (chia-query#34). It arrives immediately after the anchor
+        // was pinned and the re-arm it would once have signalled is already under way, so treating
+        // it as a reason to re-arm would unpin a healthy anchor on every single anchoring.
+        //
+        // The fact it used to carry has not been lost, it has moved: a replaced session announces
+        // itself to this client as `SessionEnded` on the subscription that is ending, below.
+        PoolFrame::Reset => AfterFrame::Continue,
         PoolFrame::Peak {
             height,
             header_hash,
