@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.22.0] - 2026-09-04
+
+### Features
+- **peer:** Grade population reads by height-normalised set equality (#54)
+
 ## [0.21.0] - 2026-09-04
 
 ### Bug Fixes
