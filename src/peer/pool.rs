@@ -586,6 +586,32 @@ impl PeerPool {
         Some((entry.peer.clone(), entry.address))
     }
 
+    /// Round-robin select a peer OTHER than the one at `excluded`.
+    ///
+    /// `None` when the pool holds no alternative, which is the honest answer that there is nobody
+    /// else to ask.
+    ///
+    /// **Deliberately NOT
+    /// [`select_corroborating_peers`](Self::select_corroborating_peers), and the difference is not
+    /// cosmetic.** That selector additionally excludes `Priority` peers because a co-resident node
+    /// cannot be an independent VOICE about a fact. This selector exists for a WRITE — a second
+    /// attempt to get a bundle admitted somewhere (chia-query#50) — where independence is not the
+    /// property being sought and the operator's own node is the single best destination there is.
+    /// Reusing the corroboration selector here would import a corroboration semantic into a
+    /// decision that is not corroboration, and would leave a solo node running its own full node
+    /// with no second attempt at all.
+    pub async fn select_peer_excluding(&self, excluded: SocketAddr) -> Option<(Peer, SocketAddr)> {
+        let entries = self.entries.read().await;
+        let candidates: Vec<&PeerEntry> =
+            entries.iter().filter(|e| e.address != excluded).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let entry = candidates[idx];
+        Some((entry.peer.clone(), entry.address))
+    }
+
     /// How the pool reached the peer currently held at `address`, or `None` if it holds none.
     ///
     /// Exists so a consumer that PINS one session can describe it honestly. A

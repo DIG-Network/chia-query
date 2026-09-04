@@ -130,6 +130,19 @@ impl PeerBackend {
         }
     }
 
+    /// As [`for_tests_with_capacity`](Self::for_tests_with_capacity), with a request timeout long
+    /// enough for a scripted peer to answer over a real loopback websocket.
+    ///
+    /// The 1ms default is deliberate for a backend nothing answers; a test whose peer DOES answer
+    /// needs a budget for the round trip, or it measures the timeout rather than the answer.
+    pub(crate) fn for_tests_with_timeout(max_peers: usize, request_timeout: Duration) -> Self {
+        Self {
+            pool: pool::PeerPool::for_tests(max_peers),
+            network: NetworkType::Mainnet,
+            request_timeout,
+        }
+    }
+
     /// The pool underneath, so a test can admit peers into the backend it is exercising.
     pub(crate) fn pool_for_tests(&self) -> &pool::PeerPool {
         &self.pool
@@ -859,15 +872,66 @@ impl PeerBackend {
         res
     }
 
-    /// Push a signed bundle to the mempool.
+    /// Push a signed bundle to the mempool, on ONE peer.
     ///
-    /// **Single-peer by design, and stated here so the silence is not read as an oversight
-    /// (chia-query#35).** This is a WRITE, not a read: there is no existing fact for a second peer
-    /// to agree about, and the only thing corroboration could grade is whether other peers also
-    /// accepted the bundle — which is a question about propagation, answered by reading the coin
-    /// back afterwards through a read that IS graded.
+    /// **Each ATTEMPT is single-peer and nothing here is corroborated (chia-query#35).** This is a
+    /// WRITE, not a read: there is no existing fact for a second peer to agree about, and the only
+    /// thing corroboration could grade is whether other peers also accepted the bundle — which is a
+    /// question about propagation, answered by reading the coin back afterwards through a read that
+    /// IS graded.
+    ///
+    /// [`QueryRouter::push_tx`](crate::QueryRouter::push_tx) may make a SECOND attempt on one other
+    /// peer when the first REFUSES for a reason that depends on which node was asked
+    /// (chia-query#50). That is a second chance at admission, not a vote: neither attempt grades the
+    /// other, and a push is never transmitted to more than two peers.
     pub async fn try_push_tx(&self, bundle: &SpendBundle) -> Result<TxStatus, ChiaQueryError> {
+        Ok(self.try_push_tx_attributed(bundle).await?.0)
+    }
+
+    /// [`try_push_tx`](Self::try_push_tx), reporting WHICH peer answered.
+    ///
+    /// The router needs the address to exclude it from a retry, and it cannot be recovered
+    /// afterwards: `pick` round-robins, so asking again would land on an arbitrary peer that may be
+    /// the same one. `TxStatus` deliberately does not carry it — `dig-wallet` builds that struct as
+    /// a literal, so a new field breaks its build for no consumer benefit.
+    pub(crate) async fn try_push_tx_attributed(
+        &self,
+        bundle: &SpendBundle,
+    ) -> Result<(TxStatus, SocketAddr), ChiaQueryError> {
         let (peer, addr) = self.pick().await?;
+        match self.do_push_tx(&peer, bundle).await {
+            Ok(status) => Ok((status, addr)),
+            Err(e) => {
+                self.pool.eject_peer(addr).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Push a signed bundle to one peer that is NOT the one at `excluded`.
+    ///
+    /// `Err(PeerConnection)` when the pool holds no other peer, which is a real and ordinary state
+    /// — a pool of one — and is why the router treats it as "no second opinion available" rather
+    /// than as a failure of the push.
+    ///
+    /// **The refuser is not ejected**, here or by the caller. Ejection is for a FAILED request
+    /// (rule 3); a refusal is a COMPLETED request with an answer. Ejecting on refusal would let
+    /// anyone holding a badly-fee'd bundle churn the pool's composition at will — a limiter keyed
+    /// on caller input, which is a denial primitive.
+    pub async fn try_push_tx_excluding(
+        &self,
+        bundle: &SpendBundle,
+        excluded: SocketAddr,
+    ) -> Result<TxStatus, ChiaQueryError> {
+        let (peer, addr) = self
+            .pool
+            .select_peer_excluding(excluded)
+            .await
+            .ok_or_else(|| {
+                ChiaQueryError::PeerConnection(
+                    "no peer other than the one that refused is held".into(),
+                )
+            })?;
         let res = self.do_push_tx(&peer, bundle).await;
         if res.is_err() {
             self.pool.eject_peer(addr).await;

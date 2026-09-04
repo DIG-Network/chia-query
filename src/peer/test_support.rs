@@ -59,7 +59,68 @@ pub(crate) async fn loopback_peer() -> Peer {
 /// accidentally exercises a different read fails on its own timeout rather than on a fabricated
 /// reply it never meant to script.
 pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
-    use chia_protocol::{Message, ProtocolMessageTypes};
+    use chia_protocol::ProtocolMessageTypes;
+    use chia_traits::Streamable;
+
+    let body = response
+        .to_bytes()
+        .expect("a RespondPuzzleState is streamable");
+    scripted_peer(move |request| {
+        (request.msg_type == ProtocolMessageTypes::RequestPuzzleState).then(|| {
+            (
+                ProtocolMessageTypes::RespondPuzzleState,
+                body.clone(),
+            )
+        })
+    })
+    .await
+    .0
+}
+
+/// A real [`Peer`] that ACKS every `send_transaction` with `status` and `error`, counting them.
+///
+/// The counter is the assertion that matters for chia-query#50: the bound is "never more than two
+/// transmissions", and a bound nothing counts is a comment. Reading a peer's answer proves what it
+/// SAID; only the count proves how many times it was ASKED.
+pub(crate) async fn transaction_peer(
+    status: u8,
+    error: Option<String>,
+) -> (Peer, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use chia_protocol::{Bytes32, ProtocolMessageTypes, TransactionAck};
+    use chia_traits::Streamable;
+
+    let body = TransactionAck::new(Bytes32::new([0x5A; 32]), status, error)
+        .to_bytes()
+        .expect("a TransactionAck is streamable");
+    scripted_peer(move |request| {
+        (request.msg_type == ProtocolMessageTypes::SendTransaction)
+            .then(|| (ProtocolMessageTypes::TransactionAck, body.clone()))
+    })
+    .await
+}
+
+/// A real [`Peer`] whose server side answers with whatever `reply` returns for each request.
+///
+/// [`loopback_peer`] holds a socket open and never replies, which is all a membership test needs
+/// and is useless to a test of what this crate does with a peer's ANSWER. So this speaks just
+/// enough of the wallet protocol to be one: it decodes each inbound `Message` and replies under the
+/// SAME request id, which is how the SDK's `Peer` matches a response to its call.
+///
+/// `reply` returning `None` leaves the request unanswered, so a test that accidentally exercises a
+/// read it did not script fails on its own timeout rather than on a fabricated reply. The returned
+/// counter counts every request the script ANSWERED.
+pub(crate) async fn scripted_peer<F>(
+    reply: F,
+) -> (Peer, std::sync::Arc<std::sync::atomic::AtomicUsize>)
+where
+    F: Fn(&chia_protocol::Message) -> Option<(chia_protocol::ProtocolMessageTypes, Vec<u8>)>
+        + Send
+        + 'static,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use chia_protocol::Message;
     use chia_traits::Streamable;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -69,6 +130,8 @@ pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
         .await
         .expect("bind a loopback listener");
     let addr = listener.local_addr().expect("read the listener address");
+    let answered = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&answered);
 
     tokio::spawn(async move {
         let Ok((stream, _)) = listener.accept().await else {
@@ -84,20 +147,18 @@ pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
             let Ok(request) = Message::from_bytes(&bytes) else {
                 continue;
             };
-            if request.msg_type != ProtocolMessageTypes::RequestPuzzleState {
+            let Some((msg_type, data)) = reply(&request) else {
                 continue;
-            }
-            let reply = Message {
-                msg_type: ProtocolMessageTypes::RespondPuzzleState,
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let response = Message {
+                msg_type,
                 id: request.id,
-                data: response
-                    .to_bytes()
-                    .expect("a RespondPuzzleState is streamable")
-                    .into(),
+                data: data.into(),
             };
             if ws
                 .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    reply.to_bytes().expect("a Message is streamable").into(),
+                    response.to_bytes().expect("a Message is streamable").into(),
                 ))
                 .await
                 .is_err()
@@ -115,7 +176,7 @@ pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
 
     let (peer, _receiver) =
         Peer::from_websocket(ws, Default::default()).expect("build a peer from the websocket");
-    peer
+    (peer, answered)
 }
 
 /// A documentation-range address (RFC 5737), distinct per `last_octet`.
