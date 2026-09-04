@@ -2233,6 +2233,112 @@ mod tests {
         );
     }
 
+    /// A `CoinStateUpdate` message carrying `items` coin states, encoded as it arrives on the wire.
+    ///
+    /// Every state is the same coin because the CAP is about the LENGTH: what a hostile peer sizes
+    /// is how many entries it sends, and building distinct coins would spend the fixture's cost on
+    /// a property no assertion here reads.
+    fn coin_state_update_message(items: usize) -> Message {
+        let state = CoinState {
+            coin: Coin::new(Bytes32::new([7; 32]), Bytes32::new([8; 32]), 9),
+            created_height: Some(1),
+            spent_height: None,
+        };
+        let update = CoinStateUpdate::new(200, 199, Bytes32::new([0xBB; 32]), vec![state; items]);
+        Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: update
+                .to_bytes()
+                .expect("a CoinStateUpdate is streamable")
+                .into(),
+        }
+    }
+
+    /// **A frame carrying MORE than the cap ends the session, and its items never reach a
+    /// subscriber.**
+    ///
+    /// The end reason is asserted by name: folding this into `UndecodableFrame` would report "the
+    /// bytes could not be read" about a frame that decoded perfectly, and an operator deciding
+    /// whether to redial the address is reading exactly that distinction (chia-query#33).
+    ///
+    /// The oversized frame must also NOT be delivered. Ending the session AFTER publishing it would
+    /// leave the cost this cap exists to bound already paid.
+    #[tokio::test]
+    async fn a_frame_above_the_item_cap_ends_the_session_and_is_never_delivered() {
+        let pool = empty_pool(4);
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
+
+        sender
+            .send(coin_state_update_message(MAX_FRAME_COIN_STATES + 1))
+            .await
+            .expect("send");
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        assert!(
+            frames.contains(&&PoolFrame::SessionEnded {
+                reason: SessionEndReason::OversizedFrame
+            }),
+            "a frame above the cap must end the session, named as oversized rather than \
+             undecodable: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::CoinStates { .. })),
+            "the oversized frame must never be delivered: {frames:?}"
+        );
+    }
+
+    /// **The control, and the half that pins the bound from below.**
+    ///
+    /// A frame EXACTLY at the cap is honest and must be delivered in full. Without this, a `>=`
+    /// where the code has `>` — or any tighter number — passes the test above while terminating
+    /// sessions an honest peer opens. That is the starving direction, and it is the one this
+    /// bound's derivation deliberately errs away from.
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_item_cap_is_delivered_in_full() {
+        let pool = empty_pool(4);
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
+
+        sender
+            .send(coin_state_update_message(MAX_FRAME_COIN_STATES))
+            .await
+            .expect("send");
+
+        let seen = drain_at_least(&mut subscription, 2).await;
+        let frames: Vec<&PoolFrame> = seen
+            .iter()
+            .filter(|f| f.source == source)
+            .map(|f| &f.frame)
+            .collect();
+
+        let delivered = frames
+            .iter()
+            .find_map(|f| match f {
+                PoolFrame::CoinStates { items, .. } => Some(items.len()),
+                _ => None,
+            })
+            .expect("a frame at the cap must be delivered");
+        assert_eq!(
+            delivered, MAX_FRAME_COIN_STATES,
+            "and delivered in full, not truncated to the bound"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, PoolFrame::SessionEnded { .. })),
+            "a peer sending exactly what a node may send in one response is not misbehaving: \
+             {frames:?}"
+        );
+    }
+
     /// **Every field of a `CoinStateUpdate` reaches its frame carrying its OWN value.**
     ///
     /// The destructuring in [`coin_states_frame`] makes a DROPPED field a compile error, but a
