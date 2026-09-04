@@ -36,8 +36,8 @@ pub use light_client::{ChiaLightClient, LightClientProvider, SubmitOutcome};
 use plurality::CORROBORATION_FLOOR;
 pub use pool::PeerRequirement;
 use pool::{CorroborationReadiness, PeerPool};
-pub use set_agreement::{CorroboratedSet, HeightedSet, SetAnswer, SetProjection};
 use set_agreement::{common_height, contradiction, fingerprint, normalise_at, project, SetMember};
+pub use set_agreement::{CorroboratedSet, HeightedSet, SetAnswer, SetProjection};
 
 // ---------------------------------------------------------------------------
 // OptAnswer
@@ -682,7 +682,10 @@ impl PeerBackend {
         include_spent: bool,
     ) -> Result<SetAnswer<CoinRecord>, ChiaQueryError> {
         self.read_set_corroborated(
-            |peer| async move { self.do_puzzle_hash_query(&peer, &[puzzle_hash], false).await },
+            |peer| async move {
+                self.do_puzzle_hash_query(&peer, &[puzzle_hash], false)
+                    .await
+            },
             SetProjection {
                 start_height,
                 end_height,
@@ -1064,9 +1067,8 @@ impl PeerBackend {
             .do_get_puzzle_and_solution_raw(&peer, coin_id, spent_height)
             .await
             .and_then(|spend| {
-                spend.ok_or_else(|| {
-                    ChiaQueryError::PeerRejection("puzzle solution rejected".into())
-                })
+                spend
+                    .ok_or_else(|| ChiaQueryError::PeerRejection("puzzle solution rejected".into()))
             })
             .map(|spend| CoinSpend {
                 coin: Coin::from_protocol(&cs.coin),

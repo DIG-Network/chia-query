@@ -114,13 +114,9 @@ fn coinset_is_normalised_to_the_peer_answers_height_before_comparison() {
         coin(3, 130, None),
     ];
 
-    let settled = settle_uncorroborated_set(
-        peer_at_100,
-        100,
-        unfiltered(),
-        Some(Ok(coinset_at_the_tip)),
-    )
-    .expect("a fresher second source is not a disagreement");
+    let settled =
+        settle_uncorroborated_set(peer_at_100, 100, unfiltered(), Some(Ok(coinset_at_the_tip)))
+            .expect("a fresher second source is not a disagreement");
 
     assert_eq!(settled.items.len(), 2, "the coin created at 130 is not yet");
     assert_eq!(settled.as_of_height, 100);

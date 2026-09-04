@@ -50,6 +50,7 @@ mod native_client {
 
     use serde_json::Value;
 
+    use crate::peer::CorroboratedSet;
     use crate::types::*;
     use crate::{coinset, peer, router};
 
@@ -503,6 +504,122 @@ mod native_client {
             self.router
                 .get_coin_records_by_puzzle_hashes(
                     puzzle_hashes,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// Every coin at `puzzle_hash`, GRADED, with the height the answer is true about.
+        ///
+        /// **This is the read a wallet balance and a collateral census are taken through.** Prefer
+        /// it over [`get_coin_records_by_puzzle_hash`](Self::get_coin_records_by_puzzle_hash)
+        /// wherever the answer is recorded rather than merely displayed: the set is a TRUE
+        /// statement about the chain at `as_of_height` and a FALSE one about the tip, and the
+        /// `Vec`-returning form drops that height.
+        pub async fn get_coin_records_by_puzzle_hash_graded(
+            &self,
+            puzzle_hash: &str,
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_puzzle_hash_graded(
+                    puzzle_hash,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// Every coin at any of `puzzle_hashes`, GRADED, with the height the answer is true about.
+        pub async fn get_coin_records_by_puzzle_hashes_graded(
+            &self,
+            puzzle_hashes: &[String],
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_puzzle_hashes_graded(
+                    puzzle_hashes,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// Every coin hinted at `hint`, GRADED, with the height the answer is true about.
+        pub async fn get_coin_records_by_hint_graded(
+            &self,
+            hint: &str,
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_hint_graded(
+                    hint,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// Every coin hinted at any of `hints`, GRADED, with the height the answer is true about.
+        pub async fn get_coin_records_by_hints_graded(
+            &self,
+            hints: &[String],
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_hints_graded(
+                    hints,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// The coin records for `names`, GRADED, with the height the answer is true about.
+        pub async fn get_coin_records_by_names_graded(
+            &self,
+            names: &[String],
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_names_graded(
+                    names,
+                    start_height,
+                    end_height,
+                    include_spent_coins,
+                )
+                .await
+        }
+
+        /// The children of every id in `parent_ids`, GRADED, with the height the answer is true
+        /// about — the LOWEST of the per-parent rounds, so the whole set is dated by the oldest
+        /// thing in it.
+        pub async fn get_coin_records_by_parent_ids_graded(
+            &self,
+            parent_ids: &[String],
+            start_height: Option<u32>,
+            end_height: Option<u32>,
+            include_spent_coins: bool,
+        ) -> Result<CorroboratedSet<CoinRecord>, ChiaQueryError> {
+            self.router
+                .get_coin_records_by_parent_ids_graded(
+                    parent_ids,
                     start_height,
                     end_height,
                     include_spent_coins,

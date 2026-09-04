@@ -375,11 +375,16 @@ impl QueryRouter {
         };
 
         if let Some(answer) = first {
-            return self.settle_set_answer(answer, projection, coinset_raw).await;
+            return self
+                .settle_set_answer(answer, projection, coinset_raw)
+                .await;
         }
 
         match peer_retry.await {
-            Ok(answer) => self.settle_set_answer(answer, projection, coinset_raw).await,
+            Ok(answer) => {
+                self.settle_set_answer(answer, projection, coinset_raw)
+                    .await
+            }
             Err(peer_err) => {
                 if !self.coinset_fallback_enabled {
                     return Err(peer_err);
@@ -421,9 +426,9 @@ impl QueryRouter {
             )));
         };
         let Some(as_of_height) = common_height(&[peak], projection.end_height) else {
-            return Err(all_sources_failed(ChiaQueryError::CoinsetApiError(format!(
-                "no settled common height exists below the coinset peak {peak}"
-            ))));
+            return Err(all_sources_failed(ChiaQueryError::CoinsetApiError(
+                format!("no settled common height exists below the coinset peak {peak}"),
+            )));
         };
 
         let raw = match coinset_raw.await {
@@ -722,11 +727,20 @@ impl QueryRouter {
             include_spent: include_spent_coins,
         };
         self.peer_then_coinset_set(
-            self.peer
-                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
-            self.peer
-                .try_get_coin_records_by_hint(hint, start_height, end_height, include_spent_coins),
-            self.coinset.get_coin_records_by_hint(hint, None, None, true),
+            self.peer.try_get_coin_records_by_hint(
+                hint,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_hint(
+                hint,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset
+                .get_coin_records_by_hint(hint, None, None, true),
             projection,
         )
         .await
@@ -765,11 +779,20 @@ impl QueryRouter {
             include_spent: include_spent_coins,
         };
         self.peer_then_coinset_set(
-            self.peer
-                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
-            self.peer
-                .try_get_coin_records_by_hints(hints, start_height, end_height, include_spent_coins),
-            self.coinset.get_coin_records_by_hints(hints, None, None, true),
+            self.peer.try_get_coin_records_by_hints(
+                hints,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_hints(
+                hints,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset
+                .get_coin_records_by_hints(hints, None, None, true),
             projection,
         )
         .await
@@ -803,11 +826,20 @@ impl QueryRouter {
             include_spent: include_spent_coins,
         };
         self.peer_then_coinset_set(
-            self.peer
-                .try_get_coin_records_by_names(names, start_height, end_height, include_spent_coins),
-            self.peer
-                .try_get_coin_records_by_names(names, start_height, end_height, include_spent_coins),
-            self.coinset.get_coin_records_by_names(names, None, None, true),
+            self.peer.try_get_coin_records_by_names(
+                names,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.peer.try_get_coin_records_by_names(
+                names,
+                start_height,
+                end_height,
+                include_spent_coins,
+            ),
+            self.coinset
+                .get_coin_records_by_names(names, None, None, true),
             projection,
         )
         .await

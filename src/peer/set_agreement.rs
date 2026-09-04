@@ -365,7 +365,10 @@ mod tests {
     /// implementation that read one fixed position otherwise.
     #[test]
     fn the_common_height_is_the_lowest_as_of_less_the_settled_lag() {
-        assert_eq!(common_height(&[900, 880, 895], None), Some(880 - SETTLED_LAG));
+        assert_eq!(
+            common_height(&[900, 880, 895], None),
+            Some(880 - SETTLED_LAG)
+        );
         assert_eq!(common_height(&[880], None), Some(880 - SETTLED_LAG));
     }
 

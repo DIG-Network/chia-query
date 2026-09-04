@@ -209,8 +209,7 @@ async fn two_peers_one_block_apart_corroborate_at_the_settled_height() {
 /// as corroborated, and the router settles it (see `router::set_settlement_tests`).
 #[tokio::test]
 async fn a_pool_below_the_floor_reports_uncorroborated() {
-    let (backend, script) =
-        backend_over(vec![(PeerOrigin::Discovered, 100, agreeing(100))]).await;
+    let (backend, script) = backend_over(vec![(PeerOrigin::Discovered, 100, agreeing(100))]).await;
 
     let answer = read_scripted(&backend, &script, unfiltered())
         .await
