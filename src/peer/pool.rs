@@ -1092,6 +1092,22 @@ impl PeerPool {
             .map(|e| e.last_peak.load(Ordering::Relaxed))
     }
 
+    /// Record `peak` for `address` exactly as an arriving `NewPeakWallet` would.
+    ///
+    /// The peak field is an `Arc<AtomicU32>` owned by the entry and written only by its detached
+    /// receiver task, so a test that wants to model the chain ADVANCING under a stable set of
+    /// peers has no other way to reach it. Re-admitting at a higher peak is not the same fixture:
+    /// it changes the pool's membership, which is the very thing such a test must hold constant.
+    pub(crate) async fn set_peak_for_tests(&self, address: SocketAddr, peak: u32) -> bool {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| e.last_peak.store(peak, Ordering::Relaxed))
+            .is_some()
+    }
+
     /// Admit a connection AND follow `receiver`, exactly as a real dial would.
     /// Run only the lag half of [`maintain`](Self::maintain), which does not dial.
     pub(crate) async fn evict_lagging_peers_for_tests(&self) -> Vec<SocketAddr> {
@@ -2200,25 +2216,6 @@ mod tests {
             "the aggregate tracks a genuinely advancing chain after recovery"
         );
     }
-
-    /// **Proves (#51):** an ordinary, honestly advancing chain still moves the aggregate normally
-    /// — the bound must not be so tight that a healthy pool stops tracking its own peers.
-    #[tokio::test]
-    async fn an_ordinary_advancing_chain_still_moves_the_aggregate() {
-        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT]).await;
-        assert_eq!(pool.peak_height().await, CURRENT);
-
-        // All three peers report a new, higher peak (as `NewPeakWallet` would drive via
-        // `last_peak.fetch_max`) — simulated here by admitting a fresh set at the new height,
-        // since the fixture helper only sets a peak at admission time.
-        let advanced = pool_at_peaks(5, &[CURRENT + 10, CURRENT + 10, CURRENT + 10]).await;
-        assert_eq!(
-            advanced.peak_height().await,
-            CURRENT + 10,
-            "the whole pool advancing together moves the aggregate with it"
-        );
-    }
-
     /// **Control:** a pool with a single announced peak — the solo-priority-node case — still
     /// reports it. The median over a one-element set is that element itself, so a host running
     /// only its own `TRUSTED_FULLNODE`/loopback connection is unaffected by this change.
@@ -2836,4 +2833,63 @@ mod tests {
         );
         assert_eq!(pool.held_addresses_for_tests().await.len(), 3);
     }
-}
+
+    // ===================================================================================
+    // #51 - the announced tip is recomputed from live peers, not latched at a maximum
+    // ===================================================================================
+    /// **Proves (#51):** the announced tip RECOVERS once the over-claiming peers are gone.
+    ///
+    /// Without this the test above can pass while leaving the value permanently wrong, which is the
+    /// actual defect — a bound that merely rejects one bad frame still latches whatever it accepts.
+    ///
+    /// **The fixture deliberately lets the liars WIN first.** Two colluding peers out of three do
+    /// move a median, so the pool genuinely reports the inflated height at the start; the assertion
+    /// is not vacuous. Ejecting one of them returns the tip to the honest value on the very next
+    /// call, with no reset logic — because the figure is recomputed from the LIVE entries rather
+    /// than stored.
+    #[tokio::test]
+    async fn the_announced_tip_recovers_once_an_over_claiming_peer_is_gone() {
+        let pool = pool_at_peaks(5, &[CURRENT, u32::MAX, u32::MAX]).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            u32::MAX,
+            "fixture must start WRONG, or recovery is untested"
+        );
+
+        pool.eject_peer(address(3)).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "a departed peer must take its claim with it"
+        );
+    }
+
+    /// **Proves (#51):** an ordinary advancing chain still moves the tip.
+    ///
+    /// The bound must not be so tight that a healthy node stops tracking — a tip that cannot rise
+    /// is the same denial as a tip pinned too high, reached from the other side.
+    ///
+    /// Membership is held CONSTANT and only the announced heights advance, which is why this needs
+    /// [`set_peak_for_tests`](PeerPool::set_peak_for_tests): re-admitting at a higher peak would
+    /// vary the peer set as well and could pass for the wrong reason.
+    #[tokio::test]
+    async fn an_ordinary_advancing_chain_still_moves_the_announced_tip() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+
+        const ADVANCED: u32 = CURRENT + 50;
+        for i in 1..=3u8 {
+            assert!(
+                pool.set_peak_for_tests(address(i), ADVANCED).await,
+                "fixture peer {i} must be held"
+            );
+        }
+
+        assert_eq!(
+            pool.peak_height().await,
+            ADVANCED,
+            "the tip must follow an honestly advancing chain"
+        );
+    }}
