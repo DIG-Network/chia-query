@@ -223,7 +223,11 @@ impl SetMember for CoinRecord {
 /// [`SetAnswer::as_of_height`] — and cannot drag it UP, which is what would let it hide a coin
 /// behind a height nobody else reached.
 pub fn common_height(as_of: &[u32], end_height: Option<u32>) -> Option<u32> {
-    unimplemented!("common_height")
+    let settled = as_of.iter().copied().min()?.checked_sub(SETTLED_LAG)?;
+    Some(match end_height {
+        Some(end) => settled.min(end),
+        None => settled,
+    })
 }
 
 /// Hold `items` to the chain as it stood at `h`.
@@ -236,7 +240,14 @@ pub fn common_height(as_of: &[u32], end_height: Option<u32>) -> Option<u32> {
 /// Demoting rather than dropping is the half that matters: a coin spent at `h + 1` is a coin the
 /// caller still owned at `h`, and dropping it would under-report exactly the way an omission does.
 pub fn normalise_at<T: SetMember>(items: &[T], h: u32) -> Vec<T> {
-    unimplemented!("normalise_at")
+    items
+        .iter()
+        .filter(|item| item.created_height() <= h)
+        .map(|item| match item.spent_height() {
+            Some(spent) if spent > h => item.with_spend_dropped(),
+            _ => item.clone(),
+        })
+        .collect()
 }
 
 /// The comparable fingerprint of a normalised set: identity -> chain claim.
@@ -245,7 +256,10 @@ pub fn normalise_at<T: SetMember>(items: &[T], h: u32) -> Vec<T> {
 /// each return the same coin id with a different `created_height` produce one key with two values,
 /// which reads as "these sources disagree about coin X" instead of "one extra, one missing".
 pub fn fingerprint<T: SetMember>(items: &[T]) -> BTreeMap<String, String> {
-    unimplemented!("fingerprint")
+    items
+        .iter()
+        .map(|item| (item.identity(), item.chain_claim()))
+        .collect()
 }
 
 /// The FIRST difference between two normalised fingerprints, rendered, or `None` if they are equal.
@@ -259,12 +273,247 @@ pub fn contradiction(
     other: &str,
     other_set: &BTreeMap<String, String>,
 ) -> Option<String> {
-    unimplemented!("contradiction")
+    for (identity, claim) in asked_set {
+        match other_set.get(identity) {
+            Some(other_claim) if other_claim == claim => {}
+            Some(other_claim) => {
+                return Some(format!(
+                    "{asked} claims `{claim}` for coin {identity}, {other} claims `{other_claim}`"
+                ))
+            }
+            None => {
+                return Some(format!(
+                    "{asked} reports coin {identity} (`{claim}`), {other} omits it"
+                ))
+            }
+        }
+    }
+
+    // The other direction is not implied by the first: a source that ADDS a coin agrees about
+    // every coin the asked peer returned, and a one-way walk would call that agreement.
+    for (identity, claim) in other_set {
+        if !asked_set.contains_key(identity) {
+            return Some(format!(
+                "{other} reports coin {identity} (`{claim}`), {asked} omits it"
+            ));
+        }
+    }
+
+    None
 }
 
 /// Apply what the CALLER asked for to an already-agreed set.
 ///
 /// Runs after agreement, never before it, and never on one side of a comparison alone.
 pub fn project<T: SetMember>(items: Vec<T>, projection: SetProjection) -> Vec<T> {
-    unimplemented!("project")
+    items
+        .into_iter()
+        .filter(|item| {
+            let above_start = projection
+                .start_height
+                .is_none_or(|start| item.created_height() >= start);
+            let wanted = projection.include_spent || item.spent_height().is_none();
+            above_start && wanted
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Coin;
+
+    /// A coin record with only the fields the rule reads. `n` names the coin.
+    fn coin(n: u8, created: u32, spent: Option<u32>) -> CoinRecord {
+        CoinRecord {
+            coin: Coin {
+                parent_coin_info: format!("parent{n:02}"),
+                puzzle_hash: "ph".into(),
+                amount: u64::from(n),
+            },
+            confirmed_block_index: created,
+            spent_block_index: spent.unwrap_or(0),
+            spent: spent.is_some(),
+            coinbase: false,
+            timestamp: 0,
+        }
+    }
+
+    /// `H` is the LOWEST as-of height less the lag, never an average and never the highest.
+    ///
+    /// Pinned from both sides: the value is `min - SETTLED_LAG`, and it is that *because* it is
+    /// the min — a fixture whose lowest source is neither first nor last would pass an
+    /// implementation that read one fixed position otherwise.
+    #[test]
+    fn the_common_height_is_the_lowest_as_of_less_the_settled_lag() {
+        assert_eq!(common_height(&[900, 880, 895], None), Some(880 - SETTLED_LAG));
+        assert_eq!(common_height(&[880], None), Some(880 - SETTLED_LAG));
+    }
+
+    /// A hostile source can only drag `H` DOWN. Worth pinning explicitly, because the obvious
+    /// alternative — the highest as-of, so the answer is as fresh as possible — is the aggregate
+    /// one inflated claim wins outright.
+    #[test]
+    fn one_source_claiming_a_high_as_of_cannot_raise_the_common_height() {
+        let honest = common_height(&[900, 901], None).expect("two honest sources");
+        let with_liar = common_height(&[900, 901, 9_000_000], None).expect("plus one inflated");
+        assert_eq!(honest, with_liar, "the maximum must not move H");
+    }
+
+    /// The caller's `end_height` clamps `H` DOWN and never up: a caller asking about the settled
+    /// past must not be answered about the tip, and one asking about the future must not be told
+    /// `H` is further along than the sources are.
+    #[test]
+    fn the_callers_end_height_clamps_the_common_height_downwards_only() {
+        assert_eq!(common_height(&[900], Some(500)), Some(500));
+        assert_eq!(
+            common_height(&[900], Some(50_000)),
+            Some(900 - SETTLED_LAG),
+            "an end_height above the sources cannot invent chain they have not seen"
+        );
+    }
+
+    /// Nothing settled can be said about a chain shorter than the lag, and `0` is not the honest
+    /// answer to that — a set normalised at height 0 is empty, which is the exact under-report
+    /// this module exists to refuse.
+    #[test]
+    fn there_is_no_common_height_below_the_lag_and_no_source_means_no_height() {
+        assert_eq!(common_height(&[1], None), None);
+        assert_eq!(common_height(&[], None), None);
+    }
+
+    /// A coin created above `H` did not exist yet, so it is not in the answer.
+    #[test]
+    fn normalising_drops_a_coin_created_above_the_common_height() {
+        let items = [coin(1, 100, None), coin(2, 105, None)];
+
+        let at = normalise_at(&items, 102);
+
+        assert_eq!(at.len(), 1, "the coin created at 105 did not exist at 102");
+        assert_eq!(at[0].identity(), coin(1, 100, None).identity());
+    }
+
+    /// **The half that decides whether this module under-reports.**
+    ///
+    /// A coin SPENT above `H` existed and was unspent at `H`. Dropping it — the naive reading of
+    /// "hold the set to `H`" — removes a coin the caller still owned, which is indistinguishable
+    /// from the omission attack the rule exists to catch. It is DEMOTED, not dropped.
+    #[test]
+    fn normalising_demotes_a_coin_spent_above_the_common_height_rather_than_dropping_it() {
+        let items = [coin(1, 100, Some(105))];
+
+        let at = normalise_at(&items, 102);
+
+        assert_eq!(at.len(), 1, "the coin was still owned at 102");
+        assert_eq!(at[0].spent_height(), None, "and it was unspent at 102");
+    }
+
+    /// A spend at or below `H` is a fact about the chain at `H` and survives normalisation.
+    ///
+    /// Without this, an implementation that demoted EVERY spend would pass the test above while
+    /// erasing every settled spend in the set.
+    #[test]
+    fn normalising_keeps_a_spend_that_had_already_happened_at_the_common_height() {
+        let items = [coin(1, 100, Some(101))];
+
+        let at = normalise_at(&items, 102);
+
+        assert_eq!(at[0].spent_height(), Some(101));
+    }
+
+    /// **The honest-lag case, which any workable rule must not call a disagreement.**
+    ///
+    /// Two peers one block apart: the faster one has seen a coin created at `P+1` and a spend at
+    /// `P+1` the slower one has not. Normalised to a common height below both, their sets are
+    /// identical — so ordinary lag stops being a source of disagreement at all.
+    #[test]
+    fn two_honest_peers_one_block_apart_agree_once_normalised() {
+        let slow = [coin(1, 100, None), coin(2, 100, None)];
+        let fast = [
+            coin(1, 100, None),
+            coin(2, 100, Some(105)),
+            coin(3, 105, None),
+        ];
+
+        let h = common_height(&[104, 105], None).expect("both sources answered");
+        let slow = fingerprint(&normalise_at(&slow, h));
+        let fast = fingerprint(&normalise_at(&fast, h));
+
+        assert_eq!(
+            contradiction("slow", &slow, "fast", &fast),
+            None,
+            "a one-block lead is not a contradiction"
+        );
+    }
+
+    /// **The attack, stated as a test.** A source that hides a coin is caught, not averaged away.
+    #[test]
+    fn a_source_that_omits_a_coin_contradicts_one_that_reports_it() {
+        let honest = fingerprint(&normalise_at(&[coin(1, 10, None), coin(2, 10, None)], 100));
+        let hiding = fingerprint(&normalise_at(&[coin(1, 10, None)], 100));
+
+        let detail = contradiction("honest", &honest, "hiding", &hiding)
+            .expect("an omission is a contradiction");
+        assert!(
+            detail.contains(&coin(2, 10, None).identity()),
+            "the disagreement must name the coin: {detail}"
+        );
+    }
+
+    /// The mirror: a source that ADDS a coin is caught too. Addition is the expensive direction
+    /// for an attacker, but the rule is equality, so it is refused just the same.
+    #[test]
+    fn a_source_that_adds_a_coin_contradicts_one_that_does_not_have_it() {
+        let honest = fingerprint(&normalise_at(&[coin(1, 10, None)], 100));
+        let adding = fingerprint(&normalise_at(&[coin(1, 10, None), coin(9, 10, None)], 100));
+
+        assert!(contradiction("honest", &honest, "adding", &adding).is_some());
+    }
+
+    /// The same coin with a different chain claim is a contradiction about THAT coin, and the
+    /// error says so — the reason the fingerprint is keyed on identity rather than on the claim.
+    #[test]
+    fn the_same_coin_with_a_different_height_is_a_contradiction_naming_that_coin() {
+        let a = fingerprint(&normalise_at(&[coin(1, 10, None)], 100));
+        let b = fingerprint(&normalise_at(&[coin(1, 11, None)], 100));
+
+        let detail = contradiction("a", &a, "b", &b)
+            .expect("a fabricated creation height is a contradiction");
+        assert!(detail.contains(&coin(1, 10, None).identity()), "{detail}");
+    }
+
+    /// Equal sets in a different ORDER agree: the wire order is not a claim about the chain.
+    #[test]
+    fn set_comparison_ignores_the_order_the_source_returned_coins_in() {
+        let forwards = fingerprint(&[coin(1, 10, None), coin(2, 10, None)]);
+        let backwards = fingerprint(&[coin(2, 10, None), coin(1, 10, None)]);
+
+        assert_eq!(contradiction("f", &forwards, "b", &backwards), None);
+    }
+
+    /// The caller's projection is applied to an ALREADY-AGREED set, and applies both halves.
+    #[test]
+    fn the_projection_applies_the_callers_start_height_and_spent_filter() {
+        let agreed = vec![coin(1, 10, None), coin(2, 50, Some(60)), coin(3, 50, None)];
+
+        let unspent_only = project(
+            agreed.clone(),
+            SetProjection {
+                start_height: None,
+                end_height: None,
+                include_spent: false,
+            },
+        );
+        assert_eq!(unspent_only.len(), 2, "the spent coin is projected out");
+
+        let recent = project(
+            agreed,
+            SetProjection {
+                start_height: Some(20),
+                end_height: None,
+                include_spent: true,
+            },
+        );
+        assert_eq!(recent.len(), 2, "the coin created at 10 is below the start");
+    }
 }
