@@ -3,10 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use chia_protocol::{
-    Bytes32, CoinStateUpdate, HeaderBlock, Message, NewPeakWallet, ProtocolMessageTypes,
-    RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader,
-};
+use chia_protocol::{CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes};
 use chia_traits::Streamable;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, RwLock};
@@ -148,8 +145,119 @@ fn most_credible<T>(mut candidates: Vec<DialCandidate<T>>, slots: usize) -> Vec<
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|c| seen.insert(c.address));
 
+    // Diversity runs AFTER the latency sort and BEFORE the truncate, so the slots go to as many
+    // distinct subnets as the round actually reached, while the survivor of each subnet is still
+    // its FASTEST member - the candidate the ranking would have chosen anyway.
+    candidates = spread_across_subnets(candidates);
+
     candidates.truncate(slots);
     candidates
+}
+
+/// Reorder a latency-ranked round so the slots are spread across as many distinct routing
+/// prefixes as the round reached, WITHOUT ever leaving a slot empty for want of diversity.
+///
+/// Emits one candidate per subnet per pass — subnets in the order their fastest member appeared,
+/// candidates within a subnet in their existing latency order — so the head of the list is one
+/// peer from each distinct subnet, then a second from each, and so on. `Priority` entries are
+/// passed through at the front untouched.
+///
+/// # Why this rather than a hard cap of K per subnet
+///
+/// A cap has to pick `K`, and `K` is a genuine trade in both directions: too high and it is
+/// decorative, too low and a host whose reachable peers happen to share a /24 cannot fill its pool
+/// at all — it drops below [`CORROBORATION_FLOOR`] and falls back to the centralized HTTPS tier,
+/// which is the outcome this crate exists to avoid. Cloud-hosted nodes cluster in /24s heavily, so
+/// that is not a hypothetical population.
+///
+/// A spread has no `K` and no such trade. When the round reached several subnets, the diverse
+/// peers take the slots — which is the whole attack this addresses. When it reached only one, the
+/// order is unchanged and every slot still fills. It is strictly more diverse than the plain
+/// latency ranking and never less filled.
+///
+/// # The attack it addresses
+///
+/// [`most_credible`] ranks discovered candidates by ascending handshake time, and latency is
+/// partly a measure of network PROXIMITY — so ranking on it is a mild preference for peers NEAR
+/// this host, precisely the population a local or regional adversary already holds.
+/// [`DIAL_OVERSUBSCRIPTION`] bounds that pressure but does not remove it, and it is no bound at
+/// all on PROVISIONING: an adversary who stands up several nodes in one datacentre gets several
+/// fast candidates for one act of provisioning. NC-12 rests on the held peers being independent of
+/// each other, and "fastest" is not "independent".
+///
+/// # What this does NOT do
+///
+/// It spreads across ADDRESS blocks, not OWNERS. One operator holding addresses in many /24s
+/// defeats it entirely. It raises the cost of a proximity attack; it does not close it.
+///
+/// It also shapes a single ROUND, not the pool. A host that reaches only one subnet still fills
+/// from it across `FILL_ROUNDS` rounds, so the pool's eventual composition can still be
+/// concentrated.
+fn spread_across_subnets<T>(candidates: Vec<DialCandidate<T>>) -> Vec<DialCandidate<T>> {
+    let mut priority = Vec::new();
+    // Insertion-ordered buckets: the first time a subnet is seen fixes its position, so a subnet
+    // is ranked by its FASTEST member and the pass order inherits the latency sort.
+    let mut order: Vec<SubnetKey> = Vec::new();
+    let mut buckets: std::collections::HashMap<SubnetKey, Vec<DialCandidate<T>>> =
+        std::collections::HashMap::new();
+
+    for candidate in candidates {
+        // The operator's own or co-resident node. Already excluded from `independent_peer_count`,
+        // so it cannot corroborate anything, and spreading it away from its slot would displace
+        // the node the operator deliberately configured.
+        if candidate.origin == connect::PeerOrigin::Priority {
+            priority.push(candidate);
+            continue;
+        }
+        let key = SubnetKey::of(candidate.address);
+        if !buckets.contains_key(&key) {
+            order.push(key);
+        }
+        buckets.entry(SubnetKey::of(candidate.address)).or_default().push(candidate);
+    }
+
+    let mut spread = priority;
+    let mut remaining = true;
+    while remaining {
+        remaining = false;
+        for key in &order {
+            if let Some(bucket) = buckets.get_mut(key) {
+                if !bucket.is_empty() {
+                    spread.push(bucket.remove(0));
+                    remaining |= !bucket.is_empty();
+                }
+            }
+        }
+    }
+    spread
+}
+
+/// The routing prefix a dial candidate is judged to share with its neighbours: /24 for IPv4, /48
+/// for IPv6.
+///
+/// A `/24` and a `/48` are the smallest blocks routinely allocated as a unit, so they are the
+/// cheapest proxy for "these addresses are probably one operator". The proxy is deliberately
+/// coarse in the SAFE direction: it over-groups (two unrelated tenants of one hosting provider
+/// count as one) rather than under-groups.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum SubnetKey {
+    V4([u8; 3]),
+    V6([u8; 6]),
+}
+
+impl SubnetKey {
+    fn of(address: SocketAddr) -> Self {
+        match address.ip() {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                SubnetKey::V4([o[0], o[1], o[2]])
+            }
+            std::net::IpAddr::V6(v6) => {
+                let o = v6.octets();
+                SubnetKey::V6([o[0], o[1], o[2], o[3], o[4], o[5]])
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2892,4 +3000,181 @@ mod tests {
             ADVANCED,
             "the tip must follow an honestly advancing chain"
         );
-    }}
+    }
+
+    // ===================================================================================
+    // #44 - a round's slots are spread across routing prefixes, not handed to the nearest
+    // ===================================================================================
+
+    /// An address in an arbitrary /24, so a fixture can vary the SUBNET rather than the host.
+    fn address_in(subnet: u8, host: u8) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, subnet, host)),
+            8444,
+        )
+    }
+
+    /// An address in an arbitrary /48.
+    fn address_v6_in(subnet: u16, host: u16) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0x0db8, subnet, 0, 0, 0, 0, host,
+            )),
+            8444,
+        )
+    }
+
+    /// **Proves (#44), at ROUND level:** a fast cluster sharing one /24 cannot take every slot
+    /// while slower peers in distinct /24s wait behind it.
+    ///
+    /// **The fixture varies exactly ONE thing.** Eight candidates share `198.51.7.0/24` and are
+    /// ALL faster than the three peers in distinct /24s behind them, so a plain ascending-latency
+    /// ranking admits the eight and none of the three — only the spread can save them. That is
+    /// the proximity attack in miniature: an adversary who stands up eight nodes in one datacentre
+    /// gets eight fast candidates for one act of provisioning, and NC-12 rests on the held peers
+    /// being independent of each other.
+    ///
+    /// Run through `admit_most_credible_for_tests` rather than `most_credible`, because a ranker
+    /// test cannot see whether the policy is wired into the round.
+    #[tokio::test]
+    async fn a_fast_single_subnet_cluster_cannot_take_every_slot_from_distinct_subnets() {
+        const SLOTS: usize = 4;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=8u8 {
+            round.push(candidate_at(&peer, address_in(7, host), PeerOrigin::Discovered, 10).await);
+        }
+        for subnet in [20u8, 21, 22] {
+            round.push(
+                candidate_at(&peer, address_in(subnet, 1), PeerOrigin::Discovered, 900).await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let subnets: std::collections::HashSet<_> = held
+            .iter()
+            .map(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets()[2],
+                std::net::IpAddr::V6(_) => unreachable!("fixture is IPv4"),
+            })
+            .collect();
+
+        assert_eq!(held.len(), SLOTS, "every slot must still be filled");
+        assert_eq!(
+            subnets.len(),
+            4,
+            "the {SLOTS} slots must reach 4 distinct /24s, not be consumed by the fast cluster              (held: {held:?})"
+        );
+    }
+
+    /// **Proves (#44) for IPv6:** the same spread applies across /48s.
+    ///
+    /// A /48 cap on `Ipv6Addr` is separate code from a /24 cap on `Ipv4Addr`, so a test of one is
+    /// vacuous for the other — and the peer tier is IPv6-FIRST (§5.2), which makes v6 the primary
+    /// case rather than the exotic one.
+    #[tokio::test]
+    async fn the_spread_applies_across_ipv6_prefixes_too() {
+        const SLOTS: usize = 3;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=6u16 {
+            round.push(
+                candidate_at(&peer, address_v6_in(0x11, host), PeerOrigin::Discovered, 10).await,
+            );
+        }
+        for subnet in [0x22u16, 0x33] {
+            round.push(
+                candidate_at(&peer, address_v6_in(subnet, 1), PeerOrigin::Discovered, 900).await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let prefixes: std::collections::HashSet<_> = held
+            .iter()
+            .map(|a| match a.ip() {
+                std::net::IpAddr::V6(v6) => v6.segments()[2],
+                std::net::IpAddr::V4(_) => unreachable!("fixture is IPv6"),
+            })
+            .collect();
+
+        assert_eq!(held.len(), SLOTS, "every slot must still be filled");
+        assert_eq!(
+            prefixes.len(),
+            3,
+            "the {SLOTS} slots must reach 3 distinct /48s (held: {held:?})"
+        );
+    }
+
+    /// **Control:** a round with no subnet concentration is UNAFFECTED — the latency ranking still
+    /// decides, in order.
+    ///
+    /// Without this, a spread that simply shuffled, reversed, or dropped candidates would satisfy
+    /// the diversity assertions above while quietly destroying the ranking #43 established.
+    #[tokio::test]
+    async fn a_round_with_no_subnet_concentration_keeps_its_latency_order() {
+        const SLOTS: usize = 3;
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for (i, subnet) in [30u8, 31, 32, 33].iter().enumerate() {
+            round.push(
+                candidate_at(
+                    &peer,
+                    address_in(*subnet, 1),
+                    PeerOrigin::Discovered,
+                    100 + i as u64 * 100,
+                )
+                .await,
+            );
+        }
+
+        let kept = most_credible(round, SLOTS);
+        let addrs: Vec<SocketAddr> = kept.iter().map(|c| c.address).collect();
+
+        assert_eq!(
+            addrs,
+            vec![address_in(30, 1), address_in(31, 1), address_in(32, 1)],
+            "with one candidate per subnet the spread is the identity and the fastest three win"
+        );
+    }
+
+    /// **Control — the starvation direction, which is the failure that would matter more.**
+    ///
+    /// A host whose only reachable peers share ONE /24 must still fill every slot. A hard cap of
+    /// `K` per subnet would fail exactly here: it would admit `K` and leave the rest empty,
+    /// dropping the pool below `CORROBORATION_FLOOR` and sending it to the centralized HTTPS tier
+    /// — the outcome this crate exists to avoid. Cloud-hosted nodes cluster in /24s heavily, so
+    /// this population is not hypothetical.
+    ///
+    /// This is the test that chose a spread over a cap.
+    #[tokio::test]
+    async fn a_host_that_can_only_reach_one_subnet_still_fills_every_slot() {
+        const SLOTS: usize = 5;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=8u8 {
+            round.push(
+                candidate_at(&peer, address_in(9, host), PeerOrigin::Discovered, 10 + host as u64)
+                    .await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        assert_eq!(
+            pool.held_addresses_for_tests().await.len(),
+            SLOTS,
+            "a single-subnet host must still fill its pool rather than fall back to the              centralized tier"
+        );
+    }
+}
