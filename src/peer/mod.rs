@@ -196,8 +196,16 @@ impl PeerBackend {
     ///
     /// Falling further behind than `capacity` ENDS the subscription rather than skipping a frame —
     /// see [`frames::FrameSubscription`].
-    pub async fn subscribe_frames(&self, capacity: usize) -> frames::FrameSubscription {
-        self.pool.subscribe_frames(capacity).await
+    ///
+    /// The subscription follows the session held at `address` and receives only that session's
+    /// frames, so no other held peer can end it (chia-query#34). `None` when no live session is
+    /// held there — see [`PeerPool::subscribe_frames`](pool::PeerPool::subscribe_frames).
+    pub async fn subscribe_frames(
+        &self,
+        address: SocketAddr,
+        capacity: usize,
+    ) -> Option<frames::FrameSubscription> {
+        self.pool.subscribe_frames(address, capacity).await
     }
 
     // -----------------------------------------------------------------------

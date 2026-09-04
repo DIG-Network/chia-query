@@ -21,6 +21,7 @@
 
 pub mod coinset;
 pub mod drift;
+pub mod mempool_refusal;
 pub mod types;
 
 // The `@dignetwork/chia-query-wasm` bindings — only for the wasm coinset build.

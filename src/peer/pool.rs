@@ -17,6 +17,7 @@ use crate::NetworkType;
 use super::connect;
 use super::frames::{
     FrameFanout, FrameSource, FrameSubscription, PoolFrame, SessionEndReason, SessionId,
+    MAX_FRAME_COIN_STATES,
 };
 use super::plurality::{CORROBORATION_FLOOR, PEAK_LAG_EVICTION, PEER_LIFETIME, PRIORITY_SLOTS};
 
@@ -1085,6 +1086,20 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
+                        // Checked BEFORE the frame is built, so an oversized `items` is never
+                        // moved into a `PoolFrame` and never reaches a subscriber's queue
+                        // (chia-query#33). The peer chooses this length, so it is the one input
+                        // to this task an untrusted peer sizes.
+                        if update.items.len() > MAX_FRAME_COIN_STATES {
+                            log::warn!(
+                                "peer {} sent a CoinStateUpdate carrying {} coin states, above \
+                                 the {MAX_FRAME_COIN_STATES} a node's own subscription response \
+                                 may hold; ending the session",
+                                source.address,
+                                update.items.len(),
+                            );
+                            break SessionEndReason::OversizedFrame;
+                        }
                         fanout.publish(source, coin_states_frame(update)).await;
                     }
                     _ => {}
@@ -1101,12 +1116,36 @@ impl PeerPool {
         });
     }
 
-    /// Subscribe to this pool's frames, with room for `capacity` unread ones.
+    /// Follow the session currently held at `address`, with room for `capacity` unread frames.
     ///
-    /// Falling further behind than `capacity` ENDS the subscription - see
+    /// `None` when the pool holds no live, announced session at `address`.
+    ///
+    /// **The subscription binds a SESSION, not an address.** The session is resolved from the pool
+    /// entry under the read lock, so a subscriber attaches to exactly the connection whose
+    /// [`Peer`] handle it is about to send `subscribe = true` on — never to a replacement that was
+    /// dialled in the gap. When that session ends the subscription ends with it; following the
+    /// address across a reconnect would silently re-point a consumer at a different peer's claims.
+    ///
+    /// Only that session's frames are queued against `capacity`, so no other held peer can
+    /// terminate this subscription by talking fast (chia-query#34). Falling further behind than
+    /// `capacity` on the followed session's OWN frames still ENDS the subscription — see
     /// [`FrameSubscription`](super::frames::FrameSubscription) for why a gap is not an option.
-    pub async fn subscribe_frames(&self, capacity: usize) -> FrameSubscription {
-        self.fanout.subscribe(capacity).await
+    pub async fn subscribe_frames(
+        &self,
+        address: SocketAddr,
+        capacity: usize,
+    ) -> Option<FrameSubscription> {
+        // The entries lock is held across the registration so the resolved session cannot be
+        // ejected and replaced between reading it and following it; `eject_peer` takes the write
+        // lock and therefore waits. Nothing takes `entries` while holding the fanout's lock, so
+        // the entries -> fanout order taken here is the only one in the crate.
+        let entries = self.entries.read().await;
+        let entry = entries.iter().find(|e| e.address == address)?;
+        let source = FrameSource {
+            address,
+            session: entry.session,
+        };
+        self.fanout.subscribe(source, capacity).await
     }
 }
 
@@ -1187,15 +1226,32 @@ impl PeerPool {
     /// Production admits through [`admit_and_follow`](Self::admit_and_follow), which also starts
     /// the session; a test that only cares about the pool's membership uses this so it does not
     /// have to invent a receiver it will never feed.
+    ///
+    /// It still ANNOUNCES the session, because production always does and a subscription can only
+    /// be opened on an announced one. A seam that admitted without announcing would put the pool in
+    /// a state a real dial never reaches — an entry nothing can follow — and every test built on it
+    /// would be measuring that state rather than the one that ships.
     pub(crate) async fn admitted(
         &self,
         peer: Peer,
         address: SocketAddr,
         origin: connect::PeerOrigin,
     ) -> bool {
-        let session = self.fanout.allocate_session(address).session;
-        self.admit(peer, address, origin, session, Arc::new(AtomicU32::new(0)))
+        let source = self.fanout.allocate_session(address);
+        if !self
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::new(AtomicU32::new(0)),
+            )
             .await
+        {
+            return false;
+        }
+        self.fanout.open_session(source).await;
+        true
     }
 
     /// Admit a connection that has already announced `peak`.
@@ -1210,15 +1266,21 @@ impl PeerPool {
         origin: connect::PeerOrigin,
         peak: u32,
     ) -> bool {
-        let session = self.fanout.allocate_session(address).session;
-        self.admit(
-            peer,
-            address,
-            origin,
-            session,
-            Arc::new(AtomicU32::new(peak)),
-        )
-        .await
+        let source = self.fanout.allocate_session(address);
+        if !self
+            .admit(
+                peer,
+                address,
+                origin,
+                source.session,
+                Arc::new(AtomicU32::new(peak)),
+            )
+            .await
+        {
+            return false;
+        }
+        self.fanout.open_session(source).await;
+        true
     }
 
     /// The peak this pool has recorded for `address`, if it holds it.
@@ -1921,43 +1983,66 @@ mod tests {
         (sender, source)
     }
 
+    /// Admit a peer at `addr`, follow the channel the test feeds, and SUBSCRIBE to that session.
+    ///
+    /// The ordering is forced by the source-scoped fan-out: a subscription names the session it
+    /// follows, so it cannot be opened before that session exists (chia-query#34).
+    async fn followed_and_subscribed(
+        pool: &PeerPool,
+        addr: SocketAddr,
+    ) -> (mpsc::Sender<Message>, FrameSource, FrameSubscription) {
+        let (sender, source) = followed_session(pool, addr).await;
+        let subscription = pool
+            .subscribe_frames(addr, 32)
+            .await
+            .expect("a session just admitted is subscribable");
+        (sender, source, subscription)
+    }
+
     /// **A frame carries the address of the peer that sent it, all the way from the socket.**
     ///
-    /// TWO sessions are followed and each is fed a peak of its own. A handler that published
-    /// without attribution - or that attributed every frame to one session - gives both frames the
-    /// same source and fails here; a one-session fixture cannot tell those apart from correct
-    /// behaviour.
+    /// TWO sessions are followed and each is fed a peak of its own, through the real receiver
+    /// handler. A handler that published without attribution - or that attributed every frame to
+    /// one session - gives both frames the same source and fails here; a one-session fixture cannot
+    /// tell those apart from correct behaviour.
     ///
-    /// This is the property whose absence let any held peer's `CoinStateUpdate` reach a subscriber
-    /// as if it came from the peer that subscriber had chosen to follow.
+    /// Each subscription follows ONE session (chia-query#34), so the assertion is also that peer
+    /// 2's frames never reach peer 1's follower: the property whose absence let any held peer's
+    /// `CoinStateUpdate` reach a subscriber as if it came from the peer that subscriber chose.
     #[tokio::test]
     async fn a_frame_reaching_a_subscriber_names_the_session_it_came_from() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (first, first_source) = followed_session(&pool, address(1)).await;
-        let (second, second_source) = followed_session(&pool, address(2)).await;
+        let (first, first_source, mut following_first) =
+            followed_and_subscribed(&pool, address(1)).await;
+        let (second, second_source, mut following_second) =
+            followed_and_subscribed(&pool, address(2)).await;
 
         first.send(peak_message(100)).await.expect("send");
         second.send(peak_message(200)).await.expect("send");
 
-        let seen = drain_at_least(&mut subscription, 4).await;
+        let from_first = drain_at_least(&mut following_first, 2).await;
+        let from_second = drain_at_least(&mut following_second, 2).await;
 
-        let peaks: Vec<(SocketAddr, u32)> = seen
-            .iter()
-            .filter_map(|f| match f.frame {
-                PoolFrame::Peak { height, .. } => Some((f.source.address, height)),
-                _ => None,
-            })
-            .collect();
+        let peaks = |seen: &[SourcedFrame]| -> Vec<(SocketAddr, u32)> {
+            seen.iter()
+                .filter_map(|f| match f.frame {
+                    PoolFrame::Peak { height, .. } => Some((f.source.address, height)),
+                    _ => None,
+                })
+                .collect()
+        };
 
-        assert!(
-            peaks.contains(&(address(1), 100)),
-            "peer 1's peak must arrive under peer 1's address: {peaks:?}"
+        assert_eq!(
+            peaks(&from_first),
+            vec![(address(1), 100)],
+            "peer 1's follower sees peer 1's peak under peer 1's address, and NOTHING of peer \
+             2's: {from_first:?}"
         );
-        assert!(
-            peaks.contains(&(address(2), 200)),
-            "peer 2's peak must arrive under peer 2's address: {peaks:?}"
+        assert_eq!(
+            peaks(&from_second),
+            vec![(address(2), 200)],
+            "and symmetrically for peer 2: {from_second:?}"
         );
         assert_ne!(
             first_source.session, second_source.session,
@@ -1974,8 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn an_undecodable_frame_ends_the_session_rather_than_being_skipped() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         sender.send(peak_message(100)).await.expect("send");
         sender.send(undecodable_peak_message()).await.expect("send");
@@ -2015,8 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_fed_only_valid_frames_stays_open() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         sender.send(peak_message(100)).await.expect("send");
         sender.send(peak_message(101)).await.expect("send");
@@ -2048,8 +2131,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_transport_ends_the_session_loudly() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
-        let (sender, source) = followed_session(&pool, address(1)).await;
+        let (sender, source, mut subscription) = followed_and_subscribed(&pool, address(1)).await;
 
         drop(sender);
 
@@ -2074,9 +2156,9 @@ mod tests {
     #[tokio::test]
     async fn a_peer_whose_session_ended_is_ejected_without_waiting_for_a_failure() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        let (dying, dying_source, mut subscription) =
+            followed_and_subscribed(&pool, address(1)).await;
         let (_surviving, _) = followed_session(&pool, address(2)).await;
 
         drop(dying);
@@ -2120,9 +2202,9 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_at_the_same_address_survives_its_predecessors_death() {
         let pool = empty_pool(4);
-        let mut subscription = pool.subscribe_frames(32).await;
 
-        let (dying, dying_source) = followed_session(&pool, address(1)).await;
+        let (dying, dying_source, mut subscription) =
+            followed_and_subscribed(&pool, address(1)).await;
         drop(dying);
 
         let seen = drain_at_least(&mut subscription, 2).await;
@@ -2542,12 +2624,12 @@ mod tests {
     #[tokio::test]
     async fn a_peers_recorded_peak_comes_from_the_peak_it_announces() {
         let pool = empty_pool(2);
-        let mut subscription = pool.subscribe_frames(8).await;
         let addr = address(1);
-        let (session, _source) = followed_session(&pool, addr).await;
+        let (session, _source, mut subscription) = followed_and_subscribed(&pool, addr).await;
 
         session.send(peak_message(4242)).await.expect("send a peak");
-        drain_at_least(&mut subscription, 1).await;
+        // Two frames: this subscription's opening `Reset`, then the announced peak.
+        drain_at_least(&mut subscription, 2).await;
 
         // The handler writes the peak and then publishes, both from its own detached task, so the
         // write is ordered before the frame this test just saw. The poll is for the scheduler, not

@@ -38,10 +38,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chia_protocol::{Bytes32, CoinState, CoinStateFilters, Program, SpendBundle};
 use chia_wallet_sdk::client::Peer;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use super::error::LightClientError;
 use crate::peer::connect::PeerOrigin;
+use crate::peer::frames::{FrameSource, FrameSubscription};
 use crate::peer::PeerBackend;
 
 /// Max pages an UNTRUSTED peer may return for one paged puzzle-state read before we fail closed.
@@ -103,6 +104,17 @@ pub struct PooledFetcher {
     /// [`release_anchor`](Self::release_anchor) when that session ends, so the next subscribing
     /// read re-anchors on a live peer instead of a dead one.
     anchor: Arc<RwLock<Option<Anchor>>>,
+    /// Where a newly pinned session's frame subscription is handed to the drive-loop.
+    ///
+    /// A subscription now names ONE session (chia-query#34), so it cannot be opened before the
+    /// session exists — and the session this client follows is chosen lazily, by the first
+    /// subscribing read. The drive-loop therefore starts with nothing to read and is fed a
+    /// subscription each time an anchor is pinned.
+    ///
+    /// UNBOUNDED because it carries one item per re-anchor, an event driven by this client's own
+    /// reconnects rather than by any peer, and because a bounded send that blocked would do so
+    /// while holding the anchor write lock.
+    subscriptions: mpsc::UnboundedSender<FrameSubscription>,
     request_timeout: Duration,
 }
 
@@ -111,6 +123,13 @@ pub struct PooledFetcher {
 pub(super) struct Anchor {
     pub(super) peer: Peer,
     pub(super) address: SocketAddr,
+    /// The pooled session this anchor is pinned to, ADDRESS AND SESSION.
+    ///
+    /// The session half is what separates this connection from a replacement dialled to the same
+    /// address. An anchor identified by address alone is torn down by its own predecessor's
+    /// `SessionEnded`, which arrives whenever the dead connection's transport finally closes —
+    /// after the pool has already ejected it and refilled the slot.
+    pub(super) source: FrameSource,
     /// How the pool reached this peer. Held so the provider can say whether its answers come from
     /// an operator-preferred node or a discovered one, which is the fact
     /// [`ProviderKind`](dig_chainsource_interface::ProviderKind) exists to carry — and which
@@ -120,11 +139,17 @@ pub(super) struct Anchor {
 
 impl PooledFetcher {
     /// Builds a fetcher drawing sessions from `backend`, bounding every request with
-    /// `request_timeout`.
-    pub(super) fn new(backend: Arc<PeerBackend>, request_timeout: Duration) -> Self {
+    /// `request_timeout`, and handing each newly pinned session's frame subscription to
+    /// `subscriptions`.
+    pub(super) fn new(
+        backend: Arc<PeerBackend>,
+        request_timeout: Duration,
+        subscriptions: mpsc::UnboundedSender<FrameSubscription>,
+    ) -> Self {
         Self {
             backend,
             anchor: Arc::new(RwLock::new(None)),
+            subscriptions,
             request_timeout,
         }
     }
@@ -133,6 +158,14 @@ impl PooledFetcher {
     ///
     /// Written under the same lock the read takes, so two concurrent subscribing reads cannot pin
     /// two different sessions and split the subscription set between them.
+    ///
+    /// **Pinning and FOLLOWING happen together, under that one lock.** The frame subscription names
+    /// the session (chia-query#34), so opening it here is what guarantees the drive-loop follows
+    /// exactly the connection the subscribing reads are about to be issued on — rather than an
+    /// address that may already hold a different one. A pool that no longer has a live session at
+    /// the picked address REFUSES to anchor: pinning a dead session would arm subscriptions on a
+    /// connection nothing will ever push to, and the cache would go quietly stale while every
+    /// surface reported it healthy.
     pub(super) async fn anchor(&self) -> Result<Anchor, LightClientError> {
         let mut slot = self.anchor.write().await;
         if let Some(existing) = slot.as_ref() {
@@ -149,11 +182,22 @@ impl PooledFetcher {
             .origin_of(address)
             .await
             .ok_or(LightClientError::NotConnected)?;
+        let subscription = self
+            .backend
+            .subscribe_frames(address, super::FRAME_BUFFER)
+            .await
+            .ok_or(LightClientError::NotConnected)?;
         let anchor = Anchor {
             peer,
             address,
             origin,
+            source: subscription.source(),
         };
+        // A send failure means the drive-loop is gone, which happens only as the client is dropped.
+        // The anchor is still valid for the reads in flight, so this is logged rather than failed.
+        if self.subscriptions.send(subscription).is_err() {
+            log::debug!("light-client drive-loop has stopped; anchor {address} will not be followed");
+        }
         *slot = Some(anchor.clone());
         Ok(anchor)
     }
@@ -163,17 +207,30 @@ impl PooledFetcher {
         self.anchor.read().await.clone()
     }
 
-    /// The address of the currently pinned session, if any.
-    pub(super) async fn anchor_address(&self) -> Option<SocketAddr> {
-        self.anchor.read().await.as_ref().map(|a| a.address)
+    /// The currently pinned SESSION, if any.
+    pub(super) async fn anchor_source(&self) -> Option<FrameSource> {
+        self.anchor.read().await.as_ref().map(|a| a.source)
     }
 
-    /// Unpins the anchor if it is still the session at `address`, so the next subscribing read
-    /// re-anchors.
+    /// Unpins the anchor if it is still `source`, so the next subscribing read re-anchors.
     ///
-    /// Guarded on the address rather than clearing unconditionally: a `SessionEnded` for a peer
-    /// that is no longer the anchor must not tear down a healthy anchor pinned since.
-    pub(super) async fn release_anchor(&self, address: SocketAddr) {
+    /// Guarded on the whole [`FrameSource`] rather than on the address: a `SessionEnded` belonging
+    /// to a session that is no longer the anchor must not tear down a healthy anchor pinned since,
+    /// and after a reconnect the replacement frequently sits at the SAME address — so an
+    /// address-only guard would let a dead connection's parting frame unpin its live successor.
+    pub(super) async fn release_anchor(&self, source: FrameSource) {
+        let mut slot = self.anchor.write().await;
+        if slot.as_ref().is_some_and(|a| a.source == source) {
+            *slot = None;
+        }
+    }
+
+    /// Unpins the anchor if it is held at `address`, whatever session that is.
+    ///
+    /// For the FAILED-READ path, where the address is all the failure names: a read that could not
+    /// be served by the connection at `address` must not leave the anchor pointing there, and the
+    /// only session this client could have been reading is the one it had pinned.
+    pub(super) async fn release_anchor_at(&self, address: SocketAddr) {
         let mut slot = self.anchor.write().await;
         if slot.as_ref().is_some_and(|a| a.address == address) {
             *slot = None;
@@ -200,7 +257,7 @@ impl PooledFetcher {
     /// connection and the drive-loop would follow a source that never speaks again.
     async fn discard(&self, address: SocketAddr) {
         self.backend.pool.eject_peer(address).await;
-        self.release_anchor(address).await;
+        self.release_anchor_at(address).await;
     }
 
     /// The height-0 `header_hash` the peer protocol requires (`Bytes32::default()` is rejected).
