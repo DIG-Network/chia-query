@@ -1296,6 +1296,17 @@ impl PeerPool {
         self.admitted(peer, address, origin).await
     }
 
+    /// Publish `frame` on `source`, exactly as that session's reader task would.
+    ///
+    /// A test that needs a subscriber to actually RECEIVE something has no other way in: frames are
+    /// produced by the reader task from a live peer's socket, and the fixture peers speak no
+    /// wallet protocol. Wrapping the fan-out rather than exposing it keeps
+    /// [`spawn_receiver_handler`](Self::spawn_receiver_handler)'s one-path claim on attribution
+    /// intact.
+    pub(crate) async fn publish_for_tests(&self, source: FrameSource, frame: PoolFrame) {
+        self.fanout.publish(source, frame).await;
+    }
+
     /// Admit a connection under a freshly allocated session, reporting only whether it was taken.
     ///
     /// Production admits through [`admit_and_follow`](Self::admit_and_follow), which also starts

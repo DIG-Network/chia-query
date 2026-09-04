@@ -32,6 +32,7 @@
 //! by the registry that composes it.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,6 +116,21 @@ pub struct PooledFetcher {
     /// reconnects rather than by any peer, and because a bounded send that blocked would do so
     /// while holding the anchor write lock.
     subscriptions: mpsc::UnboundedSender<FrameSubscription>,
+    /// Whether the subscription set is NO LONGER armed on a session this client is following.
+    ///
+    /// **Lives here, beside the anchor, because every way the set can come unarmed is an UNPIN of
+    /// the anchor** — and a flag kept anywhere else has to be remembered at each of those sites.
+    /// It was previously held by [`ChiaLightClient`](super::ChiaLightClient) and written only by
+    /// the drive-loop, so the FAILED-READ path ([`discard`](Self::discard), reached from all seven
+    /// read sites) unpinned the anchor and set nothing: from that moment the drive-loop followed
+    /// nothing, every frame failed [`follows`](super::follows), and the cache froze while
+    /// [`needs_rearm`](Self::needs_rearm) still answered "armed" (chia-query#59).
+    ///
+    /// Set on any real unpin, cleared only by a COMPLETED
+    /// [`reconnect`](super::ChiaLightClient::reconnect). Erring towards set costs a redundant
+    /// re-subscription; erring the other way costs a silently stale cache, which is the failure
+    /// this whole signal exists to make visible.
+    rearm_needed: Arc<AtomicBool>,
     request_timeout: Duration,
 }
 
@@ -150,8 +166,19 @@ impl PooledFetcher {
             backend,
             anchor: Arc::new(RwLock::new(None)),
             subscriptions,
+            rearm_needed: Arc::new(AtomicBool::new(false)),
             request_timeout,
         }
+    }
+
+    /// Whether the subscription set needs re-arming — see [`rearm_needed`](Self::rearm_needed).
+    pub(super) fn needs_rearm(&self) -> bool {
+        self.rearm_needed.load(Ordering::Acquire)
+    }
+
+    /// Records that the subscription set has been re-armed on the current anchor.
+    pub(super) fn clear_rearm(&self) {
+        self.rearm_needed.store(false, Ordering::Release);
     }
 
     /// The pinned session, drawn from the pool and recorded on first use.
@@ -220,10 +247,18 @@ impl PooledFetcher {
     /// to a session that is no longer the anchor must not tear down a healthy anchor pinned since,
     /// and after a reconnect the replacement frequently sits at the SAME address — so an
     /// address-only guard would let a dead connection's parting frame unpin its live successor.
+    /// Unpinning ASKS FOR A RE-ARM, and does so here rather than at each call site. The
+    /// subscription set is server-side state on the session that was pinned, so losing the pin is
+    /// exactly the event that leaves it armed nowhere this client is reading from.
+    ///
+    /// Guarded on an ACTUAL unpin, not attempted unconditionally: a `SessionEnded` from a session
+    /// this client already replaced does not unpin anything, and reporting a re-arm for it would
+    /// undo one that had just succeeded.
     pub(super) async fn release_anchor(&self, source: FrameSource) {
         let mut slot = self.anchor.write().await;
         if slot.as_ref().is_some_and(|a| a.source == source) {
             *slot = None;
+            self.rearm_needed.store(true, Ordering::Release);
         }
     }
 
@@ -232,10 +267,14 @@ impl PooledFetcher {
     /// For the FAILED-READ path, where the address is all the failure names: a read that could not
     /// be served by the connection at `address` must not leave the anchor pointing there, and the
     /// only session this client could have been reading is the one it had pinned.
+    /// Like [`release_anchor`](Self::release_anchor), this ASKS FOR A RE-ARM when it really unpins.
+    /// A failed read leaves the subscription set armed on a session nothing is reading any more,
+    /// which is indistinguishable from a quiet chain unless it is reported (chia-query#59).
     pub(super) async fn release_anchor_at(&self, address: SocketAddr) {
         let mut slot = self.anchor.write().await;
         if slot.as_ref().is_some_and(|a| a.address == address) {
             *slot = None;
+            self.rearm_needed.store(true, Ordering::Release);
         }
     }
 
