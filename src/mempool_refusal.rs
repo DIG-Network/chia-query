@@ -163,7 +163,10 @@ mod tests {
         for name in BUNDLE_INTRINSIC_REFUSALS {
             assert!(is_bundle_intrinsic_refusal(name), "{name}");
             assert!(is_bundle_intrinsic_refusal(&name.to_lowercase()), "{name}");
-            assert!(is_bundle_intrinsic_refusal(&format!("  {name}  ")), "{name}");
+            assert!(
+                is_bundle_intrinsic_refusal(&format!("  {name}  ")),
+                "{name}"
+            );
         }
     }
 

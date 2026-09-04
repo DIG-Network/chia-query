@@ -790,7 +790,7 @@ impl PeerPool {
     /// thing. Without it, two entries on one machine would both be asked and both could agree,
     /// producing an `agreed` tally above the number of independent voices the pool actually holds —
     /// a floor cleared by one peer answering twice.
-    fn corroborators<'a>(entries: &'a [PeerEntry], asked: SocketAddr) -> Vec<&'a PeerEntry> {
+    fn corroborators(entries: &[PeerEntry], asked: SocketAddr) -> Vec<&PeerEntry> {
         let mut hosts = std::collections::HashSet::new();
         entries
             .iter()
@@ -2373,8 +2373,12 @@ mod tests {
 
         for octet in [1u8, 2, 3] {
             assert!(
-                pool.admit_for_tests(loopback_peer().await, address(octet), PeerOrigin::Discovered)
-                    .await
+                pool.admit_for_tests(
+                    loopback_peer().await,
+                    address(octet),
+                    PeerOrigin::Discovered
+                )
+                .await
             );
         }
 
@@ -2417,7 +2421,10 @@ mod tests {
         );
         assert!(matches!(
             pool.corroboration_readiness(asked).await,
-            CorroborationReadiness::Insufficient { corroborators: 1, .. }
+            CorroborationReadiness::Insufficient {
+                corroborators: 1,
+                ..
+            }
         ));
         assert_eq!(
             pool.corroboration_readiness(asked).await,

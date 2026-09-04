@@ -196,7 +196,9 @@ impl PooledFetcher {
         // A send failure means the drive-loop is gone, which happens only as the client is dropped.
         // The anchor is still valid for the reads in flight, so this is logged rather than failed.
         if self.subscriptions.send(subscription).is_err() {
-            log::debug!("light-client drive-loop has stopped; anchor {address} will not be followed");
+            log::debug!(
+                "light-client drive-loop has stopped; anchor {address} will not be followed"
+            );
         }
         *slot = Some(anchor.clone());
         Ok(anchor)

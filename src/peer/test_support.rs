@@ -89,12 +89,8 @@ pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
         .to_bytes()
         .expect("a RespondPuzzleState is streamable");
     scripted_peer(move |request| {
-        (request.msg_type == ProtocolMessageTypes::RequestPuzzleState).then(|| {
-            (
-                ProtocolMessageTypes::RespondPuzzleState,
-                body.clone(),
-            )
-        })
+        (request.msg_type == ProtocolMessageTypes::RequestPuzzleState)
+            .then(|| (ProtocolMessageTypes::RespondPuzzleState, body.clone()))
     })
     .await
     .0
@@ -181,7 +177,7 @@ where
             };
             if ws
                 .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    response.to_bytes().expect("a Message is streamable").into(),
+                    response.to_bytes().expect("a Message is streamable"),
                 ))
                 .await
                 .is_err()

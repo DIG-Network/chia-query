@@ -109,11 +109,7 @@ fn total_pushes(peers: &[Scripted]) -> usize {
 /// transaction was not accepted, and `dig-wallet` then held its inputs reserved for the full TTL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_view_dependent_refusal_is_retried_and_the_admission_wins() {
-    let (router, peers) = router_over(vec![
-        (PENDING, Some(VIEW_DEPENDENT)),
-        (SUCCESS, None),
-    ])
-    .await;
+    let (router, peers) = router_over(vec![(PENDING, Some(VIEW_DEPENDENT)), (SUCCESS, None)]).await;
 
     let status = router.push_tx(&bundle()).await.expect("a peer answered");
 
@@ -122,7 +118,10 @@ async fn a_view_dependent_refusal_is_retried_and_the_admission_wins() {
         MempoolInclusion::Admitted,
         "a peer that ADMITTED the bundle outranks a peer that refused it on its own fee policy"
     );
-    assert!(status.success, "and the boolean must agree with the verdict");
+    assert!(
+        status.success,
+        "and the boolean must agree with the verdict"
+    );
     assert_eq!(
         total_pushes(&peers),
         2,
