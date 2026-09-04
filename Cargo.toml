@@ -1,6 +1,6 @@
 [package]
 name = "chia-query"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 description = "Query the Chia blockchain via decentralized peers with coinset.org fallback"
 license = "MIT"
@@ -71,7 +71,15 @@ chia-puzzle-types = { version = "0.36", optional = true }
 clvm-traits = { version = "0.36", optional = true }
 clvm-utils = { version = "0.36", optional = true }
 # The canonical `ChainSource` provider interface chia-query implements + aggregates.
-dig-chainsource-interface = { version = "0.3", optional = true }
+#
+# `lineage-walk` supplies the ONE canonical launcher -> tip singleton walk. It is non-default in the
+# dependency because it pulls a CLVM evaluator, and it is enabled HERE because `ChiaQueryProvider`
+# serves `resolve_singleton_lineage` -- the trait's only method with no default body, and its most
+# trust-critical. Without it this crate had to hand-roll the walk, and the hand-rolled copy fed only
+# `coin_spend` into it, so it could not tell an unspent tip from a coin the source never knew and
+# returned unverified successors as live state (#28). The whole dependency sits inside `native`, so
+# the CLVM evaluator never reaches the wasm `coinset` build.
+dig-chainsource-interface = { version = "0.3", features = ["lineage-walk"], optional = true }
 clvmr = { version = "0.16", optional = true }
 chia-wallet-sdk = { version = "0.36", features = ["native-tls"], optional = true }
 # Generates the peer TLS client identity in memory, so a query client never needs a

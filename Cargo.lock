@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",
@@ -1141,6 +1141,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6557b694429aa9a27ccf6a079853471826f17b9e71ff167711132fa51907b9d"
 dependencies = [
  "chia-protocol",
+ "chia-puzzle-types",
+ "chia-puzzles",
+ "chia-sdk-driver",
+ "chia-sdk-types",
+ "clvm-traits 0.36.1",
+ "clvm-utils",
+ "clvmr",
  "thiserror 2.0.20",
 ]
 
