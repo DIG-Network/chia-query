@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-09-04
+
+### Bug Fixes
+- **pool:** Batch the open chia-query tickets (#52)
+
 ## [0.20.1] - 2026-09-04
 
 ### Documentation
