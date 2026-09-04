@@ -60,7 +60,7 @@ const FILL_ROUNDS: usize = PRIORITY_SLOTS + 2;
 /// [`QUORUM_SAMPLE`](super::plurality::QUORUM_SAMPLE); this widens the CANDIDATE set only, so the
 /// number of independent voices the pool ends up holding is unchanged and only their identity
 /// differs.
-const DIAL_OVERSUBSCRIPTION: usize = 2;
+pub(crate) const DIAL_OVERSUBSCRIPTION: usize = 2;
 
 /// How many dials to open when `wanted` slots remain.
 ///
