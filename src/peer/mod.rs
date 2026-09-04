@@ -815,8 +815,8 @@ impl PeerBackend {
 
     // -- peak height (from tracked NewPeakWallet messages) ------------------
 
-    pub fn peak_height(&self) -> u32 {
-        self.pool.peak_height()
+    pub async fn peak_height(&self) -> u32 {
+        self.pool.peak_height().await
     }
 
     // =======================================================================

@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use chia_protocol::{CoinStateUpdate, Message, NewPeakWallet, ProtocolMessageTypes};
+use chia_protocol::{
+    Bytes32, CoinStateUpdate, HeaderBlock, Message, NewPeakWallet, ProtocolMessageTypes,
+    RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader,
+};
 use chia_traits::Streamable;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, RwLock};
@@ -167,9 +170,9 @@ struct PeerEntry {
     origin: connect::PeerOrigin,
     /// The highest peak THIS peer has announced, or 0 before it has announced any.
     ///
-    /// The pool's shared `peak_height` is a `fetch_max` across every session, so it answers "how
-    /// high is the chain" and can never say which peer is behind. Lag is a per-peer fact and needs
-    /// a per-peer number.
+    /// [`PeerPool::peak_height`] and [`PeerPool::evict_lagging_peers`] both derive their answer
+    /// from the collection of every entry's value here, recomputed on each call — never from a
+    /// single shared counter, which is what let one peer's claim outlive the peer itself (#51).
     ///
     /// An `Arc<AtomicU32>` because the only writer is the entry's receiver-handler task, which
     /// runs detached and cannot take the pool's write lock. It is cloned into that task at
@@ -227,14 +230,11 @@ pub struct PeerPool {
     tls: Connector,
     network: NetworkType,
     connect_timeout: Duration,
-    /// Latest peak height observed from any connected peer's NewPeakWallet
-    /// messages.  Updated in the background by receiver handler tasks.
-    peak_height: Arc<AtomicU32>,
     /// Fans every inbound frame out to the pool's subscribers.
     ///
-    /// The atomic above answers "how high is the chain"; this carries the frames THEMSELVES, which
-    /// is what a consumer following coin states needs and what its absence forced into a second
-    /// dialled session (dig_ecosystem#2761).
+    /// [`peak_height`](Self::peak_height) answers "how high is the chain"; this carries the
+    /// frames THEMSELVES, which is what a consumer following coin states needs and what its
+    /// absence forced into a second dialled session (dig_ecosystem#2761).
     fanout: Arc<FrameFanout>,
     /// Sessions that have STOPPED, waiting to be ejected on the next maintenance pass.
     ///
@@ -266,7 +266,6 @@ impl PeerPool {
             tls,
             network,
             connect_timeout,
-            peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
             dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         };
@@ -416,10 +415,51 @@ impl PeerPool {
         true
     }
 
-    /// Latest peak height observed across all connected peers.
-    /// Returns 0 if no peak has been received yet.
-    pub fn peak_height(&self) -> u32 {
-        self.peak_height.load(Ordering::Relaxed)
+    /// The chain's peak, as agreed by the peers this pool holds. Returns 0 if no peer has
+    /// announced one yet.
+    ///
+    /// The [`reference_peak`] median of every held peer's [`PeerEntry::last_peak`], RECOMPUTED on
+    /// every call rather than latched behind a shared counter (#51).
+    ///
+    /// # Why a latched maximum was a permanent denial-of-service primitive
+    ///
+    /// This used to be a single `Arc<AtomicU32>` advanced with `fetch_max` from every session's
+    /// `NewPeakWallet`. That makes the value MONOTONIC and UNBOUNDED: one connected peer sending
+    /// `height: u32::MAX` once pins it there for the life of the pool, because nothing can lower a
+    /// `fetch_max` and no later honest announcement is ever larger. Every downstream freshness
+    /// claim in `dig-wallet` reads this number, so a single frame from a single dialled — and
+    /// under NC-12, UNTRUSTED — peer could permanently disable the "am I synced" answer for the
+    /// whole node.
+    ///
+    /// The median already computed for lag eviction (below) does not have this defect: it is
+    /// recomputed from the LIVE entries on every call, so
+    ///
+    /// - **one implausible claim cannot pin it** — moving a lower median upward needs more than
+    ///   half the announced peaks to agree, exactly [`reference_peak`]'s existing NC-12 guarantee;
+    /// - **it recovers on its own** — once the offending peer is gone (evicted, cycled, or simply
+    ///   disconnected), the very next call recomputes over whoever remains, with no separate
+    ///   "reset" logic to get wrong;
+    /// - **an ordinary advancing chain still moves it** — every peer's `last_peak` keeps climbing,
+    ///   so the median climbs with them.
+    ///
+    /// # Every origin counts here, unlike eviction's voters
+    ///
+    /// [`evict_lagging_peers`](Self::evict_lagging_peers) deliberately excludes `Priority` peers
+    /// from the vote, because letting an operator's own node decide who else gets evicted is a
+    /// side door around `independent_peer_count`. That concern does not apply to this READ: a
+    /// solo node that only holds its `TRUSTED_FULLNODE`/loopback priority connections is a normal,
+    /// supported configuration, and it must still see a peak. Excluding `Priority` here would
+    /// silently zero this out for exactly that setup, so the median is taken over every entry that
+    /// has announced, priority and discovered alike — the same population the old `fetch_max`
+    /// drew from.
+    pub async fn peak_height(&self) -> u32 {
+        let entries = self.entries.read().await;
+        let announced: Vec<u32> = entries
+            .iter()
+            .map(|e| e.last_peak.load(Ordering::Relaxed))
+            .filter(|peak| *peak > 0)
+            .collect();
+        reference_peak(&announced).unwrap_or(0)
     }
 
     /// Round-robin select a peer from the pool.
@@ -862,7 +902,6 @@ impl PeerPool {
         mut receiver: mpsc::Receiver<Message>,
         last_peak: Arc<AtomicU32>,
     ) {
-        let peak = Arc::clone(&self.peak_height);
         let fanout = Arc::clone(&self.fanout);
         let dead_sessions = Arc::clone(&self.dead_sessions);
 
@@ -881,8 +920,7 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
-                        last_peak.fetch_max(new_peak.height, Ordering::Relaxed);
-                        let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
+                        let prev = last_peak.fetch_max(new_peak.height, Ordering::Relaxed);
                         if new_peak.height > prev {
                             log::debug!(
                                 "new peak from peer {}: {}",
@@ -991,7 +1029,6 @@ impl PeerPool {
             tls: connect::create_generated_tls().expect("generate a TLS identity"),
             network: NetworkType::Mainnet,
             connect_timeout: Duration::from_millis(1),
-            peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
             dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -2094,6 +2131,132 @@ mod tests {
         assert!(
             pool.held_addresses_for_tests().await.contains(&address(4)),
             "a peer exactly at the tolerance must survive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // peak_height(): a recomputed median, not a latched maximum (#51)
+    // -----------------------------------------------------------------------
+
+    /// **Proves (#51):** one peer announcing an implausible height cannot pin the pool's
+    /// AGGREGATE peak, the way the old `fetch_max` latch could.
+    ///
+    /// Three peers agree on `CURRENT`; a fourth claims `u32::MAX`. The old implementation
+    /// returned `u32::MAX` forever, from the moment that single frame arrived. The median-based
+    /// aggregate needs more than half the announced peaks to agree before it can move upward, so
+    /// one liar among four honest voices is outvoted.
+    #[tokio::test]
+    async fn one_peer_claiming_an_implausible_peak_cannot_pin_the_aggregate() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, u32::MAX]).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "the honest majority's height wins over one absurd claim, not the claim itself"
+        );
+    }
+
+    /// **Proves (#51):** the aggregate RECOVERS once the offending peer is gone.
+    ///
+    /// Without this test the first could pass while the value stayed permanently wrong in some
+    /// OTHER way a latch-based fix might introduce (e.g. a one-shot "reject and remember"
+    /// mitigation that never reconsiders). Recomputing from live entries on every call means
+    /// eviction alone is sufficient recovery, with no separate reset path to get wrong.
+    #[tokio::test]
+    async fn the_aggregate_recovers_once_the_offending_peer_is_gone() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, u32::MAX]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+
+        // The liar leaves (eject_peer is what a failed request or a protocol violation drives;
+        // reused directly here since this test is about the aggregate, not the ejection trigger).
+        pool.eject_peer(address(4)).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "still correct with the liar gone"
+        );
+
+        // The three honest peers also leave (as a rotation or a batch of failures would remove
+        // them) and are replaced by peers reporting a genuinely higher, honest peak — proving the
+        // aggregate is LIVE, not merely resistant: it must move for a real reason, not just hold
+        // steady after an eviction.
+        for addr in [address(1), address(2), address(3)] {
+            pool.eject_peer(addr).await;
+        }
+        let advanced = CURRENT + 1_000;
+        for i in 1..=3u8 {
+            pool.admit_at_peak_for_tests(
+                loopback_peer().await,
+                address(i + 10),
+                PeerOrigin::Discovered,
+                advanced,
+            )
+            .await;
+        }
+        assert_eq!(
+            pool.peak_height().await,
+            advanced,
+            "the aggregate tracks a genuinely advancing chain after recovery"
+        );
+    }
+
+    /// **Proves (#51):** an ordinary, honestly advancing chain still moves the aggregate normally
+    /// — the bound must not be so tight that a healthy pool stops tracking its own peers.
+    #[tokio::test]
+    async fn an_ordinary_advancing_chain_still_moves_the_aggregate() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+
+        // All three peers report a new, higher peak (as `NewPeakWallet` would drive via
+        // `last_peak.fetch_max`) — simulated here by admitting a fresh set at the new height,
+        // since the fixture helper only sets a peak at admission time.
+        let advanced = pool_at_peaks(5, &[CURRENT + 10, CURRENT + 10, CURRENT + 10]).await;
+        assert_eq!(
+            advanced.peak_height().await,
+            CURRENT + 10,
+            "the whole pool advancing together moves the aggregate with it"
+        );
+    }
+
+    /// **Control:** a pool with a single announced peak — the solo-priority-node case — still
+    /// reports it. The median over a one-element set is that element itself, so a host running
+    /// only its own `TRUSTED_FULLNODE`/loopback connection is unaffected by this change.
+    #[tokio::test]
+    async fn a_single_announced_peak_is_reported_as_is() {
+        let pool = pool_at_peaks(5, &[CURRENT]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+    }
+
+    /// **Control:** a pool where nobody has announced anything yet reports 0, exactly as the old
+    /// latch did before its first `NewPeakWallet`.
+    #[tokio::test]
+    async fn no_announcement_yet_reports_zero() {
+        let pool = empty_pool(5);
+        assert_eq!(pool.peak_height().await, 0);
+    }
+
+    /// **Proves (#51):** `Priority` peers still count toward the aggregate, unlike the eviction
+    /// vote (#42) which deliberately excludes them. A solo node reading only through its trusted
+    /// full node must still see a peak — excluding `Priority` here would silently zero it out for
+    /// that supported configuration.
+    #[tokio::test]
+    async fn a_priority_only_pool_still_reports_a_peak() {
+        let pool = empty_pool(5);
+        assert!(
+            pool.admit_at_peak_for_tests(
+                loopback_peer().await,
+                address(1),
+                PeerOrigin::Priority,
+                CURRENT,
+            )
+            .await
+        );
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "a priority-only pool (e.g. TRUSTED_FULLNODE + loopback) still reports its peak"
         );
     }
 

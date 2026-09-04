@@ -623,7 +623,7 @@ async fn parity_all() {
     // =======================================================================
     eprintln!("--- get_blockchain_state (peak) ---");
     {
-        let peer_peak = peer.peak_height();
+        let peer_peak = peer.peak_height().await;
         let diff = (peak as i64 - peer_peak as i64).unsigned_abs();
         assert!(
             diff < 50,

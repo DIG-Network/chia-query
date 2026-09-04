@@ -849,7 +849,7 @@ impl QueryRouter {
             }
         }
         // Fallback: return a minimal state from the peer-tracked peak.
-        let peak = self.peer.peak_height();
+        let peak = self.peer.peak_height().await;
         if peak == 0 {
             return Err(ChiaQueryError::PeerConnection(
                 "no peak observed from peers yet".into(),
