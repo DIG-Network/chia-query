@@ -492,10 +492,11 @@ read, which is the fail-safe direction.
 
 #### Frame fan-out
 
-A pooled session's inbound frames are fanned out to subscribers over BOUNDED per-subscriber
-channels (`subscribe_frames(capacity)`). Every delivered frame is a `SourcedFrame`: a `PoolFrame`
-paired with the `FrameSource` that produced it — the peer `SocketAddr` this process DIALLED,
-together with a `SessionId`.
+A pooled session's inbound frames are fanned out to subscribers over BOUNDED channels partitioned
+BY SOURCE. A subscription is opened on ONE session (`subscribe_frames(address, capacity)`, which
+answers `None` when no live session is held at `address`) and receives only that session's frames.
+Every delivered frame is a `SourcedFrame`: a `PoolFrame` paired with the `FrameSource` that produced
+it — the peer `SocketAddr` this process DIALLED, together with a `SessionId`.
 
 - `SessionId` is drawn from a monotonic counter at the moment the pool allocates a session. It is
   never reused, never derived from anything a peer sends, and a reconnect to the same address
@@ -503,13 +504,28 @@ together with a `SessionId`.
 - A session MUST be announced by `PoolFrame::Reset` before its first frame and closed by
   `PoolFrame::SessionEnded` after its last. `Reset` carries no generation of its own; the session
   it announces is named by the `FrameSource` on the frame.
-- **A subscriber receives the frames of EVERY held session, not only the one it follows.** `Reset`
-  in particular is published to all subscribers, so a subscriber that tracks one peer MUST filter
-  on `FrameSource` — matching both address and `SessionId` — before acting on a frame. A subscriber
-  that clears its state on any `Reset` will discard it when an unrelated peer reconnects.
+- **A subscription receives ONLY the frames of the session it was opened on.** Frames from any
+  other held peer MUST NOT be queued to it. Delivering them was a cross-peer denial primitive: the
+  frames counted against the subscriber's bound, so an unfollowed peer could overflow the queue and
+  END a subscription it was never chosen for. It was also useless work — a subscriber is already
+  REQUIRED to discard every other peer's frames (rule 5h) — so the fan-out queued frames the
+  contract obliges the consumer to throw away, then terminated the consumer for receiving them.
+- A subscription MUST be announced to its own subscriber by a `Reset` before any other frame, even
+  when the session was already running when it was opened, and MUST end after that session's
+  `SessionEnded`. A subscription binds a SESSION, not an address: a reconnect to the same address is
+  a different source and MUST NOT reach a subscription opened on its predecessor.
+- A session that has already ENDED MUST NOT be subscribable. Its `SessionEnded` was published before
+  the subscription existed, so a subscriber would wait forever for an end frame that has gone —
+  silence it would read as a quiet chain.
 - A subscriber whose channel is FULL MUST have its subscription TERMINATED. Dropping a frame and
   continuing is FORBIDDEN: a missed `CoinStateUpdate` is a spend the consumer never learns about, so
-  a replica goes on reporting itself synced while reading spent money as present.
+  a replica goes on reporting itself synced while reading spent money as present. This is unchanged,
+  and it now applies only to the frames of the peer the subscriber CHOSE.
+- A `CoinStateUpdate` carrying more than `MAX_FRAME_COIN_STATES` (100,000, the node's own
+  `max_subscribe_response_items` ceiling on one subscription response) MUST end the session with
+  `SessionEndReason::OversizedFrame`, and the frame MUST NOT be delivered. The bound is derived from
+  the protocol and errs LARGE deliberately: a per-block update is bounded far below it by block cost,
+  and a tighter number would terminate honest sessions during ordinary chain activity.
 
 #### DNS Introducers
 
@@ -718,6 +734,16 @@ struct ChiaQueryConfig {
 
 1. **Peers first**: Every request that has a peer protocol equivalent goes to `PeerBackend` first
 2. **Single retry on peer failure**: If a peer request fails, eject that peer, try one more peer. If that also fails, fall back to coinset.org
+2a. **Push refusal rule**: A push whose first peer REFUSES (`NotAdmitted`, `Failed` or `Unknown`)
+    with a reason that is NOT a bundle-intrinsic name MUST be transmitted ONCE more, to one other
+    held peer, WITHOUT ejecting the refuser. A refusal naming a bundle-intrinsic reason
+    (`mempool_refusal::BUNDLE_INTRINSIC_REFUSALS`, matched exactly and case-insensitively, never as
+    a substring) is FINAL. A push MUST NOT be transmitted to more than two peers, and coinset is a
+    fallback for TRANSPORT failure only — never for a refusal. An admission from either attempt
+    wins; otherwise a definitive refusal outranks a view-dependent one, and between two
+    view-dependent refusals the answer to the caller's own first transmission stands. A refusal is a
+    COMPLETED request with an answer, so rule 3 does not apply to it: ejecting on refusal would let
+    anyone holding a badly-fee'd bundle churn the pool's composition
 3. **Immediate ejection**: Any peer that fails a request or whose connection drops is removed from the pool immediately
 4. **Background replacement**: After ejecting a peer, spawn an async task to connect a new random peer -- do not block the current request
 5. **Pool size invariant**: The pool always targets `max_peers` connections. The `PeerBackend::read` path maintains the pool on every request, refilling it if below target
@@ -734,8 +760,10 @@ struct ChiaQueryConfig {
 5l. **Projection-after-agreement invariant**: A caller's `start_height`, `include_spent` filter, or
     item cap MUST be applied to the AGREED set, never to a source's answer before comparison, and the
     wire request MUST ask for spent coins regardless of the caller's filter
-5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it
-5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool
+5d. **Frame invariant**: A subscriber that overflows its bounded channel MUST be terminated, never served a stream with a gap in it. Only the frames of the session it FOLLOWS may count against that bound
+5e. **Frame attribution invariant**: Every frame delivered to a subscriber MUST name the session that produced it, by peer address and session id. A session MUST be announced by `Reset` before its first frame and closed by `SessionEnded` after its last, and a session that ends MUST have its peer ejected rather than left in the pool. A subscription opened mid-session MUST be announced by a `Reset` of its OWN, so the invariant holds per subscription and not merely per session
+5m. **Frame size invariant**: A `CoinStateUpdate` carrying more than `MAX_FRAME_COIN_STATES` items MUST end the session as `SessionEndReason::OversizedFrame` and MUST NOT be delivered. The bound MUST be derived from the protocol's own ceiling on one subscription response, never chosen as a round number
+5n. **Anchor-height invariant**: An as-of height taken from a peer's WIRE response (`RespondPuzzleState.height`) MUST be cross-checked against that peer's own announced peak, and the read REFUSED when the answer sits more than `PEAK_LAG_EVICTION` blocks below it, or when the peer has announced no peak at all. The round's common height is a `min`, so an unchecked low claim from one source normalises every honest answer to the empty set — and empty sets agree, which reports a corroborated absence of coins on the wallet-balance path. There MUST be no upper bound: overstating cannot lower the `min`, and bounding above would refuse an honest peer whose paged walk outran its last announcement
 5g. **Single-dialler invariant**: `peer::connect` is the ONLY place this ecosystem opens a Chia
     wallet-protocol connection, and `PeerPool` is the only thing that holds one. Every consumer that
     needs a session — the router, the light client, a wallet replica — BORROWS one. A component that
@@ -743,9 +771,13 @@ struct ChiaQueryConfig {
     what `chia-peer` was and why it was folded in here.
 5h. **Anchored-subscription invariant**: A subscription is server-side state on ONE connection, so a
     `subscribe = true` request MUST be issued on the subscriber's pinned session, and a subscriber
-    MUST apply only the frames whose `FrameSource.address` is that session's. Frames from any other
-    held peer MUST be discarded: `CoinStateUpdate` is an unsolicited push carrying no request id, so
-    an unattributed one is indistinguishable from a fabrication.
+    MUST apply only the frames of that session. Frames from any other held peer MUST be discarded:
+    `CoinStateUpdate` is an unsolicited push carrying no request id, so an unattributed one is
+    indistinguishable from a fabrication. The pool now enforces the same boundary from below — it
+    delivers a subscription only the frames of the session it was opened on — so this rule is what
+    the consumer owes on top of it, not a substitute for it. A consumer that PINS a session MUST
+    identify it by its whole `FrameSource`, address AND session id: an address alone cannot separate
+    a session from a replacement dialled to the same address, and a reconnect commonly is one.
 5i. **Paired-peak invariant**: A peak height and its header hash MUST reach a subscriber from the
     SAME message. `PoolFrame::CoinStates` therefore carries `peak_hash`; pairing a new height with a
     previously-held hash names a block that never existed at that height.
@@ -754,6 +786,8 @@ struct ChiaQueryConfig {
     an endpoint may still be answered by a discovered peer, and a descriptor that reports the
     configured intent describes a source it does not have.
 5f. **Local-discovery invariant**: An address reached through DNS discovery MUST be refused if it is loopback, private, link-local or unspecified in either family. Only the priority path may reach a host-local node, and what it reaches is recorded as `Priority`
+5o. **Independent-host invariant**: Independence is counted per HOST, not per connection. `independent_peer_count` MUST count distinct IP addresses among `Discovered` entries, and `select_corroborating_peers` MUST return at most one peer per IP and none sharing the answering peer's IP. Two connections to one machine are two usable read sources and ONE opinion; counting them twice lets a single voice clear `CORROBORATION_FLOOR` by agreeing with itself. The key is the IP and NOT the `/24` + `/48` `SubnetKey` used for dial spreading: that proxy over-groups, and on a gate that REFUSES rather than degrades, over-grouping converts availability into refusal and routes the read to the centralized tier — strictly worse than the Sybil case it would defend against. **Stated limitation**: a dual-stack host holds two IPs and is not separated by this key, nor by any address-derived one; only an identity key (the peer id derived from the session's TLS SPKI) can close that
+5p. **Disagreement invariant**: A source whose read FAILS is ejected (rule 3); a source that CONTRADICTS another MUST NOT be. Ejection answers a failed request and is indifferent to what the peer would have said, whereas a contradiction is a successful request whose answer this crate cannot adjudicate — it says exactly one of two sources is wrong and nothing about which. Ejecting on disagreement would let any peer evict honest ones by contradicting them, which is a limiter keyed on adversary-supplied input. The disagreement MUST be reported and MUST NOT be resolved
 5a. **Distinct-address invariant**: At most one connection per `SocketAddr` is held, decided under the write lock — see [Distinct admission](#distinct-admission). `max_peers` connections therefore mean `max_peers` distinct addresses, which is what makes the count meaningful as a measure of redundancy
 6. **Coinset-only endpoints**: Endpoints with no peer protocol equivalent (mempool queries, block count metrics, block spends with conditions, unfinished block headers) always go directly to `CoinsetBackend`. If coinset fallback is disabled, these return `ChiaQueryError::UnsupportedWithoutCoinset`
 7. **Thread safety**: `ChiaQuery` is `Send + Sync` -- all internal state is behind `Arc<Mutex<_>>` or `Arc<RwLock<_>>` as appropriate
@@ -1094,7 +1128,7 @@ is and its answer is returned on its own, anchored on coinset's own peak through
 | `coin_records_by_puzzle_hash` / `_puzzle_hashes` / `_hint` / `_hints` / `_names`, children | the set rule above |
 | `get_coin_record_by_name_opt`, `get_coin_spend_opt`, `get_puzzle_and_solution`, `get_block_record_by_height_opt` | the scalar `OptAnswer` rule |
 | `get_fee_estimate` | single-peer BY DESIGN: an estimate is one node's advice about a future mempool, not a claim about chain state, so there is no fact for a second source to agree with |
-| `push_tx` | single-peer BY DESIGN: a write has no pre-existing fact to corroborate |
+| `push_tx` | UNGRADED by design: a write has no pre-existing fact to corroborate. Each ATTEMPT is single-peer and neither grades the other; a view-dependent refusal earns exactly one more transmission (rule 2a), which is a second chance at admission and not a vote |
 | `get_block` / `get_block_by_height` / `get_block_spends*` / `get_additions_and_removals*` | single-peer BY DESIGN: these feed CLVM parsing whose output is bound to the block's own hashes |
 | `get_block_records(start, end)` | single-peer BY DESIGN for the RANGE form only: grading it would run one corroboration round per height. The single-height read is graded |
 

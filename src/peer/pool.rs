@@ -637,8 +637,10 @@ impl PeerPool {
     ///
     /// A corroborating peer must be two things at once, and neither alone is enough:
     ///
-    /// - **A different address than `asked`.** Asking the same connection twice returns the same
-    ///   opinion twice, which reads as agreement while being one voice.
+    /// - **A different HOST than `asked`.** Asking the same connection twice returns the same
+    ///   opinion twice, which reads as agreement while being one voice — and so does asking one
+    ///   machine over two of its ports, which is why the test is on the IP rather than the whole
+    ///   socket address (chia-query#27). At most one peer per host is returned for the same reason.
     /// - **[`PeerOrigin::Discovered`](connect::PeerOrigin).** A peer reached from a preferred
     ///   address - an operator's node, or one on this machine - is an excellent peer to READ from
     ///   and is not evidence about the chain independent of this host, exactly as
@@ -653,11 +655,9 @@ impl PeerPool {
     /// Returns an empty vector when the pool holds nobody who qualifies, which is the honest
     /// answer that there is nobody to corroborate with.
     pub async fn select_corroborating_peers(&self, asked: SocketAddr) -> Vec<(Peer, SocketAddr)> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|e| Self::is_corroborator(e, asked))
+        let entries = self.entries.read().await;
+        Self::corroborators(&entries, asked)
+            .into_iter()
             .map(|e| (e.peer.clone(), e.address))
             .collect()
     }
@@ -731,18 +731,72 @@ impl PeerPool {
     /// deciding whether enough separate sources agree MUST use this number, because counting a
     /// co-resident node as an independent voice is the thing that made a single local process able
     /// to look like a full peer set (dig_ecosystem#2648).
+    /// Counted by distinct HOST, not by distinct connection: see [`is_corroborator`] for why the
+    /// key is the IP and not the whole socket address.
+    ///
+    /// [`is_corroborator`]: Self::is_corroborator
     pub async fn independent_peer_count(&self) -> usize {
-        self.entries
-            .read()
-            .await
+        let entries = self.entries.read().await;
+        let mut hosts = std::collections::HashSet::new();
+        entries
             .iter()
             .filter(|e| e.origin == connect::PeerOrigin::Discovered)
+            .filter(|e| hosts.insert(e.address.ip()))
             .count()
     }
 
-    /// Whether a peer entry qualifies as a corroborator: not the answering peer, and discovered.
+    /// Whether a peer entry qualifies as a corroborator: a DIFFERENT HOST than the answering peer,
+    /// and discovered.
+    ///
+    /// # The key is the IP, not the whole `SocketAddr` (chia-query#27)
+    ///
+    /// [`admit`](Self::admit) refuses a duplicate `SocketAddr`, which guarantees two entries are
+    /// never one CONNECTION. It does not guarantee they are not one MACHINE: a host listening on
+    /// two ports seats two entries that both count as `Discovered`, and independence is the entire
+    /// load-bearing property here — absence is believed when two peers AGREE, and a corroborator on
+    /// the same machine as the first is one peer agreeing with itself. The canonical entry records
+    /// the sibling lesson from dig_ecosystem#2648: *"N sockets to one address is one answer counted
+    /// N times."* This is that, one layer out.
+    ///
+    /// # Why NOT the `/24` + `/48` [`SubnetKey`] this crate already has
+    ///
+    /// Deliberate, and the asymmetry is the general principle rather than a preference. The prefix
+    /// proxy is cheap on a SELECTING gate and expensive on a REFUSING one. [`SubnetKey`] earns its
+    /// keep in [`most_credible`]'s dial spreading, where over-grouping costs nothing — the round
+    /// simply picks a different candidate. Here the gate REFUSES rather than degrading, and
+    /// [`CORROBORATION_FLOOR`] is measured against a small `max_peers`, so an over-grouping key does
+    /// not weaken a heuristic: it converts availability into refusal, and a refusing node falls back
+    /// to the CENTRALIZED coinset tier. That is strictly worse than the Sybil case a prefix key
+    /// defends against, because it routes every read through one source rather than making one
+    /// adversary's several voices count as one. It is the "bound that starves the work it protects"
+    /// shape, on the read path that matters most.
+    ///
+    /// # The limitation this does NOT close, stated rather than implied
+    ///
+    /// A DUAL-STACK host is two different IPs — and two different [`SubnetKey`]s — so neither key
+    /// separates it. Only an identity-based key (the peer id derived from the session's TLS SPKI)
+    /// can, and that is a larger change tracked separately. This closes the multi-PORT case that
+    /// chia-query#27 names; it does not make independence unforgeable.
+    ///
+    /// [`SubnetKey`]: SubnetKey
+    /// [`most_credible`]: most_credible
     fn is_corroborator(entry: &PeerEntry, asked: SocketAddr) -> bool {
-        entry.address != asked && entry.origin == connect::PeerOrigin::Discovered
+        entry.address.ip() != asked.ip() && entry.origin == connect::PeerOrigin::Discovered
+    }
+
+    /// The corroborators for an answer given by `asked`, at most ONE per host.
+    ///
+    /// Deduping here as well as in [`is_corroborator`] is what keeps the COUNT and the SET the same
+    /// thing. Without it, two entries on one machine would both be asked and both could agree,
+    /// producing an `agreed` tally above the number of independent voices the pool actually holds —
+    /// a floor cleared by one peer answering twice.
+    fn corroborators<'a>(entries: &'a [PeerEntry], asked: SocketAddr) -> Vec<&'a PeerEntry> {
+        let mut hosts = std::collections::HashSet::new();
+        entries
+            .iter()
+            .filter(|e| Self::is_corroborator(e, asked))
+            .filter(|e| hosts.insert(e.address.ip()))
+            .collect()
     }
 
     /// Whether the pool can honestly attempt a CORROBORATED read of an answer given by `asked`.
@@ -764,13 +818,8 @@ impl PeerPool {
     /// [`CorroborationReadiness::Insufficient`] must decline the read, not proceed with fewer
     /// voices.
     pub async fn corroboration_readiness(&self, asked: SocketAddr) -> CorroborationReadiness {
-        let corroborators = self
-            .entries
-            .read()
-            .await
-            .iter()
-            .filter(|e| Self::is_corroborator(e, asked))
-            .count();
+        let entries = self.entries.read().await;
+        let corroborators = Self::corroborators(&entries, asked).len();
         if corroborators >= CORROBORATION_FLOOR {
             CorroborationReadiness::Armed { corroborators }
         } else {
@@ -2256,6 +2305,130 @@ mod tests {
             pool.held_addresses_for_tests().await,
             vec![address(1)],
             "the replacement session must survive its predecessor's death"
+        );
+    }
+
+    /// Two sockets on ONE host, which is what `admit`'s per-`SocketAddr` rule permits.
+    fn two_ports_on(last_octet: u8) -> (SocketAddr, SocketAddr) {
+        let host = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last_octet));
+        (SocketAddr::new(host, 8444), SocketAddr::new(host, 8445))
+    }
+
+    /// **One machine on two ports is ONE independent voice, not two (chia-query#27).**
+    ///
+    /// `admit` refuses a duplicate `SocketAddr`, which guarantees two entries are never one
+    /// CONNECTION — and says nothing about them being one MACHINE. Independence is the entire
+    /// load-bearing property of the corroboration floor: an absence is believed when two peers
+    /// AGREE, so a corroborator on the same host as the first is one peer agreeing with itself.
+    ///
+    /// The pool still HOLDS both, and that is deliberate. Two connections to one host are two
+    /// usable read sources; what they are not is two opinions. Asserting the peer count is
+    /// unchanged is what stops this fix from quietly becoming an admission rule.
+    #[tokio::test]
+    async fn one_host_on_two_ports_is_one_independent_voice() {
+        let pool = empty_pool(4);
+        let (first, second) = two_ports_on(7);
+
+        assert!(
+            pool.admit_for_tests(loopback_peer().await, first, PeerOrigin::Discovered)
+                .await
+        );
+        assert!(
+            pool.admit_for_tests(loopback_peer().await, second, PeerOrigin::Discovered)
+                .await,
+            "admission is per socket and stays that way: the second port is still a usable source"
+        );
+
+        assert_eq!(
+            pool.peer_count().await,
+            2,
+            "both connections are held — this is about counting VOICES, not about admission"
+        );
+        assert_eq!(
+            pool.independent_peer_count().await,
+            1,
+            "two ports on one machine are one independent opinion"
+        );
+        assert!(
+            pool.select_corroborating_peers(first).await.is_empty(),
+            "a peer on the SAME host cannot corroborate the answering one"
+        );
+        assert!(
+            matches!(
+                pool.corroboration_readiness(first).await,
+                CorroborationReadiness::Insufficient { .. }
+            ),
+            "and the readiness gate must refuse rather than arm on a voice counted twice"
+        );
+    }
+
+    /// The control: two DIFFERENT hosts are two voices.
+    ///
+    /// Without it, an independence count that answered 1 unconditionally — or a corroborator
+    /// selector that returned nothing — would satisfy the test above while disabling corroboration
+    /// entirely, which is the starving direction.
+    #[tokio::test]
+    async fn two_different_hosts_are_two_independent_voices() {
+        let pool = empty_pool(4);
+
+        for octet in [1u8, 2, 3] {
+            assert!(
+                pool.admit_for_tests(loopback_peer().await, address(octet), PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        assert_eq!(pool.independent_peer_count().await, 3);
+        assert_eq!(
+            pool.select_corroborating_peers(address(1)).await.len(),
+            2,
+            "the other two hosts corroborate the one that answered"
+        );
+        assert!(matches!(
+            pool.corroboration_readiness(address(1)).await,
+            CorroborationReadiness::Armed { corroborators: 2 }
+        ));
+    }
+
+    /// **The selected SET and the counted number are the same thing.**
+    ///
+    /// Two ports on one host, beside one genuinely separate host. A selector that deduped while the
+    /// readiness count did not — or the reverse — would let a round ask two entries that are one
+    /// machine and tally two agreements, clearing a floor of two with a single voice answering
+    /// twice. That is the failure this pins, and a fixture with only distinct hosts cannot see it.
+    #[tokio::test]
+    async fn a_host_answering_twice_cannot_clear_the_floor_on_its_own() {
+        let pool = empty_pool(4);
+        let asked = address(1);
+        let (twin_a, twin_b) = two_ports_on(9);
+
+        for addr in [asked, twin_a, twin_b] {
+            assert!(
+                pool.admit_for_tests(loopback_peer().await, addr, PeerOrigin::Discovered)
+                    .await
+            );
+        }
+
+        let selected = pool.select_corroborating_peers(asked).await;
+        assert_eq!(
+            selected.len(),
+            1,
+            "the two ports on one host must be offered as ONE corroborator: {selected:?}"
+        );
+        assert!(matches!(
+            pool.corroboration_readiness(asked).await,
+            CorroborationReadiness::Insufficient { corroborators: 1, .. }
+        ));
+        assert_eq!(
+            pool.corroboration_readiness(asked).await,
+            match pool.select_corroborating_peers(asked).await.len() {
+                n if n >= CORROBORATION_FLOOR => CorroborationReadiness::Armed { corroborators: n },
+                n => CorroborationReadiness::Insufficient {
+                    corroborators: n,
+                    required: CORROBORATION_FLOOR,
+                },
+            },
+            "corroboration_readiness and select_corroborating_peers must still agree exactly"
         );
     }
 

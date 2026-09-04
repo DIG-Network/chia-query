@@ -523,6 +523,28 @@ impl PeerBackend {
     /// Silence is not agreement. A corroborator whose read FAILS is ejected and does not count
     /// towards the floor, so a pool that has been quietly reduced to one voice reports
     /// `Uncorroborated` rather than corroborating against itself.
+    ///
+    /// # A peer that CONTRADICTS is kept, while one that goes SILENT is ejected
+    ///
+    /// The asymmetry is deliberate and it is decided here rather than left to look like an
+    /// oversight (chia-query#27). It reads backwards — the pool appears to punish unreachability and
+    /// tolerate contradiction — but the two events are not the same kind of thing. Ejection is the
+    /// response to a FAILED REQUEST (rule 3), and it is indifferent to what the peer would have
+    /// said; a disagreement is a request that SUCCEEDED, answered by a peer this crate has no way to
+    /// judge.
+    ///
+    /// Ejecting on disagreement would make the pool's composition a function of what peers claim,
+    /// which hands any peer a way to evict the honest ones: contradict them, and they leave. That is
+    /// a limiter keyed on adversary-supplied input, the same denial primitive this crate refuses
+    /// elsewhere — and it would be a worse deal than it looks, because the attacker chooses which
+    /// honest peers to displace while the pool refills from a set the attacker may also be in.
+    ///
+    /// Nor is there a right party to eject. A contradiction says exactly one of two sources is
+    /// wrong and nothing about WHICH, so any eviction rule built on it is a coin flip that removes
+    /// the honest peer half the time. Refusing to resolve the disagreement — which
+    /// [`SourcesDisagree`](ChiaQueryError::SourcesDisagree) does — is the only answer the evidence
+    /// supports, and carrying no pool-level memory of it is what keeps that refusal free of a side
+    /// effect an attacker would steer.
     async fn read_set_corroborated<T, F, Fut>(
         &self,
         read: F,

@@ -10,17 +10,40 @@ use std::net::SocketAddr;
 use chia_protocol::RespondPuzzleState;
 use chia_wallet_sdk::client::Peer;
 
+/// A loopback address no other peer built by these helpers will use.
+///
+/// **Each fixture peer gets its own IP, not merely its own PORT, and that is load-bearing.**
+/// Independence is counted per HOST (`PeerPool::is_corroborator`, chia-query#27), so a fixture whose
+/// "independent" peers all sit on `127.0.0.1` is modelling one machine answering several times —
+/// exactly the thing that count exists to refuse. Binding distinct `127.x.y.z` addresses keeps the
+/// fixture faithful to production, where every held peer is a different host.
+///
+/// The whole of `127.0.0.0/8` routes to loopback on Linux, macOS and Windows alike, so this is
+/// portable; it is verified by `two_fixture_peers_are_on_different_hosts` below.
+fn distinct_loopback_addr() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "127.{}.{}.{}:0",
+        (n >> 14) & 0xff,
+        (n >> 7) & 0x7f,
+        1 + (n & 0x7f)
+    )
+}
+
 /// A real [`Peer`] over a genuine loopback websocket.
 ///
-/// Each call binds a FRESH ephemeral port, so two peers built by two calls carry two distinct
-/// [`Peer::socket_addr`] values — which is what lets a test address them apart and give them
-/// different things to say. The returned peer is cloneable (`Peer` is an `Arc` inside), so the
-/// *same* connection can also be offered under several addresses when that is the shape under test.
+/// Each call binds a FRESH address — a distinct loopback IP as well as an ephemeral port — so two
+/// peers built by two calls are two distinct HOSTS as far as the pool's independence counting is
+/// concerned. The returned peer is cloneable (`Peer` is an `Arc` inside), so the *same* connection
+/// can also be offered under several addresses when that is the shape under test.
 pub(crate) async fn loopback_peer() -> Peer {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::MaybeTlsStream;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(distinct_loopback_addr())
         .await
         .expect("bind a loopback listener");
     let addr = listener.local_addr().expect("read the listener address");
@@ -126,7 +149,7 @@ where
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::MaybeTlsStream;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(distinct_loopback_addr())
         .await
         .expect("bind a loopback listener");
     let addr = listener.local_addr().expect("read the listener address");
@@ -199,4 +222,28 @@ pub(crate) fn address_v6(last_group: u16) -> SocketAddr {
         )),
         8444,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Two fixture peers are two HOSTS, not one host on two ports.**
+    ///
+    /// Every corroboration fixture in this crate rests on this: independence is counted per IP, so
+    /// peers sharing `127.0.0.1` would model one machine agreeing with itself and every such test
+    /// would be measuring the defect rather than the fix. It also pins that binding across
+    /// `127.0.0.0/8` actually works on the platforms CI runs, which is the assumption underneath.
+    #[tokio::test]
+    async fn two_fixture_peers_are_on_different_hosts() {
+        let first = loopback_peer().await;
+        let second = loopback_peer().await;
+
+        assert_ne!(
+            first.socket_addr().ip(),
+            second.socket_addr().ip(),
+            "fixture peers must differ by IP, not merely by port, or every independence test in \
+             this crate is vacuous"
+        );
+    }
 }
