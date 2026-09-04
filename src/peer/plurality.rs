@@ -62,6 +62,25 @@ pub const PEER_LIFETIME: Duration = Duration::from_secs(300);
 /// happen, so a consumer adopts THIS rather than restating it.
 pub const PEAK_LAG_TOLERANCE: u32 = 3;
 
+/// How far below the LOWEST as-of height in a round every population read is normalised.
+///
+/// **The same constant, with the same semantics, as `dig-wallet`'s
+/// `sage::quorum::SETTLED_LAG` / `common_height`.** It is restated here rather than re-derived so
+/// the two crates cannot drift into rival definitions of "a settled height" (CLAUDE.md §2.0,
+/// centralize rivals): dig-wallet subtracts it from the lowest CLAIMED PEAK of its sample, and
+/// [`set_agreement::common_height`](super::set_agreement::common_height) subtracts it from the
+/// lowest AS-OF height of the sources that answered. Both land the question at a height every
+/// source reached some time ago rather than one it reached this instant.
+///
+/// Two blocks, for the reason recorded there: without the margin the question sits exactly on the
+/// slowest source's tip, where that source is most likely to be mid-apply and where a one-block
+/// reorg — the common kind — still separates honest answers.
+///
+/// A crate adopting both this and [`PEAK_LAG_TOLERANCE`] must not let one stand in for the other:
+/// the tolerance decides which sources are worth asking, and this decides when the question is
+/// asked of them.
+pub const SETTLED_LAG: u32 = 2;
+
 /// How far a peer must trail the reference peak before the pool stops HOLDING it.
 ///
 /// Twice [`PEAK_LAG_TOLERANCE`], and derived from it rather than chosen: a peer just outside the

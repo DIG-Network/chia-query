@@ -5,6 +5,7 @@ pub mod light_client;
 pub mod ordering;
 pub mod plurality;
 pub mod pool;
+pub mod set_agreement;
 pub mod translate;
 
 #[cfg(test)]
