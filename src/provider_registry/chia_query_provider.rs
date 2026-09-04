@@ -128,7 +128,7 @@ impl ChainSource for ChiaQueryProvider {
     /// # Why the synchronous walk is sound behind this async-backed facade
     ///
     /// The walk drives `self`, whose reads each bridge to the router through
-    /// [`run_blocking`]. Those calls are SEQUENTIAL, not nested: this method is itself synchronous
+    /// `run_blocking`. Those calls are SEQUENTIAL, not nested: this method is itself synchronous
     /// and holds no `block_on` of its own, so each read enters and leaves the runtime cleanly. The
     /// per-walk wall-clock budget is `dig_chainsource_interface`'s
     /// [`DEFAULT_WALK_BUDGET`](dig_chainsource_interface::DEFAULT_WALK_BUDGET), checked between
@@ -152,5 +152,92 @@ impl ChainSource for ChiaQueryProvider {
 impl ChainSourceProvider for ChiaQueryProvider {
     fn provider_info(&self) -> ProviderInfo {
         self.info.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chia_protocol::Coin;
+    use chia_puzzles::SINGLETON_LAUNCHER_HASH;
+    use dig_chainsource_interface::{
+        resolve_singleton_lineage_via_walk, ChainSourceError, CoinRecord, MockChainSource,
+    };
+
+    use super::Bytes32;
+
+    /// A genuine singleton LAUNCHER coin record.
+    ///
+    /// The walk recognises a launcher ONLY by its canonical puzzle hash, so a fixture that gets that
+    /// wrong is silently read as "not a launcher" and resolves to `Ok(None)` — which would make the
+    /// fail-closed assertion below pass for entirely the wrong reason. Hence
+    /// [`SINGLETON_LAUNCHER_HASH`] rather than an arbitrary hash, and hence the companion control
+    /// test, which proves this fixture really does reach the walk's spend-reading path.
+    fn launcher_record(spent_height: Option<u32>) -> (Bytes32, CoinRecord) {
+        let coin = Coin::new(
+            Bytes32::new([0xAB; 32]),
+            Bytes32::new(SINGLETON_LAUNCHER_HASH),
+            1,
+        );
+        (
+            coin.coin_id(),
+            CoinRecord {
+                coin,
+                confirmed_height: Some(100),
+                spent_height,
+                timestamp: None,
+                coinbase: false,
+            },
+        )
+    }
+
+    /// CONFORMANCE (#28) — the walk this provider delegates to resolves the
+    /// "unspent **OR unknown**" ambiguity by FAILING CLOSED.
+    ///
+    /// This is the exact defect class #28 removed. chia-query's deleted copy was driven by a
+    /// spend-fetcher alone, and [`ChainSource::coin_spend`](dig_chainsource_interface::ChainSource)
+    /// answers `Ok(None)` for BOTH "unspent" and "unknown". With no second read it could not tell
+    /// them apart, so a coin the source could not actually account for authenticated as live state.
+    ///
+    /// Here the launcher's own record says it was SPENT at height 100, yet the source serves no
+    /// spend for it. That is a "could not answer", never an absence: reading it as an absence would
+    /// report a launched singleton as never launched. The canonical walk consults `coin_record`
+    /// as well as `coin_spend`, so it can and does refuse.
+    ///
+    /// Failure direction matters (NC-9): this refuses a lineage that may well be real, which a
+    /// caller retries. The alternative — the copy's behaviour — hands back chain state nobody
+    /// confirmed, which a caller acts on.
+    #[test]
+    fn a_spent_launcher_whose_spend_is_not_served_fails_closed() {
+        let (launcher_id, record) = launcher_record(Some(100));
+        let source = MockChainSource::new().with_coin(launcher_id, record);
+
+        let result = resolve_singleton_lineage_via_walk(&source, launcher_id);
+
+        assert!(
+            matches!(result, Err(ChainSourceError::Malformed(_))),
+            "a launcher recorded as SPENT whose spend the source cannot serve is an unknown, not an \
+             absence; it must fail closed rather than resolve (got {result:?})"
+        );
+    }
+
+    /// CONTROL for the test above — an UNSPENT launcher is a genuine absence, so the walk returns
+    /// `Ok(None)` rather than erroring.
+    ///
+    /// Without this, the assertion above would still pass if the walk simply errored on every
+    /// input, and the fixture would never be shown to reach the spend-reading path at all. The two
+    /// tests differ by exactly one field — `spent_height` — so together they prove the walk is
+    /// discriminating on the record, which is the read the deleted copy did not have.
+    #[test]
+    fn an_unspent_launcher_is_a_genuine_absence_not_an_error() {
+        let (launcher_id, record) = launcher_record(None);
+        let source = MockChainSource::new().with_coin(launcher_id, record);
+
+        let result = resolve_singleton_lineage_via_walk(&source, launcher_id);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a launcher that was never spent minted no singleton state, which is a genuine absence \
+             and must not be reported as a failure (got {result:?})"
+        );
     }
 }
