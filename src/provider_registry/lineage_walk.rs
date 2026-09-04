@@ -495,6 +495,31 @@ mod tests {
         assert!(!lineage.contains(forked_tip));
     }
 
+    /// RED (chia-query#28) -- a DERIVED successor the source does NOT know must never be handed
+    /// back as the live tip.
+    ///
+    /// This walk's only read is `fetch_spend`, whose `Ok(None)` means "unspent **or unknown**". The
+    /// walk reads that as "unspent" and returns the coin, so a successor the chain may never have
+    /// had authenticates as the live tip. NC-9 requires on-chain proof for chain-anchored data: with
+    /// no proof obtainable the walk MUST fail closed, never invent an answer.
+    ///
+    /// The scenario: the launcher and eve are genuine and spent, and the spend of `c1` derives a
+    /// successor that DOES NOT EXIST ON CHAIN. A sound walk refuses it; this one returns it.
+    #[tokio::test]
+    async fn derived_successor_the_source_does_not_know_is_not_the_tip() {
+        let (spends, launcher_id, members, children) = genuine_lineage();
+        // `members.last()` is derived purely from `children` -- nothing ever confirmed it exists.
+        let unverified = *members.last().unwrap();
+
+        let result =
+            walk_singleton_lineage(launcher_id, fetcher(spends), table_extractor(children)).await;
+
+        assert!(
+            result.is_err(),
+            "walk returned the UNVERIFIED coin {unverified} as the live tip (got {result:?}); a              successor the source cannot confirm exists must fail closed"
+        );
+    }
+
     #[tokio::test]
     async fn unlaunched_launcher_returns_none() {
         let result = walk_singleton_lineage(
