@@ -57,7 +57,7 @@ const FILL_ROUNDS: usize = PRIORITY_SLOTS + 2;
 /// [`QUORUM_SAMPLE`](super::plurality::QUORUM_SAMPLE); this widens the CANDIDATE set only, so the
 /// number of independent voices the pool ends up holding is unchanged and only their identity
 /// differs.
-const DIAL_OVERSUBSCRIPTION: usize = 2;
+pub(crate) const DIAL_OVERSUBSCRIPTION: usize = 2;
 
 /// How many dials to open when `wanted` slots remain.
 ///
@@ -145,8 +145,122 @@ fn most_credible<T>(mut candidates: Vec<DialCandidate<T>>, slots: usize) -> Vec<
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|c| seen.insert(c.address));
 
+    // Diversity runs AFTER the latency sort and BEFORE the truncate, so the slots go to as many
+    // distinct subnets as the round actually reached, while the survivor of each subnet is still
+    // its FASTEST member - the candidate the ranking would have chosen anyway.
+    candidates = spread_across_subnets(candidates);
+
     candidates.truncate(slots);
     candidates
+}
+
+/// Reorder a latency-ranked round so the slots are spread across as many distinct routing
+/// prefixes as the round reached, WITHOUT ever leaving a slot empty for want of diversity.
+///
+/// Emits one candidate per subnet per pass — subnets in the order their fastest member appeared,
+/// candidates within a subnet in their existing latency order — so the head of the list is one
+/// peer from each distinct subnet, then a second from each, and so on. `Priority` entries are
+/// passed through at the front untouched.
+///
+/// # Why this rather than a hard cap of K per subnet
+///
+/// A cap has to pick `K`, and `K` is a genuine trade in both directions: too high and it is
+/// decorative, too low and a host whose reachable peers happen to share a /24 cannot fill its pool
+/// at all — it drops below [`CORROBORATION_FLOOR`] and falls back to the centralized HTTPS tier,
+/// which is the outcome this crate exists to avoid. Cloud-hosted nodes cluster in /24s heavily, so
+/// that is not a hypothetical population.
+///
+/// A spread has no `K` and no such trade. When the round reached several subnets, the diverse
+/// peers take the slots — which is the whole attack this addresses. When it reached only one, the
+/// order is unchanged and every slot still fills. It is strictly more diverse than the plain
+/// latency ranking and never less filled.
+///
+/// # The attack it addresses
+///
+/// [`most_credible`] ranks discovered candidates by ascending handshake time, and latency is
+/// partly a measure of network PROXIMITY — so ranking on it is a mild preference for peers NEAR
+/// this host, precisely the population a local or regional adversary already holds.
+/// [`DIAL_OVERSUBSCRIPTION`] bounds that pressure but does not remove it, and it is no bound at
+/// all on PROVISIONING: an adversary who stands up several nodes in one datacentre gets several
+/// fast candidates for one act of provisioning. NC-12 rests on the held peers being independent of
+/// each other, and "fastest" is not "independent".
+///
+/// # What this does NOT do
+///
+/// It spreads across ADDRESS blocks, not OWNERS. One operator holding addresses in many /24s
+/// defeats it entirely. It raises the cost of a proximity attack; it does not close it.
+///
+/// It also shapes a single ROUND, not the pool. A host that reaches only one subnet still fills
+/// from it across `FILL_ROUNDS` rounds, so the pool's eventual composition can still be
+/// concentrated.
+fn spread_across_subnets<T>(candidates: Vec<DialCandidate<T>>) -> Vec<DialCandidate<T>> {
+    let mut priority = Vec::new();
+    // Insertion-ordered buckets: the first time a subnet is seen fixes its position, so a subnet
+    // is ranked by its FASTEST member and the pass order inherits the latency sort.
+    let mut order: Vec<SubnetKey> = Vec::new();
+    let mut buckets: std::collections::HashMap<SubnetKey, Vec<DialCandidate<T>>> =
+        std::collections::HashMap::new();
+
+    for candidate in candidates {
+        // The operator's own or co-resident node. Already excluded from `independent_peer_count`,
+        // so it cannot corroborate anything, and spreading it away from its slot would displace
+        // the node the operator deliberately configured.
+        if candidate.origin == connect::PeerOrigin::Priority {
+            priority.push(candidate);
+            continue;
+        }
+        let key = SubnetKey::of(candidate.address);
+        if !buckets.contains_key(&key) {
+            order.push(key);
+        }
+        buckets
+            .entry(SubnetKey::of(candidate.address))
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut spread = priority;
+    let mut remaining = true;
+    while remaining {
+        remaining = false;
+        for key in &order {
+            if let Some(bucket) = buckets.get_mut(key) {
+                if !bucket.is_empty() {
+                    spread.push(bucket.remove(0));
+                    remaining |= !bucket.is_empty();
+                }
+            }
+        }
+    }
+    spread
+}
+
+/// The routing prefix a dial candidate is judged to share with its neighbours: /24 for IPv4, /48
+/// for IPv6.
+///
+/// A `/24` and a `/48` are the smallest blocks routinely allocated as a unit, so they are the
+/// cheapest proxy for "these addresses are probably one operator". The proxy is deliberately
+/// coarse in the SAFE direction: it over-groups (two unrelated tenants of one hosting provider
+/// count as one) rather than under-groups.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum SubnetKey {
+    V4([u8; 3]),
+    V6([u8; 6]),
+}
+
+impl SubnetKey {
+    fn of(address: SocketAddr) -> Self {
+        match address.ip() {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                SubnetKey::V4([o[0], o[1], o[2]])
+            }
+            std::net::IpAddr::V6(v6) => {
+                let o = v6.octets();
+                SubnetKey::V6([o[0], o[1], o[2], o[3], o[4], o[5]])
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,9 +281,9 @@ struct PeerEntry {
     origin: connect::PeerOrigin,
     /// The highest peak THIS peer has announced, or 0 before it has announced any.
     ///
-    /// The pool's shared `peak_height` is a `fetch_max` across every session, so it answers "how
-    /// high is the chain" and can never say which peer is behind. Lag is a per-peer fact and needs
-    /// a per-peer number.
+    /// [`PeerPool::peak_height`] and [`PeerPool::evict_lagging_peers`] both derive their answer
+    /// from the collection of every entry's value here, recomputed on each call — never from a
+    /// single shared counter, which is what let one peer's claim outlive the peer itself (#51).
     ///
     /// An `Arc<AtomicU32>` because the only writer is the entry's receiver-handler task, which
     /// runs detached and cannot take the pool's write lock. It is cloned into that task at
@@ -227,14 +341,11 @@ pub struct PeerPool {
     tls: Connector,
     network: NetworkType,
     connect_timeout: Duration,
-    /// Latest peak height observed from any connected peer's NewPeakWallet
-    /// messages.  Updated in the background by receiver handler tasks.
-    peak_height: Arc<AtomicU32>,
     /// Fans every inbound frame out to the pool's subscribers.
     ///
-    /// The atomic above answers "how high is the chain"; this carries the frames THEMSELVES, which
-    /// is what a consumer following coin states needs and what its absence forced into a second
-    /// dialled session (dig_ecosystem#2761).
+    /// [`peak_height`](Self::peak_height) answers "how high is the chain"; this carries the
+    /// frames THEMSELVES, which is what a consumer following coin states needs and what its
+    /// absence forced into a second dialled session (dig_ecosystem#2761).
     fanout: Arc<FrameFanout>,
     /// Sessions that have STOPPED, waiting to be ejected on the next maintenance pass.
     ///
@@ -266,7 +377,6 @@ impl PeerPool {
             tls,
             network,
             connect_timeout,
-            peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
             dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         };
@@ -416,10 +526,51 @@ impl PeerPool {
         true
     }
 
-    /// Latest peak height observed across all connected peers.
-    /// Returns 0 if no peak has been received yet.
-    pub fn peak_height(&self) -> u32 {
-        self.peak_height.load(Ordering::Relaxed)
+    /// The chain's peak, as agreed by the peers this pool holds. Returns 0 if no peer has
+    /// announced one yet.
+    ///
+    /// The [`reference_peak`] median of every held peer's [`PeerEntry::last_peak`], RECOMPUTED on
+    /// every call rather than latched behind a shared counter (#51).
+    ///
+    /// # Why a latched maximum was a permanent denial-of-service primitive
+    ///
+    /// This used to be a single `Arc<AtomicU32>` advanced with `fetch_max` from every session's
+    /// `NewPeakWallet`. That makes the value MONOTONIC and UNBOUNDED: one connected peer sending
+    /// `height: u32::MAX` once pins it there for the life of the pool, because nothing can lower a
+    /// `fetch_max` and no later honest announcement is ever larger. Every downstream freshness
+    /// claim in `dig-wallet` reads this number, so a single frame from a single dialled — and
+    /// under NC-12, UNTRUSTED — peer could permanently disable the "am I synced" answer for the
+    /// whole node.
+    ///
+    /// The median already computed for lag eviction (below) does not have this defect: it is
+    /// recomputed from the LIVE entries on every call, so
+    ///
+    /// - **one implausible claim cannot pin it** — moving a lower median upward needs more than
+    ///   half the announced peaks to agree, exactly [`reference_peak`]'s existing NC-12 guarantee;
+    /// - **it recovers on its own** — once the offending peer is gone (evicted, cycled, or simply
+    ///   disconnected), the very next call recomputes over whoever remains, with no separate
+    ///   "reset" logic to get wrong;
+    /// - **an ordinary advancing chain still moves it** — every peer's `last_peak` keeps climbing,
+    ///   so the median climbs with them.
+    ///
+    /// # Every origin counts here, unlike eviction's voters
+    ///
+    /// [`evict_lagging_peers`](Self::evict_lagging_peers) deliberately excludes `Priority` peers
+    /// from the vote, because letting an operator's own node decide who else gets evicted is a
+    /// side door around `independent_peer_count`. That concern does not apply to this READ: a
+    /// solo node that only holds its `TRUSTED_FULLNODE`/loopback priority connections is a normal,
+    /// supported configuration, and it must still see a peak. Excluding `Priority` here would
+    /// silently zero this out for exactly that setup, so the median is taken over every entry that
+    /// has announced, priority and discovered alike — the same population the old `fetch_max`
+    /// drew from.
+    pub async fn peak_height(&self) -> u32 {
+        let entries = self.entries.read().await;
+        let announced: Vec<u32> = entries
+            .iter()
+            .map(|e| e.last_peak.load(Ordering::Relaxed))
+            .filter(|peak| *peak > 0)
+            .collect();
+        reference_peak(&announced).unwrap_or(0)
     }
 
     /// Round-robin select a peer from the pool.
@@ -862,7 +1013,6 @@ impl PeerPool {
         mut receiver: mpsc::Receiver<Message>,
         last_peak: Arc<AtomicU32>,
     ) {
-        let peak = Arc::clone(&self.peak_height);
         let fanout = Arc::clone(&self.fanout);
         let dead_sessions = Arc::clone(&self.dead_sessions);
 
@@ -881,8 +1031,7 @@ impl PeerPool {
                             );
                             break SessionEndReason::UndecodableFrame;
                         };
-                        last_peak.fetch_max(new_peak.height, Ordering::Relaxed);
-                        let prev = peak.fetch_max(new_peak.height, Ordering::Relaxed);
+                        let prev = last_peak.fetch_max(new_peak.height, Ordering::Relaxed);
                         if new_peak.height > prev {
                             log::debug!(
                                 "new peak from peer {}: {}",
@@ -991,7 +1140,6 @@ impl PeerPool {
             tls: connect::create_generated_tls().expect("generate a TLS identity"),
             network: NetworkType::Mainnet,
             connect_timeout: Duration::from_millis(1),
-            peak_height: Arc::new(AtomicU32::new(0)),
             fanout: Arc::new(FrameFanout::new()),
             dead_sessions: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -1053,6 +1201,22 @@ impl PeerPool {
             .iter()
             .find(|e| e.address == address)
             .map(|e| e.last_peak.load(Ordering::Relaxed))
+    }
+
+    /// Record `peak` for `address` exactly as an arriving `NewPeakWallet` would.
+    ///
+    /// The peak field is an `Arc<AtomicU32>` owned by the entry and written only by its detached
+    /// receiver task, so a test that wants to model the chain ADVANCING under a stable set of
+    /// peers has no other way to reach it. Re-admitting at a higher peak is not the same fixture:
+    /// it changes the pool's membership, which is the very thing such a test must hold constant.
+    pub(crate) async fn set_peak_for_tests(&self, address: SocketAddr, peak: u32) -> bool {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.address == address)
+            .map(|e| e.last_peak.store(peak, Ordering::Relaxed))
+            .is_some()
     }
 
     /// Admit a connection AND follow `receiver`, exactly as a real dial would.
@@ -2097,6 +2261,113 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // peak_height(): a recomputed median, not a latched maximum (#51)
+    // -----------------------------------------------------------------------
+
+    /// **Proves (#51):** one peer announcing an implausible height cannot pin the pool's
+    /// AGGREGATE peak, the way the old `fetch_max` latch could.
+    ///
+    /// Three peers agree on `CURRENT`; a fourth claims `u32::MAX`. The old implementation
+    /// returned `u32::MAX` forever, from the moment that single frame arrived. The median-based
+    /// aggregate needs more than half the announced peaks to agree before it can move upward, so
+    /// one liar among four honest voices is outvoted.
+    #[tokio::test]
+    async fn one_peer_claiming_an_implausible_peak_cannot_pin_the_aggregate() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, u32::MAX]).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "the honest majority's height wins over one absurd claim, not the claim itself"
+        );
+    }
+
+    /// **Proves (#51):** the aggregate RECOVERS once the offending peer is gone.
+    ///
+    /// Without this test the first could pass while the value stayed permanently wrong in some
+    /// OTHER way a latch-based fix might introduce (e.g. a one-shot "reject and remember"
+    /// mitigation that never reconsiders). Recomputing from live entries on every call means
+    /// eviction alone is sufficient recovery, with no separate reset path to get wrong.
+    #[tokio::test]
+    async fn the_aggregate_recovers_once_the_offending_peer_is_gone() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT, u32::MAX]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+
+        // The liar leaves (eject_peer is what a failed request or a protocol violation drives;
+        // reused directly here since this test is about the aggregate, not the ejection trigger).
+        pool.eject_peer(address(4)).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "still correct with the liar gone"
+        );
+
+        // The three honest peers also leave (as a rotation or a batch of failures would remove
+        // them) and are replaced by peers reporting a genuinely higher, honest peak — proving the
+        // aggregate is LIVE, not merely resistant: it must move for a real reason, not just hold
+        // steady after an eviction.
+        for addr in [address(1), address(2), address(3)] {
+            pool.eject_peer(addr).await;
+        }
+        let advanced = CURRENT + 1_000;
+        for i in 1..=3u8 {
+            pool.admit_at_peak_for_tests(
+                loopback_peer().await,
+                address(i + 10),
+                PeerOrigin::Discovered,
+                advanced,
+            )
+            .await;
+        }
+        assert_eq!(
+            pool.peak_height().await,
+            advanced,
+            "the aggregate tracks a genuinely advancing chain after recovery"
+        );
+    }
+    /// **Control:** a pool with a single announced peak — the solo-priority-node case — still
+    /// reports it. The median over a one-element set is that element itself, so a host running
+    /// only its own `TRUSTED_FULLNODE`/loopback connection is unaffected by this change.
+    #[tokio::test]
+    async fn a_single_announced_peak_is_reported_as_is() {
+        let pool = pool_at_peaks(5, &[CURRENT]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+    }
+
+    /// **Control:** a pool where nobody has announced anything yet reports 0, exactly as the old
+    /// latch did before its first `NewPeakWallet`.
+    #[tokio::test]
+    async fn no_announcement_yet_reports_zero() {
+        let pool = empty_pool(5);
+        assert_eq!(pool.peak_height().await, 0);
+    }
+
+    /// **Proves (#51):** `Priority` peers still count toward the aggregate, unlike the eviction
+    /// vote (#42) which deliberately excludes them. A solo node reading only through its trusted
+    /// full node must still see a peak — excluding `Priority` here would silently zero it out for
+    /// that supported configuration.
+    #[tokio::test]
+    async fn a_priority_only_pool_still_reports_a_peak() {
+        let pool = empty_pool(5);
+        assert!(
+            pool.admit_at_peak_for_tests(
+                loopback_peer().await,
+                address(1),
+                PeerOrigin::Priority,
+                CURRENT,
+            )
+            .await
+        );
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "a priority-only pool (e.g. TRUSTED_FULLNODE + loopback) still reports its peak"
+        );
+    }
+
     /// **Proves (NC-12):** ONE peer claiming an inflated peak cannot evict the honest majority.
     ///
     /// This is the security property of the whole eviction, and it is the assertion that fails if
@@ -2672,5 +2943,246 @@ mod tests {
             "no independent voice has spoken, so there is no bar to evict against"
         );
         assert_eq!(pool.held_addresses_for_tests().await.len(), 3);
+    }
+
+    // ===================================================================================
+    // #51 - the announced tip is recomputed from live peers, not latched at a maximum
+    // ===================================================================================
+    /// **Proves (#51):** the announced tip RECOVERS once the over-claiming peers are gone.
+    ///
+    /// Without this the test above can pass while leaving the value permanently wrong, which is the
+    /// actual defect — a bound that merely rejects one bad frame still latches whatever it accepts.
+    ///
+    /// **The fixture deliberately lets the liars WIN first.** Two colluding peers out of three do
+    /// move a median, so the pool genuinely reports the inflated height at the start; the assertion
+    /// is not vacuous. Ejecting one of them returns the tip to the honest value on the very next
+    /// call, with no reset logic — because the figure is recomputed from the LIVE entries rather
+    /// than stored.
+    #[tokio::test]
+    async fn the_announced_tip_recovers_once_an_over_claiming_peer_is_gone() {
+        let pool = pool_at_peaks(5, &[CURRENT, u32::MAX, u32::MAX]).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            u32::MAX,
+            "fixture must start WRONG, or recovery is untested"
+        );
+
+        pool.eject_peer(address(3)).await;
+
+        assert_eq!(
+            pool.peak_height().await,
+            CURRENT,
+            "a departed peer must take its claim with it"
+        );
+    }
+
+    /// **Proves (#51):** an ordinary advancing chain still moves the tip.
+    ///
+    /// The bound must not be so tight that a healthy node stops tracking — a tip that cannot rise
+    /// is the same denial as a tip pinned too high, reached from the other side.
+    ///
+    /// Membership is held CONSTANT and only the announced heights advance, which is why this needs
+    /// [`set_peak_for_tests`](PeerPool::set_peak_for_tests): re-admitting at a higher peak would
+    /// vary the peer set as well and could pass for the wrong reason.
+    #[tokio::test]
+    async fn an_ordinary_advancing_chain_still_moves_the_announced_tip() {
+        let pool = pool_at_peaks(5, &[CURRENT, CURRENT, CURRENT]).await;
+        assert_eq!(pool.peak_height().await, CURRENT);
+
+        const ADVANCED: u32 = CURRENT + 50;
+        for i in 1..=3u8 {
+            assert!(
+                pool.set_peak_for_tests(address(i), ADVANCED).await,
+                "fixture peer {i} must be held"
+            );
+        }
+
+        assert_eq!(
+            pool.peak_height().await,
+            ADVANCED,
+            "the tip must follow an honestly advancing chain"
+        );
+    }
+
+    // ===================================================================================
+    // #44 - a round's slots are spread across routing prefixes, not handed to the nearest
+    // ===================================================================================
+
+    /// An address in an arbitrary /24, so a fixture can vary the SUBNET rather than the host.
+    fn address_in(subnet: u8, host: u8) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, subnet, host)),
+            8444,
+        )
+    }
+
+    /// An address in an arbitrary /48.
+    fn address_v6_in(subnet: u16, host: u16) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0x0db8, subnet, 0, 0, 0, 0, host,
+            )),
+            8444,
+        )
+    }
+
+    /// **Proves (#44), at ROUND level:** a fast cluster sharing one /24 cannot take every slot
+    /// while slower peers in distinct /24s wait behind it.
+    ///
+    /// **The fixture varies exactly ONE thing.** Eight candidates share `198.51.7.0/24` and are
+    /// ALL faster than the three peers in distinct /24s behind them, so a plain ascending-latency
+    /// ranking admits the eight and none of the three — only the spread can save them. That is
+    /// the proximity attack in miniature: an adversary who stands up eight nodes in one datacentre
+    /// gets eight fast candidates for one act of provisioning, and NC-12 rests on the held peers
+    /// being independent of each other.
+    ///
+    /// Run through `admit_most_credible_for_tests` rather than `most_credible`, because a ranker
+    /// test cannot see whether the policy is wired into the round.
+    #[tokio::test]
+    async fn a_fast_single_subnet_cluster_cannot_take_every_slot_from_distinct_subnets() {
+        const SLOTS: usize = 4;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=8u8 {
+            round.push(candidate_at(&peer, address_in(7, host), PeerOrigin::Discovered, 10).await);
+        }
+        for subnet in [20u8, 21, 22] {
+            round.push(
+                candidate_at(&peer, address_in(subnet, 1), PeerOrigin::Discovered, 900).await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let subnets: std::collections::HashSet<_> = held
+            .iter()
+            .map(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets()[2],
+                std::net::IpAddr::V6(_) => unreachable!("fixture is IPv4"),
+            })
+            .collect();
+
+        assert_eq!(held.len(), SLOTS, "every slot must still be filled");
+        assert_eq!(
+            subnets.len(),
+            4,
+            "the {SLOTS} slots must reach 4 distinct /24s, not be consumed by the fast cluster              (held: {held:?})"
+        );
+    }
+
+    /// **Proves (#44) for IPv6:** the same spread applies across /48s.
+    ///
+    /// A /48 cap on `Ipv6Addr` is separate code from a /24 cap on `Ipv4Addr`, so a test of one is
+    /// vacuous for the other — and the peer tier is IPv6-FIRST (§5.2), which makes v6 the primary
+    /// case rather than the exotic one.
+    #[tokio::test]
+    async fn the_spread_applies_across_ipv6_prefixes_too() {
+        const SLOTS: usize = 3;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=6u16 {
+            round.push(
+                candidate_at(&peer, address_v6_in(0x11, host), PeerOrigin::Discovered, 10).await,
+            );
+        }
+        for subnet in [0x22u16, 0x33] {
+            round.push(
+                candidate_at(&peer, address_v6_in(subnet, 1), PeerOrigin::Discovered, 900).await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        let held = pool.held_addresses_for_tests().await;
+        let prefixes: std::collections::HashSet<_> = held
+            .iter()
+            .map(|a| match a.ip() {
+                std::net::IpAddr::V6(v6) => v6.segments()[2],
+                std::net::IpAddr::V4(_) => unreachable!("fixture is IPv6"),
+            })
+            .collect();
+
+        assert_eq!(held.len(), SLOTS, "every slot must still be filled");
+        assert_eq!(
+            prefixes.len(),
+            3,
+            "the {SLOTS} slots must reach 3 distinct /48s (held: {held:?})"
+        );
+    }
+
+    /// **Control:** a round with no subnet concentration is UNAFFECTED — the latency ranking still
+    /// decides, in order.
+    ///
+    /// Without this, a spread that simply shuffled, reversed, or dropped candidates would satisfy
+    /// the diversity assertions above while quietly destroying the ranking #43 established.
+    #[tokio::test]
+    async fn a_round_with_no_subnet_concentration_keeps_its_latency_order() {
+        const SLOTS: usize = 3;
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for (i, subnet) in [30u8, 31, 32, 33].iter().enumerate() {
+            round.push(
+                candidate_at(
+                    &peer,
+                    address_in(*subnet, 1),
+                    PeerOrigin::Discovered,
+                    100 + i as u64 * 100,
+                )
+                .await,
+            );
+        }
+
+        let kept = most_credible(round, SLOTS);
+        let addrs: Vec<SocketAddr> = kept.iter().map(|c| c.address).collect();
+
+        assert_eq!(
+            addrs,
+            vec![address_in(30, 1), address_in(31, 1), address_in(32, 1)],
+            "with one candidate per subnet the spread is the identity and the fastest three win"
+        );
+    }
+
+    /// **Control — the starvation direction, which is the failure that would matter more.**
+    ///
+    /// A host whose only reachable peers share ONE /24 must still fill every slot. A hard cap of
+    /// `K` per subnet would fail exactly here: it would admit `K` and leave the rest empty,
+    /// dropping the pool below `CORROBORATION_FLOOR` and sending it to the centralized HTTPS tier
+    /// — the outcome this crate exists to avoid. Cloud-hosted nodes cluster in /24s heavily, so
+    /// this population is not hypothetical.
+    ///
+    /// This is the test that chose a spread over a cap.
+    #[tokio::test]
+    async fn a_host_that_can_only_reach_one_subnet_still_fills_every_slot() {
+        const SLOTS: usize = 5;
+        let pool = empty_pool(SLOTS);
+        let peer = loopback_peer().await;
+
+        let mut round = Vec::new();
+        for host in 1..=8u8 {
+            round.push(
+                candidate_at(
+                    &peer,
+                    address_in(9, host),
+                    PeerOrigin::Discovered,
+                    10 + host as u64,
+                )
+                .await,
+            );
+        }
+
+        pool.admit_most_credible_for_tests(round, SLOTS).await;
+
+        assert_eq!(
+            pool.held_addresses_for_tests().await.len(),
+            SLOTS,
+            "a single-subnet host must still fill its pool rather than fall back to the              centralized tier"
+        );
     }
 }

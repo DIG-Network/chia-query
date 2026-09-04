@@ -71,7 +71,8 @@ if light.needs_rearm() { light.reconnect().await?; }      // the followed sessio
 
 - `subscribe_coins` / `subscribe_puzzle_hashes` — arm a subscription and seed the cache.
 - `submit_spend` — a WRITE, deliberately outside the reads-only `ChainSource` surface.
-- `peak` — the FOLLOWED session's peak, not `peer_peak_height` (the highest any held peer claims).
+- `peak` — the FOLLOWED session's peak, not `peer_peak_height` (the MEDIAN of what the held peers
+  claim).
 - `needs_rearm` / `reconnect` — a followed session that ends is REPORTED, so a stopped stream is
   never read as a chain with nothing to say.
 - `as_chain_source_provider` — registers as `ProviderKind::LocalNode` when the pinned session was
@@ -180,7 +181,16 @@ is therefore of peers held and believed usable, on the same liveness standard `h
 always answered by.
 
 `peer_peak_height()` MUST report the peak this client's OWN peers have announced via
-`NewPeakWallet`, and MUST make no network call. It is distinct from `peak_height_opt()`, which
+`NewPeakWallet`, and MUST make no network call. It MUST be derived as the LOWER MEDIAN of the
+announced peaks of the peers held at the moment of the call, recomputed on each call — never
+accumulated into a latched maximum. A maximum is settable by a single voice: one `NewPeakWallet`
+carrying an implausible height would pin the reported peak there for the pool's lifetime, since
+nothing lowers a maximum and no later honest announcement is larger, and every downstream
+freshness claim reads this number. Recomputing from the live members also makes the value
+self-correcting: a peer that leaves takes its claim with it, with no separate reset path. Every
+held entry counts here, `Priority` included — unlike the eviction reference (invariant 5f), because
+a node holding only its configured or co-resident connections is a supported configuration and MUST
+still observe a peak. It is distinct from `peak_height_opt()`, which
 answers "what is the chain's peak" and consults coinset FIRST — a third party's view of the chain
 even on a client holding peers. An unobserved peak MUST be `None`, never `0`: every block is
 trivially above zero, so a leaked `0` silently satisfies any confirmation-depth comparison.
@@ -380,6 +390,25 @@ handshake latency is partly a measure of network proximity, so a strong selectio
 concentrate the pool on peers near this host — the population a local or regional adversary is
 likeliest to hold — and NC-12 rests on the held peers being independent of each other.
 
+Oversubscription bounds that pressure but does not remove it, and it is no bound at all on
+PROVISIONING: an adversary who stands up several nodes in one datacentre obtains several fast
+candidates for one act of provisioning. A round's winners MUST therefore be spread across routing
+prefixes — `/24` for IPv4, `/48` for IPv6 — before the round is truncated to its slots: one
+candidate per prefix per pass, prefixes ordered by their fastest member, so the slots reach as many
+distinct prefixes as the round actually found while each prefix's survivor remains its fastest
+member. `Priority` entries are exempt and MUST pass through ahead of the spread; they are already
+excluded from `independent_peer_count` and so corroborate nothing.
+
+The spread MUST NOT be expressed as a fixed cap of K per prefix. A cap starves a host whose
+reachable peers happen to share one prefix — it would fill only K slots, fall below
+`CORROBORATION_FLOOR` and degrade to the centralized HTTPS tier, which is the outcome corroboration
+exists to avoid. A spread has no such failure: where a round reached one prefix only, the order is
+unchanged and every slot still fills.
+
+This spreads across ADDRESS blocks, not OWNERS — one operator holding addresses in many prefixes
+defeats it — and it shapes a single ROUND, not the pool's eventual composition. It raises the cost
+of a proximity attack; it does not close it.
+
 #### Corroboration arming: refuse, never degrade
 
 `corroboration_readiness(asked)` reports `Armed` only when at least `CORROBORATION_FLOOR` (2)
@@ -504,12 +533,19 @@ Default port: `58444`
    `dedup` collapses only adjacent duplicates, so a shuffle immediately before it makes it near
    vacuous and a repeated introducer result can occupy two dial slots
 3. Shuffle the distinct addresses for randomness
-4. Order the shuffled set IPv6-first (CLAUDE.md §5.2). The ordering is STABLE, so the shuffle
+4. Truncate the shuffled set to `default_max_peers() * DIAL_OVERSUBSCRIPTION` candidates. A round
+   cannot dial more than that, and without the bound the number of addresses an introducer returns
+   is a term in the round's duration — `ceil(N / 10)` timeout-bounded batches, with N chosen by the
+   introducer rather than by this host. The truncation MUST be applied AFTER the shuffle: capping
+   first would let a hostile introducer select which addresses this host ever dials, by listing
+   them first. Because each round samples afresh and a fill makes `FILL_ROUNDS` rounds, the cap
+   excludes no address permanently
+5. Order the surviving set IPv6-first (CLAUDE.md §5.2). The ordering is STABLE, so the shuffle
    survives within each class. Locality MUST NOT reorder the discovered set: a local address
    reached through DISCOVERY is refused outright by invariant 5f, and a co-resident node is reached
    only by the priority path, where it is recorded as `Priority` and is not an independent voice
-5. Attempt connections in batches of 10, with 8-second timeout per attempt
-6. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
+6. Attempt connections in batches of 10, with 8-second timeout per attempt
+7. Use `chia-wallet-sdk`'s `Peer::new()` with the TLS connector built from the configured identity
 7. Return the first successful connection
 
 If NO peer connects, construction fails with `PeerDiscoveryFailed` ONLY when

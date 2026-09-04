@@ -399,7 +399,7 @@ mod native_client {
         /// internally, and every block is trivially above zero, so returning it would silently
         /// satisfy any "is this buried yet" comparison a caller makes.
         pub async fn peer_peak_height(&self) -> Option<u32> {
-            observed_peak(self.router.peer.peak_height())
+            observed_peak(self.router.peer.peak_height().await)
         }
 
         /// A subscribing light client over THIS client's peer pool.
