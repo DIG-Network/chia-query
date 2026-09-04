@@ -981,7 +981,7 @@ transport/timeout/parse error is NEVER reported as absence; absence is NEVER rep
 | `coin_records_by_parent(id)` | `get_coin_records_by_parent_ids([id], None, None, true)` | corroborated empty set -> `Ok(vec![])`; disagreement, or a set nobody will second -> `Err` |
 | `coin_spend(id)` | `get_coin_spend_opt` | corroborated unspent/unknown -> `Ok(None)`; failure or uncorroborated absence -> `Err` |
 | `parent_spend(id)` | trait default (`coin_record` + `coin_spend`) | gap mid-walk -> `Ok(None)`; failure -> `Err` |
-| `resolve_singleton_lineage(launcher)` | forward walk over `get_coin_spend_opt` | never launched / fully melted -> `Ok(None)`; failure -> `Err` |
+| `resolve_singleton_lineage(launcher)` | canonical walk, delegated (drives this provider's own `coin_record` + `coin_spend`) | never launched / never spent / fully melted -> `Ok(None)`; a successor the source cannot confirm, or a spent coin whose spend it will not serve -> `Err`; failure -> `Err` |
 | `peak_height()` | `peak_height_opt` (from `get_blockchain_state`) | no peak -> `Ok(None)`; failure -> `Err` |
 | `block_timestamp(h)` | `block_timestamp_opt` (from `get_block_record_by_height_opt`) | no block / no timestamp -> `Ok(None)`; failure -> `Err` |
 
@@ -1156,47 +1156,61 @@ hash verification would authenticate the block's name and leave that field on on
 zero/default. A `0` height/timestamp maps to `None` (matching "not known by this source"); `spent`
 gates `spent_height`.
 
-### Singleton lineage -- a genuine forward walk
+### Singleton lineage -- the canonical forward walk, delegated
 
-`resolve_singleton_lineage` performs a REAL forward walk launcher -> tip using the shared
-`dig_chainsource_interface::SingletonLineage` type (no dig-did dependency -- that crate is same-level).
-From the launcher spend it derives the eve coin, then follows each singleton recreation hop-by-hop to
-the current unspent tip, collecting every member coin id. It is NEVER an echo of a caller-supplied
-coin, so `SingletonLineage::contains` MEMBERSHIP is meaningful. Each hop is authenticated by
-`singleton_child_from_spend`: the spent coin's puzzle reveal MUST hash to its committed puzzle hash
-(`clvm_utils::tree_hash`), and the child is the odd-amount `CREATE_COIN` output of the parent spend
-(computed with `chia_protocol::Coin::coin_id`). The parent puzzle MUST additionally have
-singleton-family SHAPE -- it is either the one-time SINGLETON LAUNCHER (matched by its full puzzle
-hash) or a SINGLETON TOP-LAYER v1.1 puzzle (matched by its uncurried mod hash); any other puzzle that
-merely happens to emit an odd `CREATE_COIN` is NOT a singleton recreation and fails closed as
-`Malformed`. Because the singleton top layer morphs its recreation output into the singleton wrapper
-by construction, asserting the parent is genuine singleton shape is what guarantees the selected child
-is singleton-shaped. **Identity binding (beyond shape).** Shape alone proves a hop is *a* singleton,
-not *this* one -- so every TOP-LAYER hop additionally binds its curried `singleton_struct.launcher_id`
-(recovered by parsing the top layer's `SingletonArgs`) to the walk's `launcher_id`: a mismatch means
-the hop belongs to a DIFFERENT singleton and fails closed as `Malformed`, so a shape-valid hop from a
-foreign singleton cannot be spliced into this lineage. The launcher hop itself needs no such check --
-its coin id IS the `launcher_id`, already bound by the coin-id binding below. The `CREATE_COIN` amount is decoded fail-closed: an amount atom wider than 8
-bytes (a value that cannot fit `u64`) is rejected as `Malformed` rather than silently wrapped, so an
-overflowing amount can never be misread as a small odd value. Additionally, each hop binds the fetched
-spend to the requested coin id (`spend.coin.coin_id() == current`, the launcher spend bound to
-`launcher_id`), making the walk cryptographically self-authenticating from the launcher; a mismatch
-fails closed as `Malformed`. A revisited coin (cycle) fails closed as `Malformed`. The walk is bounded against
-resource-exhaustion DoS by TWO layers, because each generation is a strictly-sequential network
-round-trip (one fetch per hop on the coinset path, two on the peer path) with only per-request
-timeouts. (1) **Primary — an overall wall-clock deadline** (`WALK_DEADLINE`, 45s) wraps the entire
-walk future, so a hostile source serving an ever-advancing chain of DISTINCT (non-repeating)
-recreations — which passes the reveal + coin-id binding every hop and never trips the cycle guard —
-cannot keep the walk alive indefinitely; exceeding the deadline fails closed as `Timeout` (distinct
-from `Malformed`), bounding total network time, CPU, and memory-growth-rate together. (2)
-**Belt-and-suspenders — a hop cap** (`MAX_LINEAGE_GENERATIONS`, 100,000, checked before each fetch)
-fails closed as `Malformed`; a real singleton (a few thousand hops at most over its lifetime) stays
-far below it, and over any real network the deadline stops an adversarial walk long before the cap is
-reached. The coin-id binding is load-bearing over EVERY source: the peer transport returns
-the genuine spent coin (fetched from its coin state alongside the puzzle/solution) so a peer-sourced
-lineage authenticates and resolves — it is never built from a name-only placeholder coin, which would
-hash to the wrong id and fail the binding closed.
-`Ok(None)` = the launcher never existed or the singleton was fully melted. **Per-hop CLVM
+`resolve_singleton_lineage` is a DELEGATION, not an implementation. `ChiaQueryProvider` calls
+`dig_chainsource_interface::resolve_singleton_lineage_via_walk(self, launcher_id)`, the drop-in body
+that crate documents for this trait method, and chia-query MUST NOT carry a walk of its own. The
+`lineage-walk` feature of the `dig-chainsource-interface` dependency is therefore REQUIRED, and is
+enabled inside the `native` feature only, so it never reaches the wasm `coinset` build.
+
+This method's result IS the authority set consumers test membership against, so the walk MUST have
+exactly one implementation ecosystem-wide: a second copy is a byte-drift bug on a money path.
+
+The canonical walk is a REAL forward walk launcher -> tip over the shared
+`dig_chainsource_interface::SingletonLineage` type. From the launcher coin it derives the eve, then
+follows each singleton recreation hop-by-hop to the current unspent tip, collecting every member coin
+id. It is NEVER an echo of a caller-supplied coin, so `SingletonLineage::contains` MEMBERSHIP is
+meaningful. The member set is seeded with `launcher_id`, so `contains(launcher_id)` is TRUE for every
+resolved lineage, identically to every other provider.
+
+The walk drives BOTH `coin_spend` and `coin_record` on this provider, and both reads are load-bearing:
+
+- **Every derived successor MUST exist on chain.** A coin's puzzle hash commits it to its puzzle but
+  NOT to its solution, so a dishonest source may pair a genuine reveal with a fabricated solution and
+  name any successor it likes. The walk therefore requires each derived successor to have a coin
+  record equal to the derived coin, and fails closed as `Malformed` when the source does not know it.
+  A successor the source cannot confirm MUST NEVER be returned as the tip.
+- **`Ok(None)` from `coin_spend` means "unspent OR unknown", and only the coin's own record separates
+  them.** A coin whose record says it was SPENT but whose spend the source will not serve is a
+  "could not answer" and fails closed as `Malformed`. It MUST NOT be read as an absence: were the
+  unserved spend the MELT, a dead singleton would otherwise authenticate as live.
+
+Each hop is authenticated from the parent's actual spend: the spent coin's puzzle reveal MUST hash to
+its committed puzzle hash, the fetched spend MUST be the spend OF the requested coin, and the parent
+puzzle MUST have singleton-family SHAPE -- either the one-time SINGLETON LAUNCHER or a SINGLETON
+TOP-LAYER v1.1 puzzle. Every top-layer hop additionally binds its curried
+`singleton_struct.launcher_id` to the walk's `launcher_id`, so a shape-valid hop belonging to a
+DIFFERENT singleton cannot be spliced into this lineage. A revisited coin (cycle) fails closed as
+`Malformed`.
+
+The walk is bounded against resource-exhaustion DoS on three axes, all owned by the canonical crate:
+an overall wall-clock budget (`DEFAULT_WALK_BUDGET`, 45s) checked between hops and failing closed as
+`DeadlineExceeded`; a hop cap (`MAX_LINEAGE_DEPTH`, 100,000) failing closed as `TooDeep`; and a
+PER-HOP CLVM ceiling (`MAX_HOP_CLVM_COST`, 100,000,000) on evaluating one spend's inner puzzle. The
+per-hop ceiling is what makes the wall-clock budget keepable: a spend's solution is bound to nothing,
+so without it a single hop could legitimately burn a whole block's evaluation.
+
+Time spent INSIDE one hop is bounded by the router's own per-request timeouts, since the wall-clock
+budget is only checked between hops.
+
+The synchronous walk is sound behind this async-backed facade because it drives `self`, whose reads
+each bridge to the router through `run_blocking` SEQUENTIALLY. `resolve_singleton_lineage` is itself
+synchronous and opens no `block_on` of its own, so each read enters and leaves the runtime cleanly
+and no `block_on` is ever nested.
+
+`Ok(None)` = the launcher never existed, was never spent, or the singleton was fully melted. `Err` =
+could not answer; the consumer MUST fail closed and MUST NEVER treat it as absence. **Per-hop CLVM
 verification is NECESSARY but NOT SUFFICIENT** -- it does not defeat total fabrication; the registry
 trust model layered above provides custody soundness.
 

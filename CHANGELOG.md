@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.23.0] - 2026-09-04
+
+### Bug Fixes
+- **lineage:** Adopt the canonical singleton lineage walk, delete the unsound copy (#55)
+
 ## [0.22.0] - 2026-09-04
 
 ### Features
