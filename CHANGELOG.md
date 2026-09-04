@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.24.0] - 2026-09-04
+
+### Features
+- **peer:** Source-scoped subscriptions, bounded frame items and as-of height, push retry (#57)
+
 ## [0.23.0] - 2026-09-04
 
 ### Bug Fixes
