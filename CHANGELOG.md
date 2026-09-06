@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.24.3] - 2026-09-06
+
+### Bug Fixes
+- **peer:** Corroborate the peer-tier synced claim and gate light-client cache reads on subscription (#65)
+
 ## [0.24.2] - 2026-09-06
 
 ### Bug Fixes
