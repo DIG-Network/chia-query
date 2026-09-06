@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::coinset::CoinsetClient;
 use crate::mempool_refusal;
+use crate::peer::plurality::CORROBORATION_FLOOR;
 use crate::peer::set_agreement::{
     common_height, contradiction, fingerprint, normalise_at, project,
 };
@@ -19,6 +20,8 @@ use crate::types::*;
 
 #[cfg(test)]
 mod absence_tests;
+#[cfg(test)]
+mod blockchain_state_tests;
 #[cfg(test)]
 mod presence_tests;
 #[cfg(test)]
@@ -1291,13 +1294,23 @@ impl QueryRouter {
                 "no peak observed from peers yet".into(),
             ));
         }
+        // `synced` must derive from something MEASURED, never from a literal
+        // (dig_ecosystem#2765). `peak` above is a median over every peer that has announced one
+        // (`PeerPool::peak_height`), and a median over too few independent voices is not evidence
+        // of anything -- one peer's claim is that peer's claim, not a settled sync state. So the
+        // peer tier may only assert "caught up" once at least `CORROBORATION_FLOOR` independent
+        // (distinct-host, `Discovered`) peers actually support the number: the SAME floor every
+        // other corroborated read in this crate is gated on, reused rather than restated. Falling
+        // short reports `synced: false` -- never an error -- because the peak itself is still a
+        // real, useful number; only the confident "caught up" claim is withheld.
+        let synced = self.peer.independent_peer_count().await >= CORROBORATION_FLOOR;
         Ok(BlockchainState {
             peak: Some(BlockRecord {
                 height: peak,
                 ..Default::default()
             }),
             sync: Some(SyncState {
-                synced: true,
+                synced,
                 sync_mode: false,
                 sync_progress_height: peak,
                 sync_tip_height: peak,
