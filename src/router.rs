@@ -24,6 +24,8 @@ mod presence_tests;
 #[cfg(test)]
 mod push_tests;
 #[cfg(test)]
+mod scalar_coin_record_tests;
+#[cfg(test)]
 mod set_settlement_tests;
 
 // ---------------------------------------------------------------------------
@@ -643,13 +645,26 @@ impl QueryRouter {
 // ---------------------------------------------------------------------------
 
 impl QueryRouter {
+    /// The coin record for `name`, or an error when no source will second one.
+    ///
+    /// A fail-closed wrapper over
+    /// [`get_coin_record_by_name_opt`](Self::get_coin_record_by_name_opt) that turns corroborated
+    /// absence into a failure too -- this method promises a record, not an option, so "no such
+    /// coin" and "could not corroborate" are both outcomes a caller must not silently read as a
+    /// coin that exists.
+    ///
+    /// This used to call the raw [`peer_then_coinset`](Self::peer_then_coinset) helper directly:
+    /// whichever peer answered FIRST decided a coin's `confirmed_block_index` /
+    /// `spent_block_index` outright, with no second source ever consulted
+    /// (dig_ecosystem#3034) -- exactly the single-peer trust every OTHER coin read on this router
+    /// was migrated away from. Leaving the scalar form on the old path would have left the hole
+    /// open under the name this crate's own
+    /// [`ChiaQuery::wait_for_confirmation`](crate::ChiaQuery::wait_for_confirmation) calls before
+    /// telling a caller a spend has landed.
     pub async fn get_coin_record_by_name(&self, name: &str) -> Result<CoinRecord, ChiaQueryError> {
-        self.peer_then_coinset(
-            self.peer.try_get_coin_record_by_name(name),
-            self.peer.try_get_coin_record_by_name(name),
-            self.coinset.get_coin_record_by_name(name),
-        )
-        .await
+        self.get_coin_record_by_name_opt(name)
+            .await?
+            .ok_or_else(|| ChiaQueryError::PeerRejection(format!("no coin record for {name}")))
     }
 
     /// Absence-aware [`get_coin_record_by_name`](Self::get_coin_record_by_name): a PROVABLE absence

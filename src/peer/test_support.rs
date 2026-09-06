@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use chia_protocol::RespondPuzzleState;
+use chia_protocol::{RespondCoinState, RespondPuzzleState};
 use chia_wallet_sdk::client::Peer;
 
 /// A loopback address no other peer built by these helpers will use.
@@ -91,6 +91,28 @@ pub(crate) async fn puzzle_state_peer(response: RespondPuzzleState) -> Peer {
     scripted_peer(move |request| {
         (request.msg_type == ProtocolMessageTypes::RequestPuzzleState)
             .then(|| (ProtocolMessageTypes::RespondPuzzleState, body.clone()))
+    })
+    .await
+    .0
+}
+
+/// A real [`Peer`] whose server side ANSWERS `RequestCoinState` with `response`.
+///
+/// The coin-read counterpart of [`puzzle_state_peer`]: [`loopback_peer`] never replies, which
+/// proves nothing about what this crate does with a coin-state ANSWER. This is what lets a test
+/// prove the scalar coin-record read corroborates a peer's `confirmed_block_index`/
+/// `spent_block_index` exactly as its `_opt` sibling does, rather than trusting the lone peer that
+/// happened to answer first (dig_ecosystem#3034).
+pub(crate) async fn coin_state_peer(response: RespondCoinState) -> Peer {
+    use chia_protocol::ProtocolMessageTypes;
+    use chia_traits::Streamable;
+
+    let body = response
+        .to_bytes()
+        .expect("a RespondCoinState is streamable");
+    scripted_peer(move |request| {
+        (request.msg_type == ProtocolMessageTypes::RequestCoinState)
+            .then(|| (ProtocolMessageTypes::RespondCoinState, body.clone()))
     })
     .await
     .0
