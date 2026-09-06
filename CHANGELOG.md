@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.24.2] - 2026-09-06
+
+### Bug Fixes
+- **router:** Corroborate the scalar coin-record read, not just its opt sibling (#64)
+
 ## [0.24.1] - 2026-09-04
 
 ### Bug Fixes
