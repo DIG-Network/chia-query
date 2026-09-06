@@ -62,7 +62,9 @@ async fn peer_fallback_reports_unsynced_below_the_corroboration_floor() {
         .await
         .expect("a nonzero peak must still answer Ok");
 
-    let sync = state.sync.expect("the peer-tier fallback always carries a sync block");
+    let sync = state
+        .sync
+        .expect("the peer-tier fallback always carries a sync block");
     assert!(
         !sync.synced,
         "one uncorroborated peer must not be reported as a settled sync state"
@@ -88,7 +90,9 @@ async fn peer_fallback_reports_synced_at_the_corroboration_floor() {
         .await
         .expect("two agreeing peers must still answer Ok");
 
-    let sync = state.sync.expect("the peer-tier fallback always carries a sync block");
+    let sync = state
+        .sync
+        .expect("the peer-tier fallback always carries a sync block");
     assert!(
         sync.synced,
         "two independent peers agreeing on a peak IS measured corroboration"
