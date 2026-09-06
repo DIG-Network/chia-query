@@ -72,13 +72,38 @@ impl LightClientProvider {
         }
     }
 
-    /// Resolves a coin's current state: cache first, then a non-subscribing peer read.
+    /// Resolves a coin's current state: cache first — but ONLY while this client is still
+    /// SUBSCRIBED to it — then a non-subscribing peer read.
+    ///
+    /// # Why the cache hit is gated on subscription, not merely on presence (dig_ecosystem#2792)
+    ///
+    /// The drive-loop RETAINS a coin's last-known state after it stops being tracked — untracking
+    /// frees the subscription slot, it does not erase the historical fact (see
+    /// `a_coin_states_frame_untracks_a_spent_coin_while_retaining_its_state` in
+    /// `light_client::tests`). But retained is not the same as CURRENT: once untracked, nothing
+    /// corrects that entry again, while [`CoinStateCache::apply_update`]'s reorg-rollback keeps
+    /// touching every cached coin regardless of subscription — so an untracked entry can be
+    /// silently flipped from spent back to unspent by a LATER reorg this client was never re-armed
+    /// to observe, with no way for any future update to re-assert the truth (the re-insert half of
+    /// `apply_update` only accepts subscribed items). Trusting that flip as an unconditional cache
+    /// hit would serve it as ground truth forever: a melted singleton would authenticate as live.
+    ///
+    /// So a cache hit is authoritative only while
+    /// [`is_subscribed_coin`](CoinStateCache::is_subscribed_coin) is true — while this client is
+    /// actually still receiving updates for `coin_id`. Once untracked, every read pays for a live
+    /// fetch, which asks the peer directly rather than trusting a fact nothing is watching
+    /// anymore.
     fn coin_state(&self, coin_id: Bytes32) -> Result<Option<CoinState>, ChainSourceError> {
         let fetcher = self.fetcher.clone();
         let cache = self.cache.clone();
         run_blocking(&self.handle, async move {
-            if let Some(cached) = cache.read().await.get(coin_id) {
-                return Ok(Some(cached));
+            {
+                let guard = cache.read().await;
+                if guard.is_subscribed_coin(coin_id) {
+                    if let Some(cached) = guard.get(coin_id) {
+                        return Ok(Some(cached));
+                    }
+                }
             }
             let states = fetcher.coin_states(vec![coin_id], false).await?;
             Ok::<_, super::error::LightClientError>(
@@ -323,21 +348,17 @@ mod tests {
         provider_with_peak(fetcher, None)
     }
 
-    /// Builds a provider whose cache has been advanced to `peak` (if any), so the live-fetch clamp
-    /// against the known peak can be exercised.
-    fn provider_with_peak(
+    /// Builds a provider over a CALLER-CONSTRUCTED cache, so a test can seed coin state and
+    /// subscription status independently of a peak (dig_ecosystem#2792's fixtures need both).
+    fn provider_over_cache(
         fetcher: MockFetcher,
-        peak: Option<u32>,
+        cache: CoinStateCache,
     ) -> (tokio::runtime::Runtime, LightClientProvider) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("multi-thread runtime");
-        let mut cache = CoinStateCache::new();
-        if let Some(height) = peak {
-            cache.set_peak(height, Bytes32::new([0xAB; 32]));
-        }
         let provider = LightClientProvider::new(
             Arc::new(fetcher),
             Arc::new(RwLock::new(cache)),
@@ -345,6 +366,19 @@ mod tests {
             info(),
         );
         (rt, provider)
+    }
+
+    /// Builds a provider whose cache has been advanced to `peak` (if any), so the live-fetch clamp
+    /// against the known peak can be exercised.
+    fn provider_with_peak(
+        fetcher: MockFetcher,
+        peak: Option<u32>,
+    ) -> (tokio::runtime::Runtime, LightClientProvider) {
+        let mut cache = CoinStateCache::new();
+        if let Some(height) = peak {
+            cache.set_peak(height, Bytes32::new([0xAB; 32]));
+        }
+        provider_over_cache(fetcher, cache)
     }
 
     /// Runs the sync facade method off any ambient runtime (bridge's "outside a runtime" path).
@@ -686,5 +720,140 @@ mod tests {
         let (_rt, provider) = provider_with(MockFetcher::default());
         assert_eq!(provider.provider_info().priority, 20);
         assert_eq!(provider.peak_height().unwrap(), None);
+    }
+
+    // ---- dig_ecosystem#2792: a stale, untracked cache entry must never outrank a live read ----
+
+    /// **The melt case, stated as a test.**
+    ///
+    /// The property: `coin_record` must never serve `spent_height: None` from a cache entry this
+    /// client has stopped receiving updates for. The nearest wrong implementation is the code this
+    /// replaces — `coin_state` trusted ANY cache hit unconditionally — and the only fixture that
+    /// tells the two apart is one where the cache and the live peer DISAGREE: the cache holds a
+    /// stale UNSPENT record for a coin that is untracked (exactly what the drive-loop leaves behind
+    /// after its auto-untrack-on-spend, or after an explicit `unsubscribe_coins`, ahead of a reorg
+    /// or a missed update — dig_ecosystem#2792's probes), while the peer, asked directly, reports
+    /// it SPENT. A fixture that seeds the cache and leaves the coin subscribed cannot distinguish
+    /// "gated on subscription" from "always trusts the cache", because both serve the cache
+    /// correctly in that case.
+    #[test]
+    fn coin_record_of_an_untracked_coin_is_read_live_never_from_a_stale_cache_hit() {
+        let c = coin(20);
+        let id = c.coin_id();
+
+        // What the drive-loop leaves behind: cached UNSPENT, then untracked — the state is
+        // RETAINED (matching `a_coin_states_frame_untracks_a_spent_coin_while_retaining_its_state`
+        // in `light_client::tests`), only the subscription is dropped.
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+        cache.untrack_coins(&[id]);
+        assert!(
+            !cache.is_subscribed_coin(id),
+            "fixture sanity: the coin must be untracked"
+        );
+
+        // Ground truth, asked live: the coin is actually SPENT (the melt).
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(10),
+                spent_height: Some(99),
+            }],
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_over_cache(fetcher, cache);
+
+        let record = call(move || provider.coin_record(id))
+            .expect("read ok")
+            .expect("coin present");
+        assert_eq!(
+            record.spent_height,
+            Some(99),
+            "an untracked coin's stale UNSPENT cache entry must never outrank a live answer \
+             reporting it spent -- serving the stale value is exactly how a melted singleton \
+             authenticates as live"
+        );
+    }
+
+    /// The mirror: a coin this client is STILL subscribed to is served from the cache, and the
+    /// live fetcher is never consulted.
+    ///
+    /// Without this control, a fix that gated EVERY read on a live fetch — defeating the cache
+    /// entirely rather than gating it on subscription — would also pass the test above.
+    #[test]
+    fn coin_record_of_a_tracked_coin_is_served_from_cache_without_a_live_fetch() {
+        let c = coin(21);
+        let id = c.coin_id();
+
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+        assert!(
+            cache.is_subscribed_coin(id),
+            "fixture sanity: the coin stays tracked"
+        );
+
+        // A fetcher that answers WRONG if it is ever consulted -- if the cache were bypassed, this
+        // is the (incorrect) forced error the test would see instead of the cached answer.
+        let fetcher = MockFetcher {
+            fail: Some(LightClientError::Rejected(
+                "the cache path must not reach the peer".into(),
+            )),
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_over_cache(fetcher, cache);
+
+        let record = call(move || provider.coin_record(id))
+            .expect("a subscribed coin's cache hit must not touch the peer")
+            .expect("coin present");
+        assert_eq!(
+            record.spent_height, None,
+            "the cached (unspent) answer, not a forced fetch error"
+        );
+    }
+
+    /// The consequence stated directly on the interface method a lineage/authority check actually
+    /// calls: `coin_spend` on a coin a stale, untracked cache calls UNSPENT must still resolve to
+    /// `Some` when the coin was truly spent. An `Ok(None)` here IS "the coin looks alive" — the
+    /// melted-singleton-authenticates-as-live failure dig_ecosystem#2792 names.
+    #[test]
+    fn coin_spend_of_a_melted_coin_is_assembled_even_when_the_stale_cache_calls_it_unspent() {
+        let (puzzle, ph) = reveal_and_matching_puzzle_hash();
+        let c = Coin::new(Bytes32::new([22; 32]), ph, 1);
+        let id = c.coin_id();
+
+        let mut cache = CoinStateCache::new();
+        cache.track_coins([id]);
+        cache.seed([CoinState {
+            coin: c,
+            created_height: Some(10),
+            spent_height: None,
+        }]);
+        cache.untrack_coins(&[id]);
+
+        let fetcher = MockFetcher {
+            coin_states: vec![CoinState {
+                coin: c,
+                created_height: Some(10),
+                spent_height: Some(50),
+            }],
+            reveal: Some((puzzle, Program::from(vec![2u8]))),
+            ..Default::default()
+        };
+        let (_rt, provider) = provider_over_cache(fetcher, cache);
+
+        let spend = call(move || provider.coin_spend(id))
+            .unwrap()
+            .expect("the melted coin must resolve to a real spend, never Ok(None)");
+        assert_eq!(spend.coin, c);
     }
 }
